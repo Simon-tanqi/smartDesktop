@@ -1,0 +1,252 @@
+import sys
+print(sys.executable)
+
+"""
+
+def scan_directory(path):
+    # 过滤掉系统目录和隐藏目录，只保留对用户有用的正常文件夹
+    ignore_list = {'$RECYCLE.BIN', 'System Volume Information'}
+    dir_list = []
+    for entry in os.scandir(path):
+        # 跳过系统目录，以及以点开头的隐藏目录
+        if entry.name not in ignore_list and not entry.name.startswith('.'):
+            dir_list.append(entry.name)
+    return json.dumps(dir_list, ensure_ascii=False)
+
+
+# 提取盘符（如 F）
+drives = re.findall(r'[a-zA-Z]盘', user_input)
+if not drives:
+    print("[错误] 未识别到盘符，请使用类似「F盘」的格式")
+    window['-INPUT-'].update('')
+    continue
+
+drive_letter = drives[0].replace('盘', '')
+# 扫描该盘根目录
+scan_path = drive_letter + ':\\'
+mark_info = scan_directory(scan_path)
+print(f"[系统] 已扫描 {scan_path}，目录内容: {mark_info}")
+
+# 拼接完整任务描述（注意：变量名不能再叫 user_task，避免和函数名冲突）
+task_message = build_task_message(user_input, drive_letter, mark_info)
+# 从用户输入中提取源文件夹名（例如 "图片"）
+folder_match = re.search(r'[a-zA-Z]盘(\S+?)下的', user_input)
+if folder_match:
+    source_folder = folder_match.group(1)  # "图片"
+    # 扫描这个文件夹里的文件
+    source_path = f"{drive_letter}:\\{source_folder}"
+    file_list = scan_files(source_path)
+    # 拼到任务信息里
+    task_message += f"\n【源文件夹 \"{source_folder}\" 内的文件列表(JSON数组)】: {file_list}"
+print(f"[系统] 发送给 AI 的任务:\n{task_message}")
+
+# 调用 AI 解析
+ai_output = get_ai_reply(task_message, prompt=SYSTEM_PROMPT)
+print(f"[AI 解析结果]: {ai_output}")
+
+
+
+
+#移动文件技能
+def copy_file(src, target, file_name, new_name=None, cover=True, suffix=None):
+    """
+    复制文件的实际执行函数
+    参数和你的 inputSchema 完全对应
+    """
+    # 1. 构造源文件完整路径
+    src_path = os.path.join(src, file_name)
+
+    # 2. 确定目标文件名
+    if new_name:
+        final_name = new_name
+    else:
+        final_name = os.path.splitext(file_name)[0]  # 去掉原后缀的文件名
+
+    # 3. 如果指定了新后缀，替换掉
+    if suffix:
+        final_name = final_name + suffix
+    else:
+        final_name = final_name + os.path.splitext(file_name)[1]  # 保留原后缀
+
+    # 4. 构造目标完整路径
+    dst_path = os.path.join(target, final_name)
+
+    # 5. 检查是否覆盖
+    if os.path.exists(dst_path) and not cover:
+        return {"success": False, "message": f"文件 {dst_path} 已存在，且 cover=False，操作取消"}
+
+    # 6. 执行复制
+    try:
+        shutil.copy2(src_path, dst_path)  # copy2 会保留元数据
+        return {
+            "success": True,
+            "message": f"成功将 {src_path} 复制到 {dst_path}",
+            "src_path": src_path,
+            "dst_path": dst_path
+        }
+    except FileNotFoundError:
+        return {"success": False, "message": f"源文件不存在: {src_path}"}
+    except Exception as e:
+        return {"success": False, "message": f"复制失败: {str(e)}"}
+
+
+SKILL_MAP = {
+    "copy_file": copy_file,
+    # 未来可以轻松扩展，比如：
+    # "move_file": move_file,
+    # "delete_file": delete_file,
+    # "rename_file": rename_file,
+}
+
+task_message = (
+    f"用户的原始需求是：{user_input}\n"
+    f"当前已确认的【源文件夹绝对路径】是：{target_path}\n"  # 明确告诉它源路径是什么
+    f"经过扫描，该源目录下的真实文件/文件夹列表如下：\n{scanned_files}\n"
+    f"请根据以上信息构造路径，禁止添加空格或修改文件夹名称。"
+)
+
+
+def build_dynamic_system_prompt():
+    """根据注册表动态生成系统提示词（过滤掉不可序列化的函数对象）"""
+    # 创建一个干净的字典，只保留大模型需要的信息
+    clean_tools_desc = {}
+    for tool_name, tool_info in TOOL_REGISTRY.items():
+        clean_tools_desc[tool_name] = {
+            "description": tool_info["description"],
+            "parameters": tool_info["parameters"]
+        }
+
+    # 序列化干净的字典
+    tools_desc = json.dumps(clean_tools_desc, ensure_ascii=False, indent=2)
+
+    return f'''你是一个MCP工具调用解析器。当前系统已加载以下可用工具：
+{tools_desc}
+
+【任务】
+根据用户的自然语言指令，选择最合适的工具名称(tool_name)，并提取对应的参数(arguments)。
+
+【输出要求】
+仅输出一个合法的JSON对象，格式如下：
+{{
+  "tool_name": "函数名",
+  "arguments": {{
+    "参数名": "参数值"
+  }}
+}}
+禁止输出任何思考过程或Markdown标记。
+'''
+
+
+def process_user_request(user_input: str):
+    """
+    【通用 Agent 调度器】
+    不绑定任何具体业务，仅负责：接收指令 -> 调用大模型 -> 执行工具 -> 返回结果
+    """
+    print("[系统] 正在分析您的指令...")
+
+    # 1. 动态生成包含所有工具的 Prompt
+    system_prompt = build_dynamic_system_prompt()
+
+    # 2. 将用户指令发给大模型
+    ai_response_raw = get_ollama_reply(user_input, system_prompt=system_prompt)
+    ai_response = parse_ai_json(ai_response_raw["message"]["content"])
+
+    if not ai_response:
+        return {"success": False, "message": "AI 未能返回有效的指令"}
+
+    # 3. 提取工具名和参数
+    tool_name = ai_response.get("tool_name")
+    arguments = ai_response.get("arguments", {})
+
+    # 4. 校验并执行工具
+    if tool_name not in TOOL_REGISTRY:
+        return {"success": False, "message": f"AI 调用了不存在的工具: {tool_name}"}
+
+    target_func = TOOL_REGISTRY[tool_name]["function"]
+    print(f"[系统] AI 决定调用工具: {tool_name}，参数: {arguments}")
+
+    try:
+        result = target_func(**arguments)
+        return result
+    except Exception as e:
+        return {"success": False, "message": f"执行异常: {str(e)}"}
+
+
+
+ def run_agent(user_input: str):
+    """支持多步思考的通用 Agent 循环"""
+    messages = [
+        {"role": "system", "content": build_dynamic_system_prompt()},
+        {"role": "user", "content": user_input}
+    ]
+
+    while True:
+        # 1. 请求大模型
+        res = get_ollama_reply(messages=messages)  # 注意这里传入完整历史
+
+        if not res:  # 如果请求失败，终止循环
+            return {"success": False, "message": "AI 请求失败"}
+
+        ai_content = parse_ai_json(res["message"]["content"])
+        print(ai_content)
+
+        # 2. 如果大模型直接回复了文本（没有调用工具），说明任务结束
+        if not ai_content or "tool_name" not in ai_content:
+            return ai_content
+
+        # 3. 执行工具
+        tool_name = ai_content["tool_name"]
+        arguments = ai_content["arguments"]
+
+        if tool_name in TOOL_REGISTRY:
+            result = TOOL_REGISTRY[tool_name]["function"](**arguments)
+            print(result)
+        else:
+            result = f"错误：工具 {tool_name} 不存在"
+
+        # 4. 将工具的执行结果作为“观察(Observation)”追加到对话历史中
+        messages.append({"role": "assistant", "content": json.dumps(ai_content, ensure_ascii=False)})
+        messages.append({"role": "user",
+                         "content": f"工具 {tool_name} 的执行结果是：{json.dumps(result, ensure_ascii=False)}。请根据结果继续下一步操作或给出最终答复。"})
+
+        # 简单的安全阀，防止死循环
+        if len(messages) > 10:
+            return {"success": False, "message": "Agent 思考步数过多，已终止"}
+
+
+     return f'''你是一个智能 AI Agent。你可以通过调用工具来完成用户的复杂指令。
+
+
+【可用工具列表】
+{tools_desc}
+
+【行动准则（非常重要）】
+1. **不要猜测**：如果你需要的信息（如文件路径、ID、状态）不明确，**严禁自行编造**。
+2. **善用工具**：如果你不确定目标是否存在，请先调用查询类工具（如 `scan_directory`）获取真实信息。
+3. **循序渐进**：你可以分多次调用工具。例如：先扫描目录 -> 获取真实文件名 -> 再执行复制/移动。
+4. **根据反馈调整**：如果工具返回了错误（如“路径不存在”），请根据错误信息修正你的参数，再次尝试。
+【反循环与反思准则（极其重要）】
+- 在决定下一步行动前，始终回顾你的操作历史。如果你发现你在重复相似的操作（如使用相同或极相似的工具、查询），这意味着你陷入了循环。
+- 一旦意识到可能陷入循环，你必须立即改变策略。例如：尝试一个完全不同的工具、重新评估用户的目标，或者如果你认为已有足够信息就直接给出最终答案。
+- 如果工具返回“找不到路径”或类似错误，**严禁**通过随意添加转义符或修改拼写来重试！你必须先调用 `scan_directory` 工具去查看真实的目录结构。
+- 中文匹配不到时，可以考虑转化为拼音或英文。
+- 若发现目标不明确，列出所有相关文件，找出相关性最高的进行操作。
+- 严禁无意义地重复调用同一个工具。
+【路径使用注意事项】
+- Windows 路径请使用字母盘符 + 冒号 + 反斜杠，如 F:\tmp，不要写成 F盘。
+- 如果你不确定目标文件夹是否存在，先用 scan_directory 查看父目录。
+【强制工作流（绝对遵守）】
+1. 任何涉及文件移动、复制、删除的操作，你**必须第一步**调用 scan_directory 扫描源文件夹，获取真实文件名（含扩展名）。
+2. 严禁在未扫描的情况下拼凑文件名或路径。
+3. 如果目标文件夹不确定，必须先用 scan_directory 查看目标父目录，从已有文件夹中选择最匹配的。
+4. 严禁自行创建文件夹，除非用户明确要求。
+
+【输出格式】
+仅输出一个合法的 JSON 对象：
+{{
+  "tool_name": "函数名",
+  "arguments": {{ "参数名": "参数值" }}
+}}
+如果任务已完成或需要向用户提问，请直接输出自然语言文本，不要输出 JSON。
+'''
+"""
