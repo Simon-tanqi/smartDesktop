@@ -68,7 +68,7 @@ def classify_intent(user_input: str, llm_call: Callable, model_name: str = None,
     用户输入：{user_input}
     意图类型："""
 
-    res = llm_call([{"role": "user", "content": prompt}], _model_name=model_name, _provider=provider)
+    res = llm_call([{"role": "user", "content": prompt}], model_name=model_name, provider=provider)
     if not res:
         return "general_chat"
 

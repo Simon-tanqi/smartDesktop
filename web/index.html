@@ -141,10 +141,34 @@
         .user-message { 
             display: flex;
             justify-content: flex-end;
+            align-items: flex-end;
+            gap: 8px;
         }
         .ai-message { 
             display: flex;
             justify-content: flex-start;
+            align-items: flex-end;
+            gap: 8px;
+        }
+
+        .avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 4px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+            user-select: none;
+        }
+        .user-avatar {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+        }
+        .ai-avatar {
+            background: linear-gradient(135deg, #43cea2, #185a9d);
         }
         
         .bubble {
@@ -219,11 +243,10 @@
         
         .message-time {
             font-size: 11px;
-            color: #999;
-            margin-top: 4px;
+            margin-top: 6px;
             text-align: right;
+            opacity: 0.6;
         }
-        .user-message .message-time { color: rgba(255,255,255,0.7); }
         
         .typing-indicator {
             display: none;
@@ -361,7 +384,7 @@
 				   date.getSeconds().toString().padStart(2, '0');
 		}
 
-		function appendMessage(sender, text, msgType = 'chat') {
+		function appendMessage(sender, text, msgType = 'chat', timestamp = null) {
 			if (msgType === 'think') {
 				// 折叠思考块
 				const block = document.createElement('div');
@@ -384,9 +407,18 @@
 			bubble.innerHTML = renderMarkdown(text);
 			const timeSpan = document.createElement('div');
 			timeSpan.className = 'message-time';
-			timeSpan.textContent = formatTime(new Date());
-			msgDiv.appendChild(bubble);
-			msgDiv.appendChild(timeSpan);
+			timeSpan.textContent = formatTime(timestamp || new Date());
+			bubble.appendChild(timeSpan);
+			const avatar = document.createElement('div');
+			avatar.className = sender === 'user' ? 'avatar user-avatar' : 'avatar ai-avatar';
+			avatar.textContent = sender === 'user' ? '我' : 'AI';
+			if (sender === 'user') {
+				msgDiv.appendChild(bubble);
+				msgDiv.appendChild(avatar);
+			} else {
+				msgDiv.appendChild(avatar);
+				msgDiv.appendChild(bubble);
+			}
 			chatContainer.insertBefore(msgDiv, typingIndicator);
 			chatContainer.scrollTop = chatContainer.scrollHeight;
 		}
@@ -411,7 +443,7 @@
 
 		function renderChatHistory(messages) {
 			clearChatArea();
-			messages.forEach(msg => appendMessage(msg.sender, msg.text, msg.msgType || 'chat'));
+			messages.forEach(msg => appendMessage(msg.sender, msg.text, msg.msgType || 'chat', msg.timestamp));
 		}
 
 		function renderSessionList() {
@@ -580,7 +612,8 @@
 		async function sendMessage() {
 			const text = messageInput.value.trim();
 			if (!text || !currentSessionId) return;
-			appendMessage('user', text);
+			const userTimestamp = new Date().toISOString();
+			appendMessage('user', text, 'chat', userTimestamp);
 			messageInput.value = '';
 			typingIndicator.style.display = 'flex';
 
@@ -660,7 +693,7 @@
 									break;
 								case 'final':
 									typingIndicator.style.display = 'none';
-									appendMessage('ai', data.text);
+									appendMessage('ai', data.text, 'chat', data.timestamp);
 									// 思考区域折叠回默认状态
 									if (hasThinking) {
 										thinkBlock.classList.remove('open');
@@ -670,8 +703,8 @@
 									}
 									// 更新本地缓存
 									if (sessions[currentSessionId]) {
-										sessions[currentSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat' });
-										sessions[currentSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat' });
+										sessions[currentSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp });
+										sessions[currentSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat', timestamp: data.timestamp });
 									}
 									break;
 								case 'error':

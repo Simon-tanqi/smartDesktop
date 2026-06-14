@@ -3,7 +3,7 @@ import os, sys, json, uuid, time, datetime, re
 from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
 from intent_router import classify_intent, extract_params
 from tools import TOOL_REGISTRY, build_dynamic_system_prompt
-from memory import (load_long_term, get_recent_compressed, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace)
+from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace)
 
 
 app = Flask(__name__,template_folder='web',static_folder='web/static')
@@ -106,47 +106,12 @@ def run_agent_with_steps(user_message, model_choice, session_id=None, trace_id="
         persona_mode=persona_mode,
     )
 
-    # 2. 长期记忆（手动格式化，基于 load_long_term 返回的结构）
-    long_term = load_long_term()
-    memory_lines = []
-
-    # 用户基本信息
-    user_info = long_term.get("user_info", {})
-    if user_info.get("name"):
-        memory_lines.append(f"用户姓名：{user_info['name']}")
-    if user_info.get("job_title"):
-        memory_lines.append(f"职位：{user_info['job_title']}")
-    if user_info.get("company"):
-        memory_lines.append(f"公司：{user_info['company']}")
-
-    # 核心知识/技能
-    core_knowledge = long_term.get("core_knowledge", [])
-    if core_knowledge:
-        memory_lines.append(f"掌握的技能：{'; '.join(core_knowledge)}")
-
-    # 项目经验（只展示最近3个）
-    projects = long_term.get("projects", [])
-    if projects:
-        memory_lines.append(f"参与的项目：{'; '.join(projects[-3:])}")
-
-    # 偏好
-    preferences = long_term.get("preferences", [])
-    if preferences:
-        memory_lines.append(f"偏好：{'; '.join(preferences)}")
-
-    # 一般事实（只展示最近3个）
-    facts = long_term.get("facts", [])
-    if facts:
-        memory_lines.append(f"其他事实：{'; '.join(f for f in facts[-3:] if f)}")
-
-    memory_str = "【长期记忆】\n" + "\n".join(memory_lines) + "\n" if memory_lines else ""
-
-    # 3. 压缩摘要（历史对话摘要）
-    compressed_str = get_recent_compressed(3)   # 返回带标题的字符串，可能为空
-    if compressed_str:
-        compressed_str = compressed_str + "\n"
-
-    full_system = base_system + "\n" + memory_str + compressed_str
+    # 2. 按需注入长期记忆（关键词匹配 + 字符上限）
+    relevant_memory = get_relevant_memory(user_message)
+    if relevant_memory:
+        full_system = base_system + "\n" + relevant_memory
+    else:
+        full_system = base_system
     # ----- 构建初始消息列表 -----
     messages = [{"role": "system", "content": full_system}] + cleaned_history
     # 将用户当前消息加入（注意：不在这里存储到数据库，只用于推理）
@@ -307,12 +272,12 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
     _default_model = model_name
     _default_provider = provider
 
-    def llm_nonstream(messages, _model_name=None, _provider=None):
+    def llm_nonstream(messages, model_name=None, provider=None):
         """非流式调用，仅用于意图识别和参数提取"""
         idx = _call_seq[0]
         _call_seq[0] += 1
-        actual_model = _model_name if _model_name else _default_model
-        actual_provider = _provider if _provider else _default_provider
+        actual_model = model_name if model_name else _default_model
+        actual_provider = provider if provider else _default_provider
         label = "intent_classify" if idx == 0 else "param_extract"
         trace_entry = {"index": idx, "label": label, "model": f"{actual_provider}/{actual_model}", "messages": messages}
         _trace_data.append(trace_entry)
@@ -404,24 +369,12 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
         persona_mode = intent_type if intent_type in PERSONA_MODES else None
         base_system = build_dynamic_system_prompt(intent_type=intent_type, persona_mode=persona_mode)
 
-        long_term = load_long_term()
-        memory_lines = []
-        user_info = long_term.get("user_info", {})
-        if user_info.get("name"): memory_lines.append(f"用户姓名：{user_info['name']}")
-        if user_info.get("job_title"): memory_lines.append(f"职位：{user_info['job_title']}")
-        if user_info.get("company"): memory_lines.append(f"公司：{user_info['company']}")
-        core_knowledge = long_term.get("core_knowledge", [])
-        if core_knowledge: memory_lines.append(f"掌握的技能：{'; '.join(core_knowledge)}")
-        projects = long_term.get("projects", [])
-        if projects: memory_lines.append(f"参与的项目：{'; '.join(projects[-3:])}")
-        preferences = long_term.get("preferences", [])
-        if preferences: memory_lines.append(f"偏好：{'; '.join(preferences)}")
-        facts = long_term.get("facts", [])
-        if facts: memory_lines.append(f"其他事实：{'; '.join(f for f in facts[-3:] if f)}")
-        memory_str = "【长期记忆】\n" + "\n".join(memory_lines) + "\n" if memory_lines else ""
-        compressed_str = get_recent_compressed(3)
-        if compressed_str: compressed_str = compressed_str + "\n"
-        full_system = base_system + "\n" + memory_str + compressed_str
+        # 2. 按需注入长期记忆（关键词匹配 + 字符上限）
+        relevant_memory = get_relevant_memory(user_message)
+        if relevant_memory:
+            full_system = base_system + "\n" + relevant_memory
+        else:
+            full_system = base_system
 
         messages = [{"role": "system", "content": full_system}] + cleaned_history
         messages.append({"role": "user", "content": user_message})
@@ -500,31 +453,8 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
         # final_message
         if ai_content and isinstance(ai_content, dict) and "final_message" in ai_content:
             final_msg = ai_content["final_message"]
-
-            # 防幻觉门禁：final_message 中出现工具调用描述但本轮未实际执行工具
-            tools_executed = any(s.get("status") == "完成" for s in collected_steps)
-            if not tools_executed:
-                # 检测 final_msg 中是否嵌入了工具调用 JSON
-                has_embedded_tool = bool(re.search(
-                    r'"tool_name"\s*:\s*"(write_file|read_file|replace_in_file|copy_file|move_file|scan_directory|search_content|execute_command)"',
-                    final_msg
-                ))
-                # 检测 final_msg 中是否出现"写入/修改/创建文件"等操作完成描述但无工具记录
-                action_keywords = r'(已写入|已修改|已创建|已复制|已移动|已删除|已保存|已生成|写入了|修改了|创建了|用\s*write_file|用\s*read_file)'
-                has_action_claim = re.search(action_keywords, final_msg)
-                if has_embedded_tool or has_action_claim:
-                    messages.append({"role": "system", "content": (
-                        "你在 final_message 中描述了文件操作但本轮并未实际执行任何工具。"
-                        "禁止在 final_message 中输出工具调用 JSON 或假装已完成操作。"
-                        "规则：先用 {\"tool_name\":\"...\",\"arguments\":{...}} 执行工具，"
-                        "收到工具返回结果后再用 {\"final_message\":\"...\"} 总结。"
-                    )})
-                    continue
-
             _dump_prompt_trace()
-            # 存储到记忆
-            append_session_message(session_id, "assistant", final_msg, skip_compress=True,
-                                   trace_id=trace_id, user_id=user_id)
+            # 存储 assistant 消息到 SQLite
             for step in collected_steps:
                 step_text = step.get("step", "")
                 if step.get("status") == "完成":
@@ -534,19 +464,17 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
                                      trace_id=trace_id, user_id=user_id)
             add_chat_message(session_id, "assistant", final_msg, msg_type="chat",
                              trace_id=trace_id, user_id=user_id)
-            yield emit("final", text=final_msg)
+            yield emit("final", text=final_msg, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
         # 纯文本回退（仅重试一次）
         if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
             fallback = raw_content
             if intent_type == "general_chat":
-                append_session_message(session_id, "assistant", fallback, skip_compress=True,
-                                       trace_id=trace_id, user_id=user_id)
                 add_chat_message(session_id, "assistant", fallback, msg_type="chat",
                                  trace_id=trace_id, user_id=user_id)
                 _dump_prompt_trace()
-                yield emit("final", text=fallback)
+                yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 return
             if not retry_used:
                 retry_used = True
@@ -555,12 +483,10 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
                     "必须严格输出 {\"tool_name\": \"...\", \"arguments\": {...}} 或 {\"final_message\": \"...\"}。"
                 )})
                 continue
-            append_session_message(session_id, "assistant", fallback, skip_compress=True,
-                                   trace_id=trace_id, user_id=user_id)
             add_chat_message(session_id, "assistant", fallback, msg_type="chat",
                              trace_id=trace_id, user_id=user_id)
             _dump_prompt_trace()
-            yield emit("final", text=fallback)
+            yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
         # 工具调用
@@ -569,7 +495,7 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
 
         if tool_name == "finished":
             _dump_prompt_trace()
-            yield emit("final", text="任务已完成")
+            yield emit("final", text="任务已完成", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
         if tool_name in TOOL_REGISTRY:
@@ -619,7 +545,7 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
         messages.append({"role": "user", "content": tool_result_msg})
 
     _dump_prompt_trace()
-    yield emit("final", text="任务未完成，已保存进度。可以继续。")
+    yield emit("final", text="任务未完成，已保存进度。可以继续。", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 # ---------- Flask 路由 ----------
@@ -690,7 +616,8 @@ def get_session(session_id):
             formatted.append({
                 "sender": sender,
                 "text": msg["content"],
-                "msgType": msg.get("msg_type", "chat")
+                "msgType": msg.get("msg_type", "chat"),
+                "timestamp": msg.get("created_at", "")
             })
         return jsonify({"success": True, "messages": formatted})
     except Exception as e:
@@ -712,10 +639,9 @@ def api_chat():
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
 
-        # 存储用户消息到记忆
+        # 存储用户消息到记忆（含事实提取、压缩检查、SQLite 写入）
         append_session_message(session_id, "user", user_input, skip_compress=False,
                                trace_id=trace_id, user_id=user_id)
-        add_chat_message(session_id, "user", user_input, trace_id=trace_id, user_id=user_id)
 
         model_choice = data.get("model_choice")
         if not model_choice or not isinstance(model_choice, dict):
