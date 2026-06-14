@@ -1,0 +1,2 @@
+args:('帮我总结一下当前进展', {'display': '本地 Ollama (deepseek-r1:7b)', 'provider': 'ollama', 'model': 'deepseek-r1:7b'}, '2026060716_1')
+kwargs:{}

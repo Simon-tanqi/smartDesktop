@@ -1,2 +1,0 @@
-args:('帮我把文件中的LiteView.exe文件移动到我的桌面上来', <function run_agent.<locals>.llm at 0x000001FB10B1DD00>)
-kwargs:{'model_name': 'deepseek-chat', 'provider': 'deepseek'}

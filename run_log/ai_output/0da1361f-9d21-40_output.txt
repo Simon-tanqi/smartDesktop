@@ -1,0 +1,1 @@
+{'success': True, 'message': '{"progress": "好的谭麒，我来总结一下当前项目的整体进展。"}\n\n{"tool_name": "get_project_summary", "arguments": {"directory": "D:\\\\PyCharm Project\\\\MyAgent"}}'}

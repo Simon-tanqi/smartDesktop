@@ -1,1 +1,0 @@
-<function path_params.<locals>.decorator at 0x000001C4D932DEE0>

@@ -1,0 +1,489 @@
+import os,fnmatch
+import shutil
+import json
+import inspect
+from memory import load_long_term, save_long_term,save_ai_log #, add_compressed_summary, get_recent_compressed
+
+TOOL_REGISTRY = {}
+
+
+def path_params(*params):
+    """装饰器：标记函数的哪些参数是路径"""
+    def decorator(func):
+        func._path_params = list(params)
+        return func
+    return decorator
+
+def register_tool(func):
+    sig = inspect.signature(func)
+    parameters = {}
+    for name, param in sig.parameters.items():
+        parameters[name] = {
+            "type": str(param.annotation.__name__ if param.annotation != inspect.Parameter.empty else "any"),
+            "default": param.default if param.default != inspect.Parameter.empty else "必填"
+        }
+    path_list = getattr(func, '_path_params', [])
+    TOOL_REGISTRY[func.__name__] = {
+        "function": func,
+        "description": func.__doc__.strip() if func.__doc__ else "无描述",
+        "parameters": parameters,
+        "path_params": path_list
+    }
+    return func
+
+def build_dynamic_system_prompt():
+    clean_tools_desc = {}
+    for name, info in TOOL_REGISTRY.items():
+        clean_tools_desc[name] = info["description"]
+
+    tools_desc = json.dumps(clean_tools_desc, ensure_ascii=False, indent=2)
+
+    return f'''你是一个智能 AI Agent。你可以通过调用工具来完成用户的复杂指令。
+
+    【可用工具列表】
+    {tools_desc}
+
+    【行动准则（非常重要）】
+    1. **不要猜测**：如果你需要的信息不明确，**严禁自行编造**。
+    2. **善用工具**：如果你不确定目标是否存在，请先调用查询类工具。
+    3. **循序渐进**：你可以分多次调用工具。先查询，再操作。
+    4. **根据反馈调整**：如果工具返回错误，请根据错误信息修正参数，再次尝试。
+    5. 如果工具返回“找不到路径”，请先调用 scan_directory 查看真实目录结构。
+    6. 中文匹配不到时，可尝试拼音或英文。
+    7. 严禁无意义地重复调用同一个工具。
+
+    【代码修改准则（必读）】
+    当用户要求修改项目代码时，你没有整个项目的上下文，不得凭空假设文件内容。
+    必须遵循以下流程：
+    - 先用 search_file_content / list_files 搜索相关文件
+    - 再用 read_file 读取精确的代码片段
+    - 确认内容后再用 replace_in_file / write_to_file 修改
+    严禁跳过搜索直接修改；严禁仅凭文件名猜测代码逻辑。
+
+    【输出格式】
+    你可以输出以下三种 JSON 对象之一：
+
+    1. 调用工具：
+    {{"tool_name": "函数名", "arguments": {{"参数名": "参数值"}}}}
+
+    2. 直接回复用户（任务完成、查询结果等）：
+    {{"final_message": "你的自然语言回复"}}
+
+    3. 汇报当前进度（任务尚未完成，但需要告知用户阶段性成果）：
+    {{"progress": "已完成文件扫描，正在生成 HTML 文件..."}}
+
+    当任务需要多个步骤时，请在每个关键步骤完成后用 progress 告知用户。
+    当所有步骤都完成后，用 final_message 总结最终结果。
+    严禁在需要回复用户时继续调用无关工具。
+
+    【final_message 回复格式规范（非常重要）】
+    你的回复最终显示在聊天框里，必须简洁、自然、易读。遵循以下规则：
+
+    1. 禁止 Markdown 表格：不要使用 |---|---| 语法。
+    2. 结构化数据使用【】标题 + 缩进列表，例如：
+       【电脑配置】
+       - 操作系统：Windows 11 专业版
+       - 处理器：AMD Ryzen 5 2600
+       - 内存：24 GB
+       - C盘：559 GB（剩余 310 GB）
+    3. 不要用 --- 分隔线。不同主题之间空一行即可。
+    4. 输出内容尽量精简，避免长篇冗余描述。
+    5. 每行不超过排版舒适宽度，列表项保持对齐。
+
+    【长任务处理】
+    - 如果任务复杂，无法在一次对话中完成，请分阶段进行。每次结束时用 final_message 总结已完成部分，并说明下一步计划。
+    即使没有明确的技能规则，你仍然可以调用任何可用的工具来获取信息或完成任务。
+    如果用户只是聊天，可直接回复 natural language。
+    '''
+# -------------------- 工具函数 --------------------
+@register_tool
+@path_params("path")
+def scan_directory(path: str):
+    """扫描指定绝对路径下的第一层文件和文件夹，返回 JSON 数组。当需要确认目录内容、查找文件时使用。"""
+    try:
+        entries = [entry.name for entry in os.scandir(path)]
+        return json.dumps(entries, ensure_ascii=False)
+    except Exception as e:
+        return f"扫描失败: {str(e)}"
+
+@register_tool
+@path_params("source", "destination")
+def move_file(source: str, destination: str, overwrite: bool = True):
+    """
+    将文件移动到目标目录或重命名。
+    destination 若为已存在的目录，则移动文件到该目录下（保留原文件名）。
+    若 destination 的父目录存在但本身不存在，则当作重命名。
+    其余情况返回错误。
+    """
+    source = os.path.normpath(source)
+    destination = os.path.normpath(destination)
+
+    if not os.path.isfile(source):
+        return {"success": False, "message": f"源文件不存在: {source}"}
+
+    if os.path.isdir(destination):
+        dest_file = os.path.join(destination, os.path.basename(source))
+    elif os.path.isdir(os.path.dirname(destination)):
+        dest_file = destination
+    else:
+        return {"success": False, "message": f"目标路径无效（父目录不存在）: {destination}"}
+
+    if os.path.exists(dest_file) and not overwrite:
+        return {"success": False, "message": f"目标已存在且 overwrite=False: {dest_file}"}
+
+    try:
+        shutil.move(source, dest_file)
+        return {"success": True, "message": f"成功移动到 {dest_file}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+@register_tool
+@path_params("source", "destination")
+def copy_file(source: str, destination: str, overwrite: bool = True):
+    """复制文件，参数含义与 move_file 相同。"""
+    source = os.path.normpath(source)
+    destination = os.path.normpath(destination)
+
+    if not os.path.isfile(source):
+        return {"success": False, "message": f"源文件不存在: {source}"}
+
+    if os.path.isdir(destination):
+        dest_file = os.path.join(destination, os.path.basename(source))
+    elif os.path.isdir(os.path.dirname(destination)):
+        dest_file = destination
+    else:
+        return {"success": False, "message": f"目标路径无效（父目录不存在）: {destination}"}
+
+    if os.path.exists(dest_file) and not overwrite:
+        return {"success": False, "message": f"目标已存在且 overwrite=False: {dest_file}"}
+
+    try:
+        shutil.copy2(source, dest_file)
+        return {"success": True, "message": f"成功复制到 {dest_file}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+SKIP_DIRS = {
+    "Windows", "Program Files", "Program Files (x86)", "ProgramData",
+    "$RECYCLE.BIN", "System Volume Information", "Recovery",
+    "node_modules", "__pycache__", ".git", ".vscode", ".idea",
+    "AppData", "Local Settings", "Application Data", "Temp"
+}
+
+@register_tool
+@path_params("search_path")
+def search_files(keyword: str, search_path: str = None, file_extensions: list = None, max_results: int = 5):
+    if not search_path:
+        candidates = [
+            os.path.expanduser("~"),  # C:\Users\用户名
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+            "D:\\", "E:\\", "F:\\"
+        ]
+    else:
+        candidates = [search_path]
+
+    results = []
+    for base in candidates:
+        if not os.path.exists(base):
+            continue
+        for root, dirs, files in os.walk(base, topdown=True, onerror=lambda e: None):
+            # 跳过隐藏文件夹和系统目录
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS]
+
+            depth = root[len(base):].count(os.sep)
+            if depth > 3:  # 保持深度限制
+                continue
+
+            for f in files:
+                if keyword.lower() in f.lower():
+                    if file_extensions:
+                        if os.path.splitext(f)[1].lower() not in file_extensions:
+                            continue
+                    results.append(os.path.join(root, f))
+                    if len(results) >= max_results:
+                        return json.dumps(results, ensure_ascii=False)
+    return json.dumps(results, ensure_ascii=False)
+
+@register_tool
+@path_params("parent_dir")
+def resolve_folder(parent_dir: str, target_name: str):
+    """在 parent_dir 下查找所有子文件夹，返回候选列表及匹配提示。"""
+    if not os.path.isdir(parent_dir):
+        return json.dumps({"success": False, "message": f"父目录不存在: {parent_dir}"})
+    try:
+        folders = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
+        return json.dumps({
+            "parent": parent_dir,
+            "target_name": target_name,
+            "folders": folders
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "message": str(e)})
+
+@register_tool
+def get_workspace_path(): #获取绝对路径
+    """
+    返回当前程序同目录下 work_space 文件夹的绝对路径。
+    如果文件夹不存在，会自动创建。
+    """
+    import os
+    base = os.path.dirname(os.path.abspath(__file__))  # main.py 所在目录
+    workspace = os.path.join(base, "work_space")
+    os.makedirs(workspace, exist_ok=True)
+    return json.dumps({"workspace": workspace})
+
+
+@register_tool
+@path_params("file_path") #写入文件
+def write_file(file_path: str, content: str, overwrite: bool = True):
+    """
+    超级安全、防格式破坏、防转义、防路径穿越的文件写入工具
+    无论 content 是什么：代码、markdown、json、换行、特殊符号 → 原样写入！
+    """
+    try:
+        # 1. 固定工作空间（绝对安全路径）
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        workspace = os.path.join(base_dir, "work_space")
+        os.makedirs(workspace, exist_ok=True)
+
+        # 2. 标准化路径（防止 ../ 穿越）
+        target_abs_path = os.path.abspath(file_path)
+        workspace_abs = os.path.abspath(workspace)
+
+        # 3. 强安全校验：必须在 work_space 内
+        if not target_abs_path.startswith(workspace_abs):
+            return json.dumps({
+                "success": False,
+                "message": f"非法路径！只能在 work_space 内操作。\n目标路径：{target_abs_path}"
+            }, ensure_ascii=False)
+
+        # 4. 自动创建目录
+        parent_dir = os.path.dirname(target_abs_path)
+        os.makedirs(parent_dir, exist_ok=True)
+
+        # 5. 不覆盖判断
+        if os.path.exists(target_abs_path) and not overwrite:
+            return json.dumps({
+                "success": False,
+                "message": f"文件已存在，且不允许覆盖：{target_abs_path}"
+            }, ensure_ascii=False)
+
+        # ======================
+        # 核心：原样写入，不转义、不变形
+        # ======================
+        with open(target_abs_path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+
+        return json.dumps({
+            "success": True,
+            "message": f"文件写入成功：{target_abs_path}"
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "message": f"写入失败：{str(e)}"
+        }, ensure_ascii=False)
+
+@register_tool
+@path_params("directory")
+def search_content(keyword: str, directory: str = None, file_pattern: str = "*", max_results: int = 10):
+    """
+    在指定目录下的文件中搜索包含关键词的行。
+    返回匹配文件的路径、行号、该行内容。
+    directory: 搜索根目录，默认工作空间。
+    file_pattern: 文件匹配模式，如 "*.py"。
+    """
+    if not directory:
+        # 默认工作空间
+        base = os.path.dirname(os.path.abspath(__file__))
+        directory = os.path.join(base, "work_space")
+    results = []
+    for root, dirs, files in os.walk(directory):
+        # 跳过隐藏目录和常见无关目录
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules','__pycache__','.git')]
+        for file in files:
+            if not fnmatch.fnmatch(file, file_pattern):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                for idx, line in enumerate(lines, 1):
+                    if keyword.lower() in line.lower():
+                        results.append({
+                            "file": file_path,
+                            "line": idx,
+                            "content": line.rstrip('\n')
+                        })
+                        if len(results) >= max_results:
+                            return json.dumps(results, ensure_ascii=False)
+            except:
+                continue
+    return json.dumps(results, ensure_ascii=False)
+
+
+@register_tool
+@path_params("file_path")
+def replace_in_file(file_path: str, old_str: str, new_str: str, occurrence: int = 1):
+    """
+    将文件中第 occurrence 次出现的 old_str 替换为 new_str。
+    occurrence: 替换第几次出现（默认 1 表示第一次）。
+    返回替换次数。
+    """
+    file_path = os.path.normpath(file_path)
+    if not os.path.isfile(file_path):
+        return json.dumps({"success": False, "message": f"文件不存在: {file_path}"})
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        return json.dumps({"success": False, "message": str(e)})
+
+    count = content.count(old_str)
+    if count == 0:
+        return json.dumps({"success": False, "message": "未找到要替换的字符串"})
+    if occurrence > count:
+        return json.dumps({"success": False, "message": f"仅有 {count} 处出现，无法替换第 {occurrence} 次"})
+
+    # 替换指定出现次数
+    parts = content.split(old_str)
+    before = old_str.join(parts[:occurrence])
+    after = old_str.join(parts[occurrence:])
+    new_content = before + new_str + after
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        return json.dumps({"success": True, "message": f"替换成功，第 {occurrence} 处出现已被替换"})
+    except Exception as e:
+        return json.dumps({"success": False, "message": str(e)})
+
+@register_tool
+@path_params("file_path")
+def read_file(file_path: str, start_line: int = None, end_line: int = None):
+    """
+    读取指定文件的全部内容或指定行范围。
+    返回 JSON 格式，包含文件路径、内容、总行数。
+    """
+    import os
+    file_path = os.path.normpath(file_path)
+    if not os.path.isfile(file_path):
+        return json.dumps({"success": False, "message": f"文件不存在: {file_path}"})
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        total = len(lines)
+        if start_line is not None or end_line is not None:
+            start = max(0, (start_line or 1) - 1)
+            end = min(total, end_line or total)
+            selected = lines[start:end]
+        else:
+            selected = lines
+        content = "".join(selected)
+        return json.dumps({
+            "success": True,
+            "file": file_path,
+            "total_lines": total,
+            "content": content
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "message": str(e)})
+
+@register_tool
+def remember_user_info(key: str, value: str):
+    """记住用户的长期信息。key 可以是: name, hobbies, long_term_goal"""
+    mem = load_long_term()
+    if key not in mem:
+        return json.dumps({"success": False, "message": f"无效的记忆字段: {key}"})
+    # 特殊处理 hobbies：字符串拆分为列表
+    if key == "hobbies" and isinstance(value, str):
+        value = [h.strip() for h in value.replace("和", ",").split(",") if h.strip()]
+    mem[key] = value
+    save_long_term(mem)   # 这里调用 memory.py 中的函数
+    return json.dumps({"success": True, "message": f"记忆已更新: {key} = {value}"})
+
+
+# 在 tools.py 中添加
+import subprocess
+import shlex
+
+# 命令白名单（允许执行的程序，必须为绝对路径或仅文件名）
+ALLOWED_COMMANDS = {
+    "dir", "copy", "move", "del", "mkdir", "rmdir", "echo", "type",
+    "findstr", "where", "python", "pip", "git", "npm", "node",
+    "systeminfo", "wmic", "powershell","cmd"
+}
+# 危险模式黑名单（禁止在参数中出现）
+FORBIDDEN_PATTERNS = ["rm -rf /", "del /f /s", "format", "shutdown"]
+
+
+@register_tool
+def execute_command(command: str, working_dir: str = None) -> str:
+    """
+    在终端执行一条命令，返回标准输出和标准错误。
+    command: 完整的命令字符串（如 'dir F:\\tmp'、'move "a.txt" "b.txt"'）
+    working_dir: 可选的工作目录，默认为当前目录。
+
+    限制：仅允许执行 ALLOWED_COMMANDS 中的程序，且禁止包含危险模式。
+    """
+    # 解析命令的第一个词（程序名）
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return json.dumps({"success": False, "message": "命令解析失败，请检查引号配对。"})
+    if not parts:
+        return json.dumps({"success": False, "message": "空命令"})
+
+    prog = os.path.basename(parts[0]).lower()
+    if prog not in ALLOWED_COMMANDS:
+        return json.dumps({
+            "success": False,
+            "message": f"安全限制：不允许执行程序 '{parts[0]}'。当前白名单: {list(ALLOWED_COMMANDS)}"
+        })
+
+    # 检查是否包含危险模式
+    cmd_lower = command.lower()
+    for pattern in FORBIDDEN_PATTERNS:
+        if pattern.lower() in cmd_lower:
+            return json.dumps({"success": False, "message": f"安全限制：命令包含禁止模式 '{pattern}'"})
+
+    try:
+        result = subprocess.run(command, shell=True, cwd=working_dir,
+                                capture_output=True, text=True, timeout=30, encoding="gbk", errors="replace")
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            return json.dumps({
+                "success": False,
+                "message": f"命令执行失败 (code {result.returncode}): {error}"
+            })
+        return json.dumps({"success": True, "output": output})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"success": False, "message": "命令执行超时"})
+    except Exception as e:
+        return json.dumps({"success": False, "message": str(e)})
+
+@register_tool
+def append_to_log(content: str, filename: str = None):
+    """将内容保存到 Markdown 日志文件中。filename 可选，默认按日期。"""
+    save_ai_log(content, filename)
+    return json.dumps({"success": True, "message": "内容已保存到日志"})
+
+@register_tool
+def get_project_summary(directory: str = None):
+    """列出目录下所有代码文件及大小，帮助 AI 快速了解项目结构"""
+    import os
+    if not directory:
+        base = os.path.dirname(os.path.abspath(__file__))
+        directory = os.path.join(base, "work_space")
+    summary = []
+    for root, dirs, files in os.walk(directory):
+        # 跳过隐藏目录和常见无关目录
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules','__pycache__','.git')]
+        for file in files:
+            if file.endswith(('.py', '.html', '.js', '.css', '.json', '.md')):
+                path = os.path.join(root, file)
+                size = os.path.getsize(path)
+                summary.append({"file": file, "path": path, "size": size})
+    return json.dumps(summary, ensure_ascii=False)

@@ -1,0 +1,1 @@
+{'success': True, 'message': '{"progress": "正在扫描项目结构，了解当前代码库的完整情况。"}\n\n{"tool_name": "scan_directory", "arguments": {"path": "D:\\\\PyCharm Project\\\\MyAgent"}}'}

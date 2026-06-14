@@ -1,4 +1,4 @@
-from ai_reply import save_config
+from llm_client import save_config
 
 if __name__ == "__main__":
     print("选择后端类型:")

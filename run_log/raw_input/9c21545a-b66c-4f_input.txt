@@ -1,2 +1,0 @@
-args:('帮我把LiteView.exe文件复制到我现在的电脑桌面上来', <function run_agent.<locals>.llm at 0x000001FB10B1EFC0>)
-kwargs:{'model_name': 'deepseek-chat', 'provider': 'deepseek'}
