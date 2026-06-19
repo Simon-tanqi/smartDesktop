@@ -67,6 +67,9 @@ from memory.compressor import (
     get_recent_compressed,
     compress_conversation,
     compress_conversation_async,
+    get_latest_summary,
+    estimate_tokens,
+    estimate_messages_tokens,
 )
 
 # ── 会话管理 ──
@@ -83,4 +86,5 @@ from memory.session import (
     generate_session_id,
     get_log_dir,
     save_ai_log,
+    build_context_messages,
 )

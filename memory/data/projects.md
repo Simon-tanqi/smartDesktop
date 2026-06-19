@@ -10,3 +10,4 @@
 - [06-15] [06-14] MyAgent
 - [06-15] [06-14] MyAgent
 - [06-15] [06-14] MyAgent
+- [06-19] [06-19] 在D:\PyCharm Project\MyAgent\work_space文件夹写一个车辆相撞的前端代码，注意这是硬性物理碰撞，符合物理规则碰撞变形挤压

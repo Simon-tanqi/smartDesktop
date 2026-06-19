@@ -24,6 +24,18 @@ from memory.config import (
 _migrated = False
 _migrate_lock = threading.Lock()
 
+# ── 按文件写入锁（防并发追加导致内容交错损坏）──
+_file_locks = {}
+_file_locks_guard = threading.Lock()
+
+
+def _get_lock(filepath):
+    """获取指定文件的写入锁，按需懒创建。"""
+    with _file_locks_guard:
+        if filepath not in _file_locks:
+            _file_locks[filepath] = threading.Lock()
+        return _file_locks[filepath]
+
 
 # ═══════════════════════════════════════════════
 # 初始化 + 迁移
@@ -107,12 +119,16 @@ def _ensure_migrated():
 
 
 def _ensure_file(filepath, header):
-    """确保 Markdown 文件存在，否则创建并写入标题。"""
+    """确保 Markdown 文件存在，否则创建并写入标题（并发安全）。"""
     _ensure_migrated()
     if not os.path.exists(filepath):
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(header)
+        lock = _get_lock(filepath)
+        with lock:
+            # double-check：锁内再次确认文件未被其他线程创建
+            if not os.path.exists(filepath):
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(header)
 
 
 def _rewrite_md(filepath, content):
@@ -151,35 +167,39 @@ def _date_short():
 # ═══════════════════════════════════════════════
 
 def append_skill(text):
-    """追加一条技能。"""
+    """追加一条技能（并发安全）。"""
     _ensure_file(SKILLS_MD, "# 技能\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
-    with open(SKILLS_MD, "a", encoding="utf-8") as f:
-        f.write(line)
+    with _get_lock(SKILLS_MD):
+        with open(SKILLS_MD, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def append_project(text):
-    """追加一条项目。"""
+    """追加一条项目（并发安全）。"""
     _ensure_file(PROJECTS_MD, "# 项目\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
-    with open(PROJECTS_MD, "a", encoding="utf-8") as f:
-        f.write(line)
+    with _get_lock(PROJECTS_MD):
+        with open(PROJECTS_MD, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def append_fact(text):
-    """追加一条一般事实。"""
+    """追加一条一般事实（并发安全）。"""
     _ensure_file(FACTS_MD, "# 事实\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
-    with open(FACTS_MD, "a", encoding="utf-8") as f:
-        f.write(line)
+    with _get_lock(FACTS_MD):
+        with open(FACTS_MD, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def append_summary(text):
-    """追加一条对话摘要（含时间戳）。"""
+    """追加一条对话摘要（并发安全）。"""
     _ensure_file(SUMMARIES_MD, "# 历史对话摘要\n\n")
     line = f"- [{_timestamp()}] {text.strip()}\n"
-    with open(SUMMARIES_MD, "a", encoding="utf-8") as f:
-        f.write(line)
+    with _get_lock(SUMMARIES_MD):
+        with open(SUMMARIES_MD, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 # ═══════════════════════════════════════════════

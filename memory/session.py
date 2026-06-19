@@ -1,9 +1,10 @@
 """
 会话生命周期管理：创建、切换、删除会话，以及消息写入主入口。
 
-核心改动：
+核心改动（v3 — Token 预算制 + 摘要注入）：
   - extract_facts → extract_facts_async（不阻塞主流程）
-  - compress_conversation → compress_conversation_async（不阻塞主流程）
+  - 压缩触发从"轮次计数"改为"Token 预算"
+  - build_context_messages 将摘要注入 LLM 上下文
 """
 import os
 import datetime
@@ -11,13 +12,19 @@ import datetime
 from memory.config import (
     ACTIVE_SESSION_FILE, LOGS_DIR, NOISE_PHRASES,
     DEFAULT_KEEP_ROUNDS, DEFAULT_SUMMARY_MODEL,
+    RECENT_TOKEN_MIN, RECENT_TOKEN_MAX, SUMMARY_TOKEN_BUDGET,
 )
 from memory.stores.json_store import load_sessions_db, save_sessions_db
 from memory.stores.sqlite_store import (
     add_chat_message, get_chat_messages, log_operation,
+    get_session_messages,
 )
 from memory.extractor import extract_facts_async
-from memory.compressor import compress_conversation_async
+from memory.compressor import (
+    compress_conversation_async,
+    estimate_messages_tokens,
+    get_latest_summary,
+)
 
 
 # ═══════════════════════════════════════════════
@@ -101,7 +108,7 @@ def delete_session(session_id):
 
 
 # ═══════════════════════════════════════════════
-# 轮次追踪
+# 轮次追踪（保留兼容）
 # ═══════════════════════════════════════════════
 
 def update_last_turn(session_id, turn):
@@ -114,6 +121,43 @@ def update_last_turn(session_id, turn):
 def get_last_turn(session_id):
     db = load_sessions_db()
     return db.get(session_id, {}).get("last_turn", 0)
+
+
+# ═══════════════════════════════════════════════
+# 上下文构建：SQLite 消息 + 压缩摘要
+# ═══════════════════════════════════════════════
+
+def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
+    """
+    构建 LLM 上下文消息列表（SQLite 近期消息 + 压缩摘要）。
+
+    返回：与 get_session_messages 相同格式的 dict 列表。
+    摘要以 role="system" 形式追加在消息列表末尾，由上层决定如何使用。
+
+    Args:
+        session_id: 会话 ID
+        limit: SQLite 消息上限
+        summary_max_tokens: 摘要最大 token 数
+
+    Returns:
+        [{"role": ..., "content": ...}, ...]
+    """
+    messages = get_session_messages(session_id, limit=limit)
+
+    # ── 注入压缩摘要 ──
+    latest = get_latest_summary(days=30)
+    if latest:
+        # 截断到预算
+        truncated = latest
+        while estimate_messages_tokens([{"role": "system", "content": truncated}]) > summary_max_tokens:
+            truncated = truncated[:int(len(truncated) * 0.8)]
+        summary_msg = {
+            "role": "system",
+            "content": f"【历史对话摘要】{truncated}"
+        }
+        messages.append(summary_msg)
+
+    return messages
 
 
 # ═══════════════════════════════════════════════
@@ -131,7 +175,7 @@ def append_session_message(session_id, role, content,
     1. 闲聊过滤
     2. 确保会话元数据存在
     3. 写入 SQLite 聊天记录（追加式）
-    4. 用户消息：异步事实提取 + 异步压缩检查
+    4. 用户消息：异步事实提取 + Token 预算制压缩检查
     5. 操作日志
     """
     content = content.strip()
@@ -161,7 +205,7 @@ def append_session_message(session_id, role, content,
     add_chat_message(session_id, role, content, msg_type="chat",
                      trace_id=trace_id, user_id=user_id, timestamp=now_ts)
 
-    # ── 4. 用户消息：异步事实提取 + 异步压缩 ──
+    # ── 4. 用户消息：异步事实提取 + Token 预算制压缩 ──
     if role == "user":
         # 异步事实提取（不阻塞主流程）
         extract_facts_async(content, trace_id=trace_id, user_id=user_id,
@@ -172,18 +216,25 @@ def append_session_message(session_id, role, content,
             db[session_id]["title"] = content[:25]
             save_sessions_db(db)
 
-        # 异步压缩检查
+        # ── Token 预算制压缩检查 ──
         if not skip_compress:
-            # 统计用户轮数
             messages = get_chat_messages(session_id)
-            user_turns = sum(1 for m in messages if m["role"] == "user")
-            if user_turns > max_turns:
+            total_tokens = estimate_messages_tokens(messages)
+
+            # 软阈值触发：超过最小值且用户在发消息（任务间隙），启动异步压缩
+            if total_tokens > RECENT_TOKEN_MIN:
+                threshold_label = "soft" if total_tokens <= RECENT_TOKEN_MAX else "hard"
                 log_operation(trace_id, user_id, session_id,
                               "memory.compress.start",
-                              f"turns {user_turns} > {max_turns}")
-                compress_conversation_async(session_id, keep_rounds=max_turns,
-                                            summary_model=summary_model,
-                                            trace_id=trace_id, user_id=user_id)
+                              f"tokens {total_tokens} > {RECENT_TOKEN_MIN} ({threshold_label})")
+                compress_conversation_async(
+                    session_id,
+                    recent_token_min=RECENT_TOKEN_MIN,
+                    recent_token_max=RECENT_TOKEN_MAX,
+                    summary_model=summary_model,
+                    trace_id=trace_id,
+                    user_id=user_id,
+                )
 
     # ── 5. 操作日志 ──
     log_session_turn(role, content, trace_id=trace_id, user_id=user_id, session_id=session_id)

@@ -2,11 +2,11 @@
 import os
 import json
 import shutil
-import subprocess
 import shlex
 from datetime import datetime
 
 from . import register_tool, path_params
+from . import safe_exec
 
 SKIP_DIRS = {
     "Windows", "Program Files", "Program Files (x86)", "ProgramData",
@@ -124,12 +124,16 @@ def _log_confirmation(command: str, status: str, detail: str = ""):
 
 
 @register_tool
-def execute_command(command: str, working_dir: str = None, confirmed: bool = False) -> str:
+def execute_command(command: str, working_dir: str = None, confirmed: bool = False,
+                    challenge_response: str = None, challenge_token: str = None) -> str:
     """在终端执行一条命令。
+
     command: 完整命令字符串。
     working_dir: 可选工作目录。
     confirmed: 对于需要确认的命令（如 msiexec 卸载），首次调用设为 false，系统会返回确认需求；
                用户确认后在第二轮调用中设为 true 执行。
+    challenge_response: 危险操作授权文本（用户完整打出挑战短语后传入）。
+    challenge_token: 挑战令牌（safe_exec 返回的临时凭证）。
     """
     try:
         parts = shlex.split(command)
@@ -146,7 +150,7 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
         if pattern.lower() in cmd_lower:
             return json.dumps({"success": False, "message": f"安全限制：命令包含禁止模式 '{pattern}'"})
 
-    # 确认检查：匹配需确认模式且用户尚未确认
+    # 确认检查：敏感操作（msiexec 卸载等）
     if not confirmed:
         for pattern in CONFIRM_REQUIRED_PATTERNS:
             if pattern.lower() in cmd_lower:
@@ -157,21 +161,21 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
                     "command": command
                 }, ensure_ascii=False)
 
-    # 执行命令
-    try:
-        result = subprocess.run(command, shell=True, cwd=working_dir,
-                                capture_output=True, text=True, timeout=30, encoding="gbk", errors="replace")
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            error = result.stderr.strip()
-            _log_confirmation(command, "FAILED", f"code {result.returncode}: {error}")
-            return json.dumps({"success": False, "message": f"命令执行失败 (code {result.returncode}): {error}"})
+    # 执行命令——通过 safe_exec 安全层
+    result = safe_exec.run_powershell(
+        command,
+        working_dir=working_dir,
+        challenge_response=challenge_response,
+        challenge_token=challenge_token,
+    )
 
-        _log_confirmation(command, "SUCCESS", f"返回 {len(output)} 字符")
-        return json.dumps({"success": True, "output": output})
-    except subprocess.TimeoutExpired:
-        _log_confirmation(command, "TIMEOUT", "命令超时")
-        return json.dumps({"success": False, "message": "命令执行超时"})
-    except Exception as e:
-        _log_confirmation(command, "ERROR", str(e))
-        return json.dumps({"success": False, "message": str(e)})
+    if result.get("challenge_required"):
+        _log_confirmation(command, "CHALLENGE", result.get("danger_type", ""))
+        return json.dumps(result, ensure_ascii=False)
+
+    if result.get("success"):
+        _log_confirmation(command, "SUCCESS", f"返回 {len(result.get('output', ''))} 字符")
+        return json.dumps({"success": True, "output": result["output"]}, ensure_ascii=False)
+
+    _log_confirmation(command, "FAILED", result.get("message", ""))
+    return json.dumps({"success": False, "message": result.get("message", "")}, ensure_ascii=False)

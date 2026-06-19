@@ -42,11 +42,15 @@ USER_ID_FILE = os.path.join(SESSION_DIR, "user_id.txt")
 OPERATION_LOG_DB = os.path.join(LOGS_DIR, "operation_log.db")
 TRACE_DB = os.path.join(LOGS_DIR, "agent_trace.db")
 
-# ── 压缩配置 ──
+# ── 压缩配置（Token 预算制）──
 MAX_COMPRESSED_ENTRIES = 100
-DEFAULT_KEEP_ROUNDS = 8
+DEFAULT_KEEP_ROUNDS = 8  # 已废弃，保留兼容；新逻辑使用 RECENT_TOKEN_MIN/MAX
+RECENT_TOKEN_MIN = 30000      # 软阈值：超过后触发异步压缩（用户消息间隙执行）
+RECENT_TOKEN_MAX = 50000      # 硬阈值：必须压缩（防止上下文撑爆）
+SUMMARY_TOKEN_BUDGET = 20000  # 摘要注入 system prompt 的 token 上限
 DEFAULT_SUMMARY_MODEL = "deepseek-chat"
-MAX_SUMMARY_LENGTH = 50   # 摘要最大字数
+SUMMARY_MODEL = "deepseek-chat"  # 摘要专用模型（可与主模型不同，推荐用小模型降低成本）
+MAX_SUMMARY_LENGTH = 200      # 摘要最大字数（递归摘要需要更大空间）
 
 # ── 按需注入配置 ──
 MAX_RELEVANT_MEMORY_CHARS = 800   # 注入 system prompt 的最大字符数

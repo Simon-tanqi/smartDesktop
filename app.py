@@ -4,10 +4,16 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
 from intent_router import classify_intent, extract_params
 from tools import TOOL_REGISTRY, build_dynamic_system_prompt
-from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace)
+from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace, build_context_messages)
 
 
 app = Flask(__name__,template_folder='web',static_folder='web/static')
+
+# ── 工具执行线程池单例（避免每次工具调用重复新建/销毁）──
+import atexit
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tool-")
+atexit.register(_TOOL_EXECUTOR.shutdown, wait=False)
+
 # ---------- 工作空间配置 ----------
 workspace_path = os.path.dirname(os.path.abspath(__file__))
 # ---------- 模型选择（可从前端传参） ----------
@@ -142,8 +148,11 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                   output_summary=str(params)[:200])
 
         # ===== Phase 2: 构建 System Prompt =====
-        history_messages = get_session_messages(session_id)
-        cleaned_history = [m for m in history_messages if m["role"] != "system"]
+        # 使用 build_context_messages 获取 SQLite 消息 + 压缩摘要
+        history_messages = build_context_messages(session_id)
+        # 分离摘要和普通消息：摘要以 system 角色注入 prompt，其余消息用于对话历史
+        summary_msgs = [m for m in history_messages if m["role"] == "system" and "【历史对话摘要】" in m.get("content", "")]
+        cleaned_history = [m for m in history_messages if not (m["role"] == "system" and "【历史对话摘要】" in m.get("content", ""))]
 
         # 规范化消息序列：合并连续同角色消息，确保 OpenAI/DeepSeek API 兼容
         def _normalize_messages(msgs):
@@ -172,6 +181,10 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             full_system = base_system + "\n" + relevant_memory
         else:
             full_system = base_system
+
+        # 3. 注入压缩摘要（历史对话回顾）
+        if summary_msgs:
+            full_system = full_system + "\n" + summary_msgs[0]["content"]
 
         messages = [{"role": "system", "content": full_system}] + cleaned_history
 
@@ -222,11 +235,10 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         last_exception = None
         for attempt in range(3):
             try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        TOOL_REGISTRY[tool_name]["function"], **arguments
-                    )
-                    return future.result(timeout=timeout)
+                future = _TOOL_EXECUTOR.submit(
+                    TOOL_REGISTRY[tool_name]["function"], **arguments
+                )
+                return future.result(timeout=timeout)
             except FutureTimeout:
                 raise TimeoutError(f"工具 {tool_name} 执行超时 ({timeout}s) 且不重试")
             except Exception as e:

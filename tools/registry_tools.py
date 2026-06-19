@@ -1,10 +1,10 @@
 """注册表操作工具：安全的注册表读写（仅限 HKCU + 白名单路径）"""
-import subprocess
 import json
 import os
 from datetime import datetime
 
 from . import register_tool
+from . import safe_exec
 
 # ── 注册表二级白名单 ──
 ALLOWED_ROOT_KEYS = {"HKCU", "HKEY_CURRENT_USER"}
@@ -141,24 +141,17 @@ def modify_registry(command: str) -> str:
             "allowed_paths": ALLOWED_PATH_PREFIXES
         }, ensure_ascii=False)
 
-    try:
-        result = subprocess.run(
-            command, shell=True,
-            capture_output=True, text=True, timeout=15,
-            encoding="gbk", errors="replace"
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            error = result.stderr.strip() or "未知错误"
-            _log_operation(f"FAILED ({operation_tag})", command, error)
-            return json.dumps({"success": False, "message": f"注册表操作失败: {error}"}, ensure_ascii=False)
+    # 安全执行：shell=False，命令拆为 list
+    cmd_list = [p.strip('"') if p.startswith('"') and p.endswith('"') else p for p in command.strip().split()]
+    result = safe_exec.run_cmd(cmd_list, timeout=15)
 
-        _log_operation(f"SUCCESS ({operation_tag})", command, output[:200] if output else "(无输出)")
-        return json.dumps({"success": True, "output": output}, ensure_ascii=False)
+    if result.get("challenge_required"):
+        _log_operation(f"CHALLENGE ({operation_tag})", command, result.get("danger_type", ""))
+        return json.dumps(result, ensure_ascii=False)
 
-    except subprocess.TimeoutExpired:
-        _log_operation(f"TIMEOUT ({operation_tag})", command, "命令超时")
-        return json.dumps({"success": False, "message": "注册表操作超时"}, ensure_ascii=False)
-    except Exception as e:
-        _log_operation(f"ERROR ({operation_tag})", command, str(e))
-        return json.dumps({"success": False, "message": str(e)}, ensure_ascii=False)
+    if result.get("success"):
+        _log_operation(f"SUCCESS ({operation_tag})", command, result["output"][:200] if result["output"] else "(无输出)")
+        return json.dumps({"success": True, "output": result["output"]}, ensure_ascii=False)
+
+    _log_operation(f"FAILED ({operation_tag})", command, result.get("message", ""))
+    return json.dumps({"success": False, "message": result.get("message", "")}, ensure_ascii=False)
