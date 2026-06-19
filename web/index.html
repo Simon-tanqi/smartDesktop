@@ -357,8 +357,7 @@
 		// ============================
 		// 1. 配置与状态
 		// ============================
-		const CURRENT_TIME = "2026-06-10";
-		const CURRENT_LOCATION = "Shenzhen";
+		const CURRENT_TIME = new Date().toISOString().slice(0, 10);
 		
 		let currentSessionId = null;
 		const sessions = {};
@@ -379,9 +378,19 @@
 		// ============================
 		function formatTime(date) {
 			if (!(date instanceof Date)) date = new Date(date);
-			return date.getHours().toString().padStart(2, '0') + ':' + 
-				   date.getMinutes().toString().padStart(2, '0') + ':' +
-				   date.getSeconds().toString().padStart(2, '0');
+			if (isNaN(date.getTime())) date = new Date();
+			const now = new Date();
+			const hh = date.getHours().toString().padStart(2, '0');
+			const mm = date.getMinutes().toString().padStart(2, '0');
+			const ss = date.getSeconds().toString().padStart(2, '0');
+			// 跨天显示年月日前缀
+			if (date.toDateString() !== now.toDateString()) {
+				const y = date.getFullYear();
+				const mo = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				return `${y}-${mo}-${d} ${hh}:${mm}:${ss}`;
+			}
+			return `${hh}:${mm}:${ss}`;
 		}
 
 		function appendMessage(sender, text, msgType = 'chat', timestamp = null) {
@@ -479,8 +488,7 @@
 						   now.getDate().toString().padStart(2, '0');
 			const timeStr = now.getHours().toString().padStart(2, '0') + 
 						   now.getMinutes().toString().padStart(2, '0');
-			const location = CURRENT_LOCATION || "Unknown";
-			return `${dateStr}_${timeStr}_${location}`;
+			return `${dateStr}_${timeStr}`;
 		}
 
 		// ============================
@@ -614,6 +622,10 @@
 			if (!text || !currentSessionId) return;
 			const userTimestamp = new Date().toISOString();
 			appendMessage('user', text, 'chat', userTimestamp);
+			// 立即保存用户消息到本地缓存，避免流式过程中丢失
+			if (sessions[currentSessionId]) {
+				sessions[currentSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp });
+			}
 			messageInput.value = '';
 			typingIndicator.style.display = 'flex';
 
@@ -630,6 +642,7 @@
 			chatContainer.insertBefore(thinkBlock, typingIndicator);
 			const thinkBody = thinkBlock.querySelector('.think-body');
 			let hasThinking = false;
+			let thinkContent = '';
 
 			try {
 				const modelValue = modelSelect.value;
@@ -681,14 +694,17 @@
 							switch (data.type) {
 								case 'thinking':
 									hasThinking = true;
+									thinkContent += data.text;
 									thinkBody.style.display = 'block';
-									thinkBody.textContent += data.text;
+									thinkBody.textContent = thinkContent;
 									chatContainer.scrollTop = chatContainer.scrollHeight;
 									break;
 								case 'step':
 									hasThinking = true;
+									const stepText = '\n【' + data.status + '】' + data.text;
+									thinkContent += stepText;
 									thinkBody.style.display = 'block';
-									thinkBody.textContent += '\n【' + data.status + '】' + data.text;
+									thinkBody.textContent = thinkContent;
 									chatContainer.scrollTop = chatContainer.scrollHeight;
 									break;
 								case 'final':
@@ -701,9 +717,11 @@
 									} else {
 										thinkBlock.remove();
 									}
-									// 更新本地缓存
+									// 更新本地缓存（用户消息已在 sendMessage 开头保存）
 									if (sessions[currentSessionId]) {
-										sessions[currentSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp });
+										if (hasThinking) {
+											sessions[currentSessionId].messages.push({ sender: 'ai', text: thinkContent, msgType: 'think', timestamp: data.timestamp });
+										}
 										sessions[currentSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat', timestamp: data.timestamp });
 									}
 									break;
@@ -724,6 +742,8 @@
 					typingIndicator.style.display = 'none';
 					thinkBody.style.display = '';
 				}
+				// 流式完成后备份本地缓存到后端
+				saveSessionToBackend(currentSessionId);
 			} catch (error) {
 				typingIndicator.style.display = 'none';
 				appendMessage('ai', '网络错误: ' + error.message);

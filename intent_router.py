@@ -8,7 +8,10 @@ INTENT_REGISTRY = {
     "file_manage":       "文件扫描、复制、移动、删除等本地文件操作",
     "code_generate":     "生成、重构、审查代码",
     "db_query":          "查询数据库、生成SQL语句",
+    "user_memory":       "记住或召回用户的个人信息（姓名/爱好/目标）",
+    "web_browse":        "网页搜索、抓取内容、查询天气/新闻等实时信息",
     "general_chat":      "日常闲聊、通用问答",
+    "system_config":     "注册表修改、软件安装卸载、系统外观调整等系统级操作",
     "architect":         "系统架构分析与方案设计",
     "code_review":       "代码审查，找 Bug 和安全隐患",
     "product_manager":   "产品规划与需求探索",
@@ -51,7 +54,15 @@ EXTRACT_PROMPTS = {
       "value": "要记住的内容（仅 remember 时填写）"
     }
     注意：用户可能说“我叫张三”、“我的长期目标是...”、“我的爱好是...”，即使这些内容混合在其他需求中，也请提取。""",
-    "general_chat": None  # 通用对话无需额外规则
+    "general_chat": None,  # 通用对话无需额外规则
+    "system_config": """
+    【系统配置专用规则】
+    - 修改注册表使用 modify_registry 工具，仅允许 HKCU 下的白名单路径。
+    - 软件安装使用 execute_command 调用 winget install。
+    - 软件卸载使用 execute_command 调用 msiexec /x，首次调用会触发确认（返回 confirmation_required）。
+    - 系统命令执行使用 execute_command（winget/msiexec/taskkill 已在白名单中）。
+    - 修改注册表后必须提示用户重启 explorer.exe 或注销才能生效。
+    """,
 }
 
 
@@ -120,7 +131,7 @@ SKILL_PROMPTS = {
     【路径强制规则】
     - 生成任何文件前，必须调用 `get_workspace_path` 获取工作空间根目录。
     - 所有文件路径必须是 `{workspace}/子目录/文件名` 的形式，严禁在 workspace 外创建文件。
-    - 如果目标目录不存在，先使用 `create_dir` 创建（如果工具可用）或由 `write_file` 自动创建父目录。
+    - 如果目标目录不存在，由 `write_file` 自动创建父目录。
     """,
     "db_query": """
     【数据库查询专用规则】
@@ -129,8 +140,24 @@ SKILL_PROMPTS = {
     """,
     "user_memory": """
     【记忆管理专用规则】
-    - 使用 remember_user_info 保存长期记忆（姓名/爱好/目标）。
-    - 使用 recall_user_info 或 recall_past 查询历史记忆。
+    - 记忆系统已升级为自动提取 + Markdown 存储。
+    - 系统会自动从对话中提取用户信息（姓名/爱好/目标）并持久化。
+    - 查询历史记忆时直接进行对话，系统会自动注入相关内容。
     """,
-    "general_chat": "使用自然语言回复用户信息"  # 通用对话无需额外规则
+    "web_browse": """
+    【网页浏览专用规则】
+    - 使用 web_search 搜索互联网获取最新信息。
+    - 搜索后可用 fetch_webpage 深入阅读重要链接。
+    - 查询天气使用 get_weather，默认城市深圳。
+    - 对时效性问题（新闻、最新资讯、实时数据）优先搜索而非凭记忆回答。
+    """,
+    "general_chat": "使用自然语言回复用户信息",  # 通用对话无需额外规则
+    "system_config": """
+    【系统配置专用规则】
+    - 修改注册表前，先用 modify_registry 的 query 操作确认当前状态。
+    - 注册表修改后必须告知用户生效方式（重启 explorer.exe 或注销）。
+    - winget 安装直接执行，msiexec 卸载需要用户确认（两步流程）。
+    - 当 execute_command 返回 confirmation_required 时，输出 final_message 向用户展示待执行的命令并请求确认。
+    - 用户确认后，在新一轮对话中使用 confirmed=true 重新调用 execute_command。
+    """,
 }

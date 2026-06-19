@@ -68,6 +68,11 @@ def _migrate_from_json():
                     append_fact(str(fact))
 
                 print(f"[Memory] 已从 {MEMORY_FILE} 迁移到 Markdown 文件")
+                # 迁移后删除旧 JSON，避免 debug reloader 重启时重复迁移
+                try:
+                    os.remove(MEMORY_FILE)
+                except OSError:
+                    pass
             except Exception as e:
                 print(f"[Memory] 迁移长期记忆失败: {e}")
 
@@ -83,6 +88,11 @@ def _migrate_from_json():
                         append_summary(summary)
 
                 print(f"[Memory] 已从 {COMPRESSED_FILE} 迁移 {len(old_compressed)} 条摘要")
+                # 迁移后删除旧 JSON，避免 debug reloader 重启时重复迁移
+                try:
+                    os.remove(COMPRESSED_FILE)
+                except OSError:
+                    pass
             except Exception as e:
                 print(f"[Memory] 迁移压缩记忆失败: {e}")
 

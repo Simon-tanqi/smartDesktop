@@ -1,43 +1,29 @@
 """
-LLM 调用适配层：默认使用 Ollama，可通过 set_llm_caller 替换为任意 provider。
+LLM 调用适配层：通过 llm_client.ai_concat 统一路由，支持所有已配置的后端。
 """
-import requests
 
-_default_model = "qwen2:7b"
+# 默认模型（仅当调用方未指定 model 时生效）
+_default_model = "deepseek-chat"
 
 
-def _ollama_call(messages, model=None):
-    """调用本地 Ollama 模型（内部实现）。"""
-    url = "http://localhost:11434/api/chat"
-    payload = {
-        "model": model or _default_model,
-        "messages": messages,
-        "stream": False,
-        "options": {"temperature": 0.3},
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=120)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"[Ollama] 请求失败: {e}")
+def call_llm(messages, model=None):
+    """
+    调用 LLM（通过 llm_client 统一入口，自动路由到配置的后端）。
+    返回 dict 或 None，dict 需包含 {"message": {"content": "..."}}。
+    """
+    from llm_client import ai_concat  # 延迟导入，避免 memory 包初始化时尚未就绪
+
+    result = ai_concat(messages, model_name=model or _default_model)
+    if result is None:
         return None
-
-
-# ── 可替换的 LLM 调用入口 ──
-_llm_caller = _ollama_call
+    # ai_concat 返回 {"message": {"content": "..."}}，与旧接口兼容
+    return result
 
 
 def set_llm_caller(func):
     """
-    替换记忆系统使用的 LLM 调用函数。
-    func 签名: fn(messages: list[dict], model: str) -> dict | None
-    返回 dict 需包含 {"message": {"content": "..."}} 结构。
+    替换记忆系统使用的 LLM 调用函数（保留兼容，但不再使用内部 caller）。
+    func 签名: fn(messages, model) -> dict | None
     """
-    global _llm_caller
-    _llm_caller = func
-
-
-def call_llm(messages, model=None):
-    """调用 LLM（使用当前注册的 caller）。"""
-    return _llm_caller(messages, model=model)
+    global call_llm
+    call_llm = func

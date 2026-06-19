@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
-import os, sys, json, uuid, time, datetime, re
+import os, json, time, datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
 from intent_router import classify_intent, extract_params
 from tools import TOOL_REGISTRY, build_dynamic_system_prompt
@@ -19,253 +20,28 @@ def get_model_choice(display_name=None):
             return m
     return default_model
 
-
-def run_agent_with_steps(user_message, model_choice, session_id=None, trace_id="", user_id="", continue_turns=0):
+def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id="", streaming=True):
+    """ReAct 循环：按 streaming 参数选择产出方式。
+    streaming=True：逐步产出 SSE 事件，前端实时展示思考过程。
+    streaming=False：内部收集所有步骤后一次性返回（预留，后续前端加设置项）。"""
     provider = model_choice["provider"]
     model_name = model_choice["model"]
 
-    # 提示词快照：内存累积，对话结束后一次性写入 JSON
-    _trace_data = []
-    _call_seq = [0]
-
-    _default_model = model_choice["model"]
-    _default_provider = model_choice["provider"]
-
-    def llm(messages, model_name=None, provider=None):
-        idx = _call_seq[0]
-        _call_seq[0] += 1
-
-        actual_model = model_name if model_name else _default_model
-        actual_provider = provider if provider else _default_provider
-
-        if idx == 0:
-            label = "intent_classify"
-        elif idx == 1:
-            label = "param_extract"
-        else:
-            label = f"turn{idx - 2}"
-
-        trace_entry = {
-            "index": idx,
-            "label": label,
-            "model": f"{actual_provider}/{actual_model}",
-            "messages": messages
-        }
-        _trace_data.append(trace_entry)
-
-        result = ai_concat(messages=messages, model_name=actual_model, provider=actual_provider, trace_id=trace_id)
-        if result and isinstance(result.get("message"), dict):
-            trace_entry["response"] = result["message"].get("content", "")
-        else:
-            trace_entry["response"] = ""
-        return result
-
-    def _dump_prompt_trace():
-        if not _trace_data:
-            return
-        try:
-            uid = session_id if session_id else f"unknown_{trace_id[-12:]}"
-            dump_dir = os.path.join(os.path.dirname(__file__), "logs", "prompts", "Tank", uid)
-            os.makedirs(dump_dir, exist_ok=True)
-            dump_path = os.path.join(dump_dir, "llm_full_prompt.json")
-            dump_data = {}
-            for item in _trace_data:
-                key = f"{item['index']:02d}_{item['label']}"
-                dump_data[key] = item
-            with open(dump_path, "w", encoding="utf-8") as f:
-                json.dump(dump_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[WARN] 提示词日志写入失败: {e}")
-
-    # 第一阶段：意图识别与参数提取
-    t0 = time.perf_counter()
-    intent_type = classify_intent(user_message, llm, model_name=model_name, provider=provider)
-    elapsed_i = int((time.perf_counter() - t0) * 1000)
-    log_trace(trace_id, "intent.classify", "intent", elapsed_i,
-              session_id=session_id, status="success",
-              input_summary=user_message[:200], output_summary=intent_type)
-
-    t0 = time.perf_counter()
-    params = extract_params(user_message, intent_type, llm, model_name=model_name, provider=provider) or {}
-    elapsed_p = int((time.perf_counter() - t0) * 1000)
-    log_trace(trace_id, "intent.extract_params", "intent", elapsed_p,
-              session_id=session_id, status="success",
-              input_summary=f"intent={intent_type} | {user_message[:150]}",
-              output_summary=str(params)[:200])
-
-    # 加载历史消息（短期记忆）
-    history_messages = get_session_messages(session_id)
-    cleaned_history = [m for m in history_messages if m["role"] != "system"]
-
-    # ----- 构建 system prompt（包含长期记忆和压缩摘要）-----
-    # 1. 基础系统提示
-    from intent_router import PERSONA_MODES
-    persona_mode = intent_type if intent_type in PERSONA_MODES else None
-    base_system = build_dynamic_system_prompt(
-        intent_type=intent_type,
-        persona_mode=persona_mode,
-    )
-
-    # 2. 按需注入长期记忆（关键词匹配 + 字符上限）
-    relevant_memory = get_relevant_memory(user_message)
-    if relevant_memory:
-        full_system = base_system + "\n" + relevant_memory
-    else:
-        full_system = base_system
-    # ----- 构建初始消息列表 -----
-    messages = [{"role": "system", "content": full_system}] + cleaned_history
-    # 将用户当前消息加入（注意：不在这里存储到数据库，只用于推理）
-    messages.append({"role": "user", "content": user_message})
-
-    # 日志记录（结构化，带 trace 上下文）
-    log_session_turn("user", user_message, trace_id=trace_id, user_id=user_id, session_id=session_id)
-
-    collected_steps = []
-    MAX_TURNS = 15
-    start_turn = continue_turns   # 保留断点续传逻辑（暂未使用）
-    retry_used = False            # 纯文本重试标志（仅一次）
-
-    for turn in range(start_turn, MAX_TURNS):
-        if turn >= MAX_TURNS - 2:
-            messages.append({"role": "system", "content": "你即将达到思考轮次上限，请尽快收尾。"})
-
-        res = llm(messages)
-        if not res:
-            _dump_prompt_trace()
-            return collected_steps, "AI 请求失败"
-
-        # --- 提取思考过程（在 JSON 解析之前） ---
-        raw_content = res["message"]["content"]
-        thinking_text = ""
-        # 方式1：DeepSeek-R1 的 reasoning_content
-        if res["message"].get("reasoning_content", "").strip():
-            thinking_text = res["message"]["reasoning_content"].strip()
-        # 方式2：<think> 标签（DeepSeek-R1 通过 Ollama 时的格式）
-        if not thinking_text:
-            think_matches = re.findall(r'<think>(.*?)</think>', raw_content, re.DOTALL)
-            if think_matches:
-                thinking_text = "\n".join(m.strip() for m in think_matches if m.strip())
-        # 方式3：非 JSON 前置文本（普通模型没有 think 标签时）
-        if not thinking_text and raw_content.strip():
-            stripped = raw_content.strip()
-            if not stripped.startswith("{"):
-                # 取第一个 { 之前的内容作为思考
-                brace_pos = stripped.find("{")
-                if brace_pos > 20:
-                    thinking_text = stripped[:brace_pos].strip()
-                elif brace_pos == -1 and len(stripped) > 20:
-                    thinking_text = stripped[:200]
-
-        if thinking_text:
-            short_think = thinking_text[:300] + ("..." if len(thinking_text) > 300 else "")
-            # 避免重复：相同思考内容不重复添加
-            existing_thinks = [s.get("step", "") for s in collected_steps if s.get("status") == "思考"]
-            if short_think not in existing_thinks:
-                collected_steps.append({"step": short_think, "status": "思考"})
-        # --- 思考过程提取完毕 ---
-
-        ai_content = parse_ai_json(res["message"]["content"])
-
-        # 处理进度更新
-        if ai_content and isinstance(ai_content, dict) and "progress" in ai_content:
-            progress_msg = ai_content["progress"]
-            collected_steps.append({"step": progress_msg, "status": "进行中"})
-            continue
-
-        # 处理最终回复（final_message）
-        if ai_content and isinstance(ai_content, dict) and "final_message" in ai_content:
-            final_msg = ai_content["final_message"]
-            collected_steps.append({"step": "完成", "status": "完成", "detail": final_msg})
-            _dump_prompt_trace()
-            return collected_steps, final_msg
-
-        # 纯文本回退：parse_ai_json 未能提取合法 JSON
-        if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
-            fallback = res["message"]["content"]
-
-            # general_chat 意图：纯文本直接返回
-            if intent_type == "general_chat":
-                collected_steps.append({"step": "AI 回复", "status": "完成", "detail": fallback})
-                _dump_prompt_trace()
-                return collected_steps, fallback
-
-            # 其他意图：仅重试一次，仍失败则作为 final_message 返回
-            if not retry_used:
-                retry_used = True
-                messages.append({"role": "system", "content": (
-                    "你的回复不符合格式要求。"
-                    "必须严格输出 {\"tool_name\": \"...\", \"arguments\": {...}} 或 {\"final_message\": \"...\"}。"
-                )})
-                continue
-            collected_steps.append({"step": "完成", "status": "完成", "detail": fallback})
-            _dump_prompt_trace()
-            return collected_steps, fallback
-
-        # 处理工具调用
-        tool_name = ai_content["tool_name"]
-        arguments = ai_content.get("arguments", {})
-
-        if tool_name == "finished":
-            collected_steps.append({"step": "任务结束", "status": "完成"})
-            _dump_prompt_trace()
-            return collected_steps, "任务已完成"
-
-        # 执行工具
-        if tool_name in TOOL_REGISTRY:
-            path_params = TOOL_REGISTRY[tool_name].get("path_params", [])
-            for p in path_params:
-                if p in arguments:
-                    arguments[p] = normalize_path_component(arguments[p])
-            t_tool = time.perf_counter()
-            try:
-                result = TOOL_REGISTRY[tool_name]["function"](**arguments)
-                elapsed_t = int((time.perf_counter() - t_tool) * 1000)
-                result_str = str(result)
-                # 智能截断：读文件类工具保留更多上下文，避免 LLM 因信息不足盲目重试
-                result_len = len(result_str)
-                max_len = 4000 if tool_name in ("read_file", "search_content", "get_project_summary") else 2000
-                if result_len > max_len:
-                    if tool_name == "read_file":
-                        result_str = result_str[:max_len] + (
-                            f"\n\n⚠️ 结果已截断（完整长度 {result_len} 字符）。"
-                            f"如需定位特定代码，请使用 search_content 先搜索关键词获取行号，"
-                            f"再用 read_file(start_line=行号-5, end_line=行号+30) 局部读取。"
-                            f"严禁继续通过缩小 read_file 范围来搜索——你只会反复读到文件开头区域。"
-                        )
-                    else:
-                        result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
-                collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
-                log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
-                          session_id=session_id, status="success",
-                          input_summary=str(arguments)[:200],
-                          output_summary=result_str[:200])
-            except Exception as e:
-                elapsed_t = int((time.perf_counter() - t_tool) * 1000)
-                result_str = f"工具执行错误: {str(e)}"
-                collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": str(e)})
-                log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
-                          session_id=session_id, status="error",
-                          input_summary=str(arguments)[:200],
-                          error=str(e)[:500])
-        else:
-            result_str = f"工具 '{tool_name}' 不存在"
-            collected_steps.append({"step": f"未知工具 {tool_name}", "status": "错误"})
-
-        # 将工具调用和结果加入到消息历史中（用于继续推理）
-        tool_call_msg = json.dumps(ai_content, ensure_ascii=False)
-        tool_result_msg = f"工具 {tool_name} 返回：{result_str}"
-        messages.append({"role": "assistant", "content": tool_call_msg})
-        messages.append({"role": "user", "content": tool_result_msg})
-
-    # 达到最大轮次，未完成
-    _dump_prompt_trace()
-    return collected_steps, "任务未完成，已保存进度。可以继续。"
-
-
-def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", user_id=""):
-    """流式 ReAct 循环：逐步产出 SSE 事件，让前端实时展示思考过程"""
-    provider = model_choice["provider"]
-    model_name = model_choice["model"]
+    # ── 模型名校验：使用白名单强制拦截异常值 ──
+    _known_models = [m["model"] for m in get_available_models()]
+    _known_providers = {m["model"]: m["provider"] for m in get_available_models()}
+    _need_fallback = False
+    if model_name not in _known_models:
+        print(f"[DIAG] model_choice 模型名 '{model_name}' 不在已知列表中 ({_known_models})，强制回退默认模型。")
+        _need_fallback = True
+    elif _known_providers.get(model_name) != provider:
+        print(f"[DIAG] model_choice provider='{provider}' 与已知模型 '{model_name}' 的预期 provider='{_known_providers[model_name]}' 不匹配，强制回退。")
+        _need_fallback = True
+    if _need_fallback:
+        model_choice = dict(default_model)
+        provider = model_choice["provider"]
+        model_name = model_choice["model"]
+        print(f"[DIAG] → 已强制回退为 {model_choice}")
 
     _trace_data = []
     _call_seq = [0]
@@ -302,19 +78,23 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
 
         full_content = ""
         full_reasoning = ""
-        for chunk in stream_gen:
-            if chunk.get("type") == "chunk":
-                if chunk.get("content"):
-                    full_content += chunk["content"]
-                if chunk.get("reasoning"):
-                    full_reasoning += chunk["reasoning"]
-                    yield chunk["reasoning"]
-            elif chunk.get("type") == "result":
-                full_content = chunk.get("content", full_content)
-                full_reasoning = chunk.get("reasoning_content", full_reasoning)
-            elif chunk.get("type") == "error":
-                yield None
-                return
+        try:
+            for chunk in stream_gen:
+                if chunk.get("type") == "chunk":
+                    if chunk.get("content"):
+                        full_content += chunk["content"]
+                    if chunk.get("reasoning"):
+                        full_reasoning += chunk["reasoning"]
+                        yield chunk["reasoning"]
+                elif chunk.get("type") == "result":
+                    full_content = chunk.get("content", full_content)
+                    full_reasoning = chunk.get("reasoning_content", full_reasoning)
+                elif chunk.get("type") == "error":
+                    yield {"type": "error", "message": chunk.get("message", "未知错误")}
+                    return
+        except Exception as e:
+            yield {"type": "error", "message": f"流式调用异常: {str(e)}"}
+            return
 
         trace_entry["response"] = full_content
         yield {"content": full_content, "reasoning_content": full_reasoning}
@@ -365,6 +145,23 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
         history_messages = get_session_messages(session_id)
         cleaned_history = [m for m in history_messages if m["role"] != "system"]
 
+        # 规范化消息序列：合并连续同角色消息，确保 OpenAI/DeepSeek API 兼容
+        def _normalize_messages(msgs):
+            """合并连续同角色消息，避免 API 400 错误"""
+            if not msgs:
+                return []
+            result = [dict(msgs[0])]  # shallow copy
+            for m in msgs[1:]:
+                prev = result[-1]
+                if prev["role"] == m["role"]:
+                    # 同角色连续出现 → 合并内容
+                    prev["content"] = prev["content"] + "\n" + m["content"]
+                else:
+                    result.append(dict(m))
+            return result
+
+        cleaned_history = _normalize_messages(cleaned_history)
+
         from intent_router import PERSONA_MODES
         persona_mode = intent_type if intent_type in PERSONA_MODES else None
         base_system = build_dynamic_system_prompt(intent_type=intent_type, persona_mode=persona_mode)
@@ -377,7 +174,17 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
             full_system = base_system
 
         messages = [{"role": "system", "content": full_system}] + cleaned_history
-        messages.append({"role": "user", "content": user_message})
+
+        # 避免重复追加用户消息（api_chat 已通过 append_session_message 写入历史）
+        # 当 cleaned_history 最后一条 user 消息与当前 user_message 一致时跳过
+        is_duplicate = False
+        for m in reversed(cleaned_history):
+            if m["role"] == "user":
+                if m["content"].rstrip() == user_message.rstrip():
+                    is_duplicate = True
+                break
+        if not is_duplicate:
+            messages.append({"role": "user", "content": user_message})
 
         log_session_turn("user", user_message, trace_id=trace_id, user_id=user_id, session_id=session_id)
 
@@ -390,7 +197,45 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
     # ===== Phase 3: ReAct 循环（流式）=====
     collected_steps = []
     MAX_TURNS = 15
-    retry_used = False
+    MAX_CONSECUTIVE_PROGRESS = 3  # 连续 progress 轮次上限，防止无限循环
+    retry_count = 0
+    consecutive_progress = 0
+
+    # ── 工具执行辅助：重试 + 超时 + 缓存 ──
+    _cache = {}
+    _WRITE_TOOLS = {"execute_command", "modify_registry", "write_file", "edit_file",
+                     "replace_in_file", "move_file", "copy_file", "delete_file",
+                     "scan_directory"}
+
+    def _is_retryable(exc):
+        import errno
+        if isinstance(exc, (ConnectionError, TimeoutError, FutureTimeout)):
+            return True
+        if isinstance(exc, OSError):
+            return exc.errno in (errno.EAGAIN, errno.EBUSY, errno.EINTR)
+        if isinstance(exc, PermissionError):
+            return True
+        return False
+
+    def _execute_tool_with_retry(tool_name, arguments, timeout=60):
+        RETRY_DELAYS = [0.5, 1.0, 2.0]
+        last_exception = None
+        for attempt in range(3):
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        TOOL_REGISTRY[tool_name]["function"], **arguments
+                    )
+                    return future.result(timeout=timeout)
+            except FutureTimeout:
+                raise TimeoutError(f"工具 {tool_name} 执行超时 ({timeout}s) 且不重试")
+            except Exception as e:
+                if not _is_retryable(e):
+                    raise
+                last_exception = e
+                if attempt < 2:
+                    time.sleep(RETRY_DELAYS[attempt])
+        raise last_exception
 
     for turn in range(MAX_TURNS):
         if turn >= MAX_TURNS - 2:
@@ -401,6 +246,10 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
         last_result = None
 
         for item in llm_gen:
+            if isinstance(item, dict) and item.get("type") == "error":
+                _dump_prompt_trace()
+                yield emit("error", text=item.get("message", "AI 请求失败"))
+                return
             if item is None:
                 _dump_prompt_trace()
                 yield emit("error", text="AI 请求失败")
@@ -445,46 +294,50 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
 
         # progress 类型
         if ai_content and isinstance(ai_content, dict) and "progress" in ai_content:
+            consecutive_progress += 1
             progress_msg = ai_content["progress"]
             collected_steps.append({"step": progress_msg, "status": "进行中"})
+
+            # 连续 progress 轮次超限，强制收尾
+            if consecutive_progress >= MAX_CONSECUTIVE_PROGRESS:
+                _dump_prompt_trace()
+                yield emit("step", text=progress_msg, status="进行中")
+                yield emit("final",
+                    text=f"任务执行中（连续 {consecutive_progress} 轮状态更新），已中止自动循环。可以发送新指令继续。",
+                    timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                return
+
             yield emit("step", text=progress_msg, status="进行中")
+            # 将 progress 加入消息历史，避免 LLM 失忆
+            messages.append({"role": "assistant", "content": json.dumps(ai_content, ensure_ascii=False)})
+            messages.append({"role": "user", "content": f"进度已记录，继续下一步。"})
             continue
+        else:
+            consecutive_progress = 0
 
         # final_message
         if ai_content and isinstance(ai_content, dict) and "final_message" in ai_content:
             final_msg = ai_content["final_message"]
             _dump_prompt_trace()
-            # 存储 assistant 消息到 SQLite
-            for step in collected_steps:
-                step_text = step.get("step", "")
-                if step.get("status") == "完成":
-                    continue
-                if step_text:
-                    add_chat_message(session_id, "assistant", step_text, msg_type="think",
-                                     trace_id=trace_id, user_id=user_id)
-            add_chat_message(session_id, "assistant", final_msg, msg_type="chat",
-                             trace_id=trace_id, user_id=user_id)
             yield emit("final", text=final_msg, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
-        # 纯文本回退（仅重试一次）
+        # 纯文本回退（最多 3 次渐进式重试）
         if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
             fallback = raw_content
             if intent_type == "general_chat":
-                add_chat_message(session_id, "assistant", fallback, msg_type="chat",
-                                 trace_id=trace_id, user_id=user_id)
                 _dump_prompt_trace()
                 yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 return
-            if not retry_used:
-                retry_used = True
-                messages.append({"role": "system", "content": (
-                    "你的回复不符合格式要求。"
-                    "必须严格输出 {\"tool_name\": \"...\", \"arguments\": {...}} 或 {\"final_message\": \"...\"}。"
-                )})
+            RETRY_PROMPTS = [
+                "你的回复不符合格式要求。必须严格输出 {\"tool_name\": \"...\", \"arguments\": {...}} 或 {\"final_message\": \"...\"}。",
+                "仍然无效。输出的 JSON 必须可被 json.loads 解析。不要输出多余文本，只输出一个 JSON 对象。\n正确示例：\n{\"tool_name\": \"read_file\", \"arguments\": {\"file_path\": \"D:\\\\test.txt\"}}",
+                "最后一次尝试。如果仍然失败，将直接返回原始内容。",
+            ]
+            if retry_count < len(RETRY_PROMPTS):
+                messages.append({"role": "system", "content": RETRY_PROMPTS[retry_count]})
+                retry_count += 1
                 continue
-            add_chat_message(session_id, "assistant", fallback, msg_type="chat",
-                             trace_id=trace_id, user_id=user_id)
             _dump_prompt_trace()
             yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
@@ -499,14 +352,17 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
             return
 
         if tool_name in TOOL_REGISTRY:
-            path_params = TOOL_REGISTRY[tool_name].get("path_params", [])
+            tool_info = TOOL_REGISTRY[tool_name]
+            path_params = tool_info.get("path_params", [])
+            tool_timeout = tool_info.get("timeout", 60)
             for p in path_params:
                 if p in arguments:
                     arguments[p] = normalize_path_component(arguments[p])
-            t_tool = time.perf_counter()
-            try:
-                result = TOOL_REGISTRY[tool_name]["function"](**arguments)
-                elapsed_t = int((time.perf_counter() - t_tool) * 1000)
+
+            # 缓存检查
+            cache_key = (tool_name, json.dumps(arguments, sort_keys=True, default=str))
+            if cache_key in _cache:
+                result = _cache[cache_key]
                 result_str = str(result)
                 result_len = len(result_str)
                 max_len = 4000 if tool_name in ("read_file", "search_content", "get_project_summary") else 2000
@@ -520,21 +376,44 @@ def run_agent_stream(user_message, model_choice, session_id=None, trace_id="", u
                         )
                     else:
                         result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
-                collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
-                yield emit("step", text=f"执行 {tool_name}", status="完成")
-                log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
-                          session_id=session_id, status="success",
-                          input_summary=str(arguments)[:200],
-                          output_summary=result_str[:200])
-            except Exception as e:
-                elapsed_t = int((time.perf_counter() - t_tool) * 1000)
-                result_str = f"工具执行错误: {str(e)}"
-                collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": str(e)})
-                yield emit("step", text=f"执行 {tool_name} 失败", status="错误")
-                log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
-                          session_id=session_id, status="error",
-                          input_summary=str(arguments)[:200],
-                          error=str(e)[:500])
+                collected_steps.append({"step": f"执行 {tool_name} (缓存命中)", "status": "完成", "detail": result_str[:200]})
+                yield emit("step", text=f"执行 {tool_name} (缓存命中)", status="完成")
+            else:
+                t_tool = time.perf_counter()
+                try:
+                    result = _execute_tool_with_retry(tool_name, arguments, timeout=tool_timeout)
+                    elapsed_t = int((time.perf_counter() - t_tool) * 1000)
+                    result_str = str(result)
+                    _cache[cache_key] = result
+                    if tool_name in _WRITE_TOOLS:
+                        _cache = {k: v for k, v in _cache.items() if k[0] not in _WRITE_TOOLS}
+                    result_len = len(result_str)
+                    max_len = 4000 if tool_name in ("read_file", "search_content", "get_project_summary") else 2000
+                    if result_len > max_len:
+                        if tool_name == "read_file":
+                            result_str = result_str[:max_len] + (
+                                f"\n\n⚠️ 结果已截断（完整长度 {result_len} 字符）。"
+                                f"如需定位特定代码，请使用 search_content 先搜索关键词获取行号，"
+                                f"再用 read_file(start_line=行号-5, end_line=行号+30) 局部读取。"
+                                f"严禁继续通过缩小 read_file 范围来搜索——你只会反复读到文件开头区域。"
+                            )
+                        else:
+                            result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
+                    collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
+                    yield emit("step", text=f"执行 {tool_name}", status="完成")
+                    log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
+                              session_id=session_id, status="success",
+                              input_summary=str(arguments)[:200],
+                              output_summary=result_str[:200])
+                except Exception as e:
+                    elapsed_t = int((time.perf_counter() - t_tool) * 1000)
+                    result_str = f"工具执行错误: {str(e)}"
+                    collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": str(e)})
+                    yield emit("step", text=f"执行 {tool_name} 失败", status="错误")
+                    log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
+                              session_id=session_id, status="error",
+                              input_summary=str(arguments)[:200],
+                              error=str(e)[:500])
         else:
             result_str = f"工具 '{tool_name}' 不存在"
             collected_steps.append({"step": f"未知工具 {tool_name}", "status": "错误"})
@@ -556,9 +435,34 @@ def save_session():
         data = request.json
         session_id = data.get("id")
         if session_id:
-            # 只需将该会话设为活跃即可，memory 模块后续会自动创建消息存储
             set_active_session(session_id)
-            # 可选：如果有标题，可单独存储（需扩展 memory 模块，暂忽略）
+            # 同步保存前端传递的消息到 SQLite（处理前端缓存中的消息）
+            messages = data.get("messages", [])
+            if messages:
+                from memory.stores.sqlite_store import get_chat_messages, add_chat_message
+                existing = get_chat_messages(session_id)
+                existing_keys = {(m["role"], m["content"][:80]) for m in existing}
+                sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
+                for msg in messages:
+                    role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
+                    key = (role, (msg.get("text") or "")[:80])
+                    if key not in existing_keys:
+                        # 使用前端携带的真实时间戳，而非 SQL CURRENT_TIMESTAMP
+                        frontend_ts = msg.get("timestamp", "")
+                        if frontend_ts:
+                            # 前端 ISO 格式 "2026-06-15T15:11:10.000Z" → SQLite 兼容 "2026-06-15 23:11:10"
+                            try:
+                                from datetime import datetime, timezone, timedelta
+                                dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
+                                local_dt = dt.astimezone(timezone(timedelta(hours=8)))
+                                frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                frontend_ts = frontend_ts.replace("T", " ")[:19]
+                        add_chat_message(session_id,
+                            "user" if msg.get("sender") == "user" else "assistant",
+                            msg.get("text", ""),
+                            msg_type=msg.get("msgType", "chat"),
+                            timestamp=frontend_ts)
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -649,12 +553,13 @@ def api_chat():
             model_choice = get_model_choice(model_display)
 
         return Response(
-            stream_with_context(run_agent_stream(
+            stream_with_context(run_agent(
                 user_message=user_input,
                 model_choice=model_choice,
                 session_id=session_id,
                 trace_id=trace_id,
-                user_id=user_id
+                user_id=user_id,
+                streaming=True
             )),
             mimetype='text/event-stream',
             headers={
@@ -674,4 +579,4 @@ def api_chat():
 if __name__ == '__main__':
     port = 8765
     print(f"Agent 前端已启动，请访问: http://127.0.0.1:{port}")
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)

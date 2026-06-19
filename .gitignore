@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+config.enc
+.myagent_key
+.env
+*.bak

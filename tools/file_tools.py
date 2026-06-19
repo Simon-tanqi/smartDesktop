@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import shlex
+from datetime import datetime
 
 from . import register_tool, path_params
 
@@ -89,14 +90,47 @@ def resolve_folder(parent_dir: str, target_name: str):
 ALLOWED_COMMANDS = {
     "dir", "copy", "move", "del", "mkdir", "rmdir", "echo", "type",
     "findstr", "where", "python", "pip", "git", "npm", "node",
-    "systeminfo", "wmic", "powershell", "cmd"
+    "systeminfo", "wmic", "winget", "msiexec", "taskkill",
 }
 FORBIDDEN_PATTERNS = ["rm -rf /", "del /f /s", "format", "shutdown"]
 
+# 需要用户确认的命令模式（在白名单内但操作敏感）
+CONFIRM_REQUIRED_PATTERNS = [
+    "msiexec /x",          # 卸载 MSI 产品
+    "msiexec /uninstall",  # 卸载 MSI 产品
+]
+
+
+def _get_confirm_log_path() -> str:
+    """获取确认日志文件路径"""
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(project_dir, "logs", "confirm")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "confirm_operations.log")
+
+
+def _log_confirmation(command: str, status: str, detail: str = ""):
+    """记录确认类操作到日志"""
+    log_path = _get_confirm_log_path()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = (
+        f"[{timestamp}] {status}\n"
+        f"  Command: {command}\n"
+        f"  Detail:  {detail}\n"
+        f"{'-' * 60}\n"
+    )
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(entry)
+
 
 @register_tool
-def execute_command(command: str, working_dir: str = None) -> str:
-    """在终端执行一条命令。command: 完整命令字符串。working_dir: 可选工作目录。"""
+def execute_command(command: str, working_dir: str = None, confirmed: bool = False) -> str:
+    """在终端执行一条命令。
+    command: 完整命令字符串。
+    working_dir: 可选工作目录。
+    confirmed: 对于需要确认的命令（如 msiexec 卸载），首次调用设为 false，系统会返回确认需求；
+               用户确认后在第二轮调用中设为 true 执行。
+    """
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -106,19 +140,38 @@ def execute_command(command: str, working_dir: str = None) -> str:
     prog = os.path.basename(parts[0]).lower()
     if prog not in ALLOWED_COMMANDS:
         return json.dumps({"success": False, "message": f"安全限制：不允许执行程序 '{parts[0]}'。白名单: {list(ALLOWED_COMMANDS)}"})
+
     cmd_lower = command.lower()
     for pattern in FORBIDDEN_PATTERNS:
         if pattern.lower() in cmd_lower:
             return json.dumps({"success": False, "message": f"安全限制：命令包含禁止模式 '{pattern}'"})
+
+    # 确认检查：匹配需确认模式且用户尚未确认
+    if not confirmed:
+        for pattern in CONFIRM_REQUIRED_PATTERNS:
+            if pattern.lower() in cmd_lower:
+                _log_confirmation(command, "CONFIRM_REQUIRED", f"命中确认模式: {pattern}")
+                return json.dumps({
+                    "confirmation_required": True,
+                    "message": f"该命令需要确认后才能执行（匹配模式: {pattern}）。请将命令展示给用户，等待用户回复'确认'后，使用 confirmed=true 重新调用。",
+                    "command": command
+                }, ensure_ascii=False)
+
+    # 执行命令
     try:
         result = subprocess.run(command, shell=True, cwd=working_dir,
                                 capture_output=True, text=True, timeout=30, encoding="gbk", errors="replace")
         output = result.stdout.strip()
         if result.returncode != 0:
             error = result.stderr.strip()
+            _log_confirmation(command, "FAILED", f"code {result.returncode}: {error}")
             return json.dumps({"success": False, "message": f"命令执行失败 (code {result.returncode}): {error}"})
+
+        _log_confirmation(command, "SUCCESS", f"返回 {len(output)} 字符")
         return json.dumps({"success": True, "output": output})
     except subprocess.TimeoutExpired:
+        _log_confirmation(command, "TIMEOUT", "命令超时")
         return json.dumps({"success": False, "message": "命令执行超时"})
     except Exception as e:
+        _log_confirmation(command, "ERROR", str(e))
         return json.dumps({"success": False, "message": str(e)})

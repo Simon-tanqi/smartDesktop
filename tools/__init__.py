@@ -28,7 +28,7 @@ TOOL_INTENT_MAP = {
     "move_file":            ["file_manage"],
     "copy_file":            ["file_manage"],
     "resolve_folder":       ["file_manage"],
-    "execute_command":      ["file_manage"],
+    "execute_command":      ["file_manage", "system_config"],
     "search_files":         ["file_manage", "code_generate"],
     "search_content":       ["code_generate"],
     "get_workspace_path":   ["code_generate"],
@@ -36,16 +36,21 @@ TOOL_INTENT_MAP = {
     "read_file":            ["file_manage", "code_generate", "general_chat"],
     "replace_in_file":      ["code_generate"],
     "get_project_summary":  ["code_generate"],
-    "remember_user_info":   ["general_chat"],
-    "append_to_log":        ["general_chat"],
+    "web_search":           ["web_browse"],
+    "fetch_webpage":        ["web_browse"],
+    "get_weather":          ["web_browse", "general_chat"],
+    "modify_registry":      ["system_config"],
 }
 
 # ── 技能包摘要（先告诉大模型有哪些技能包可用） ──
 SKILL_PACK_SUMMARIES = {
-    "file_manage":   "文件扫描、复制、移动、删除、终端命令执行等本地文件操作",
-    "code_generate": "代码读写、内容搜索、文件替换、项目结构分析",
-    "db_query":      "数据库查询（待扩展）",
-    "general_chat":  "记忆管理、日志追加、通用问答",
+    "file_manage":    "文件扫描、复制、移动、删除、终端命令执行等本地文件操作",
+    "code_generate":  "代码读写、内容搜索、文件替换、项目结构分析",
+    "db_query":       "数据库查询（待扩展）",
+    "user_memory":    "用户信息记忆与召回（姓名/爱好/目标）",
+    "web_browse":     "网页搜索、内容抓取、天气查询等互联网信息获取",
+    "general_chat":   "记忆管理、日志追加、通用问答",
+    "system_config":  "注册表修改、软件安装卸载(winget/msiexec)、系统外观调整",
 }
 
 
@@ -59,23 +64,39 @@ def path_params(*params):
     return decorator
 
 
-def register_tool(func):
-    """将函数注册为可用工具"""
-    sig = inspect.signature(func)
-    parameters = {}
-    for name, param in sig.parameters.items():
-        parameters[name] = {
-            "type": str(param.annotation.__name__ if param.annotation != inspect.Parameter.empty else "any"),
-            "default": param.default if param.default != inspect.Parameter.empty else "必填"
+def register_tool(func=None, *, timeout=60):
+    """将函数注册为可用工具。
+
+    用法：
+        @register_tool
+        def my_tool(...): ...
+
+        @register_tool(timeout=120)
+        def slow_tool(...): ...
+
+    timeout 字段用于 ReAct 循环中的工具执行超时控制，默认 60s。
+    """
+    def decorator(fn):
+        sig = inspect.signature(fn)
+        parameters = {}
+        for name, param in sig.parameters.items():
+            parameters[name] = {
+                "type": str(param.annotation.__name__ if param.annotation != inspect.Parameter.empty else "any"),
+                "default": param.default if param.default != inspect.Parameter.empty else "必填"
+            }
+        path_list = getattr(fn, '_path_params', [])
+        TOOL_REGISTRY[fn.__name__] = {
+            "function": fn,
+            "description": fn.__doc__.strip() if fn.__doc__ else "无描述",
+            "parameters": parameters,
+            "path_params": path_list,
+            "timeout": timeout
         }
-    path_list = getattr(func, '_path_params', [])
-    TOOL_REGISTRY[func.__name__] = {
-        "function": func,
-        "description": func.__doc__.strip() if func.__doc__ else "无描述",
-        "parameters": parameters,
-        "path_params": path_list
-    }
-    return func
+        return fn
+
+    if func is not None:
+        return decorator(func)
+    return decorator
 
 
 # ── 动态 System Prompt ──
@@ -153,9 +174,10 @@ def build_dynamic_system_prompt(
     return prompt
 
 
-# ── 延迟导入子模块（不变） ──
+# ── 延迟导入子模块 ──
 from . import file_tools
 from . import code_tools
 from . import search_tools
 from . import chat_tools
 from . import db_tools
+from . import registry_tools

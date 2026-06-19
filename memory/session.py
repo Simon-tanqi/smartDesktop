@@ -157,8 +157,9 @@ def append_session_message(session_id, role, content,
         save_sessions_db(db)
 
     # ── 3. 写入 SQLite ──
+    now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     add_chat_message(session_id, role, content, msg_type="chat",
-                     trace_id=trace_id, user_id=user_id)
+                     trace_id=trace_id, user_id=user_id, timestamp=now_ts)
 
     # ── 4. 用户消息：异步事实提取 + 异步压缩 ──
     if role == "user":

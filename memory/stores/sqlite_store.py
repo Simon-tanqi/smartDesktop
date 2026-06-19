@@ -147,15 +147,21 @@ def _get_chat_db():
     return conn
 
 
-def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", user_id=""):
-    """写入聊天记录。"""
+def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", user_id="", timestamp=""):
+    """写入聊天记录。timestamp 为 ISO 格式字符串（如 '2026-06-15 23:11:10'），不传则使用当前时间。"""
     if role not in ("user", "assistant", "system"):
         return
     conn = _get_chat_db()
-    conn.execute(
-        "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type) VALUES (?, ?, ?, ?, ?, ?)",
-        (trace_id, user_id, session_id, role, content, msg_type),
-    )
+    if timestamp:
+        conn.execute(
+            "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (trace_id, user_id, session_id, role, content, msg_type, timestamp),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type) VALUES (?, ?, ?, ?, ?, ?)",
+            (trace_id, user_id, session_id, role, content, msg_type),
+        )
     conn.commit()
     conn.close()
 

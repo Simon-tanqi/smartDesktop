@@ -45,7 +45,7 @@ TRACE_DB = os.path.join(LOGS_DIR, "agent_trace.db")
 # ── 压缩配置 ──
 MAX_COMPRESSED_ENTRIES = 100
 DEFAULT_KEEP_ROUNDS = 8
-DEFAULT_SUMMARY_MODEL = "qwen2:7b"
+DEFAULT_SUMMARY_MODEL = "deepseek-chat"
 MAX_SUMMARY_LENGTH = 50   # 摘要最大字数
 
 # ── 按需注入配置 ──
