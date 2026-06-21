@@ -100,6 +100,22 @@ CONFIRM_REQUIRED_PATTERNS = [
     "msiexec /uninstall",  # 卸载 MSI 产品
 ]
 
+# ── 命令预检：低效/错误模式（代码层拦截，不靠 LLM 自觉）──
+# 命中后不执行命令，直接返回错误信息指引正确方向
+COMMAND_ANTI_PATTERNS = [
+    # dir /s 全量输出后试图用 findstr 按文件属性过滤 → 方向性错误
+    (r"dir\s+\S+\s+/[sb].*\|.*findstr",
+     "dir /s /b 只输出文件名（不含大小/日期/权限）。"
+     "如果要按文件属性（大小/日期/内容等）过滤，dir 做不到。请改用 python os.walk + 条件判断，在扫描时直接过滤。"),
+    # dir 递归全量重定向到临时文件 → 可能极慢且无意义
+    (r"dir\s+\S+\s+/[sb].*\s*>\s*\S+[Tt]emp",
+     "dir 递归全量输出并重定向到临时文件可能极其缓慢。"
+     "如果最终目标是过滤，请在源头用 python os.walk 加条件判断，不要先生成全量列表再过滤。"),
+]
+
+# ── 输出截断阈值 ──
+MAX_OUTPUT_CHARS = 2000
+
 
 def _get_confirm_log_path() -> str:
     """获取确认日志文件路径"""
@@ -161,6 +177,17 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
                     "command": command
                 }, ensure_ascii=False)
 
+    # ── 命令预检：拦截低效/错误模式 ──
+    import re as _re
+    for _pat, _msg in COMMAND_ANTI_PATTERNS:
+        if _re.search(_pat, command):
+            _log_confirmation(command, "ANTI_PATTERN_BLOCKED", f"命中模式: {_pat}")
+            return json.dumps({
+                "success": False,
+                "message": f"命令预检拦截：{_msg}",
+                "blocked_pattern": _pat,
+            }, ensure_ascii=False)
+
     # 执行命令——通过 safe_exec 安全层
     result = safe_exec.run_powershell(
         command,
@@ -175,7 +202,22 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
 
     if result.get("success"):
         _log_confirmation(command, "SUCCESS", f"返回 {len(result.get('output', ''))} 字符")
-        return json.dumps({"success": True, "output": result["output"]}, ensure_ascii=False)
+        output = result["output"]
+        output_len = len(output)
+        truncated = output_len > MAX_OUTPUT_CHARS
+        if truncated:
+            display = output[:MAX_OUTPUT_CHARS] + (
+                f"\n\n[输出已截断：{output_len} 字符 → {MAX_OUTPUT_CHARS} 字符。"
+                f"如果命令产生极大量输出而您只需要其中一小部分，请在源头加过滤条件而非全量输出后再筛选。]"
+            )
+        else:
+            display = output
+        return json.dumps({
+            "success": True,
+            "output": display,
+            "output_total_chars": output_len,
+            "truncated": truncated,
+        }, ensure_ascii=False)
 
     _log_confirmation(command, "FAILED", result.get("message", ""))
     return json.dumps({"success": False, "message": result.get("message", "")}, ensure_ascii=False)

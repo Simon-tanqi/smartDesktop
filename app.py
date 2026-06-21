@@ -215,6 +215,13 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                      "replace_in_file", "move_file", "copy_file", "delete_file",
                      "scan_directory"}
 
+    # ── 回路护板：同类工具重复调用检测 ──
+    _last_tool_name = ""
+    _last_args_norm = ""
+    _consecutive_same_tool = 0
+    MAX_SAME_TOOL_STREAK = 5      # 连续调用同一工具 ≥5 次 → 强提醒
+    MAX_EXACT_REPEAT = 2          # 完全相同的参数 ≥2 次 → 强提醒
+
     def _is_retryable(exc):
         import errno
         if isinstance(exc, (ConnectionError, TimeoutError, FutureTimeout)):
@@ -425,6 +432,33 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         tool_result_msg = f"工具 {tool_name} 返回：{result_str}"
         messages.append({"role": "assistant", "content": tool_call_msg})
         messages.append({"role": "user", "content": tool_result_msg})
+
+        # ── 回路护板：同类工具重复调用 ──
+        args_norm = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        is_exact_repeat = (tool_name == _last_tool_name and args_norm == _last_args_norm)
+        is_same_tool = (tool_name == _last_tool_name)
+
+        if is_same_tool:
+            _consecutive_same_tool += 1
+        else:
+            _consecutive_same_tool = 1
+        _last_tool_name = tool_name
+        _last_args_norm = args_norm
+
+        def _inject_guard(reason):
+            guard = (
+                f"【回路护板】{reason}\n"
+                f"你必须立即停止尝试当前的命令/工具模式，换一种完全不同的方案。\n"
+                f"如果不确定怎么做，直接告诉用户当前方法的局限性并请求指引。"
+            )
+            messages.append({"role": "system", "content": guard})
+            nonlocal _consecutive_same_tool
+            _consecutive_same_tool = 0
+
+        if _consecutive_same_tool >= MAX_EXACT_REPEAT and is_exact_repeat:
+            _inject_guard(f"你已连续 {_consecutive_same_tool} 次调用 {tool_name} 且参数完全相同。")
+        elif _consecutive_same_tool >= MAX_SAME_TOOL_STREAK and is_same_tool:
+            _inject_guard(f"你已连续 {_consecutive_same_tool} 次调用同一工具 {tool_name}。")
 
     yield emit("final", text="任务未完成，已保存进度。可以继续。", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
