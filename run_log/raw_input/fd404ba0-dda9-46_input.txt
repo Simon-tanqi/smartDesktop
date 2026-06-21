@@ -1,2 +1,0 @@
-args:('你帮我把run_agent方法嵌入到app.py，注意读代码时不要全部把内容拼接到大模型，要用提炼工具，减少token', {'display': 'DeepSeek (deepseek-chat)', 'provider': 'deepseek', 'model': 'deepseek-chat'}, '2026060716_1')
-kwargs:{}

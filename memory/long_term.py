@@ -280,6 +280,103 @@ def _extract_keywords(text):
     return unique
 
 
+def _detect_time_window(text):
+    """
+    检测用户消息中的时间敏感词，返回目标日期范围。
+
+    返回：(target_start, target_end) 两个 datetime.date 对象；
+          无时间敏感词时返回 (None, None)。
+    """
+    now = datetime.datetime.now()
+    today = now.date()
+
+    # 绝对日期：X月X日 或 X月X号
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]", text)
+    if m:
+        try:
+            month, day = int(m.group(1)), int(m.group(2))
+            target = today.replace(month=month, day=day)
+            if target > today:
+                target = target.replace(year=today.year - 1)
+            return target, target
+        except ValueError:
+            pass
+
+    # 近X天 / 最近X天
+    m = re.search(r"(?:近|最近)\s*(\d+)\s*天", text)
+    if m:
+        n = int(m.group(1))
+        return today - datetime.timedelta(days=n), today
+
+    # 近X周
+    m = re.search(r"(?:近|最近)\s*(\d+)\s*周", text)
+    if m:
+        n = int(m.group(1))
+        return today - datetime.timedelta(weeks=n), today
+
+    # 近X月
+    m = re.search(r"(?:近|最近)\s*(\d+)\s*个?月", text)
+    if m:
+        n = int(m.group(1))
+        year, month = today.year, today.month
+        month -= n
+        while month <= 0:
+            month += 12
+            year -= 1
+        return datetime.date(year, month, 1), today
+
+    # 今天
+    if re.search(r"今[日天]", text):
+        return today, today
+
+    # 昨天
+    if re.search(r"昨[日天]", text):
+        return today - datetime.timedelta(days=1), today - datetime.timedelta(days=1)
+
+    # 前天
+    if re.search(r"前[日天]", text):
+        return today - datetime.timedelta(days=2), today - datetime.timedelta(days=2)
+
+    # 最近 / 近期 / 这几天（模糊窗口，默认 7 天）
+    if re.search(r"最近|近期|这几天|这一阵", text):
+        return today - datetime.timedelta(days=7), today
+
+    # 本周 / 这周
+    if re.search(r"本周|这周|这星期", text):
+        monday = today - datetime.timedelta(days=today.weekday())
+        return monday, today
+
+    # 上周
+    if re.search(r"上周|上星期", text):
+        last_monday = today - datetime.timedelta(days=today.weekday() + 7)
+        last_sunday = last_monday + datetime.timedelta(days=6)
+        return last_monday, last_sunday
+
+    # 本月
+    if re.search(r"本月|这个月", text):
+        return today.replace(day=1), today
+
+    # 上月
+    if re.search(r"上月|上个月", text):
+        first_of_this = today.replace(day=1)
+        last_of_prev = first_of_this - datetime.timedelta(days=1)
+        first_of_prev = last_of_prev.replace(day=1)
+        return first_of_prev, last_of_prev
+
+    return None, None
+
+
+def _parse_summary_timestamp(line):
+    """解析摘要行的 [YYYY-MM-DD HH:MM] 时间戳，返回 datetime.date 或 None。"""
+    m = re.match(r"- \[(\d{4}-\d{2}-\d{2})\s\d{2}:\d{2}\]", line)
+    if m:
+        try:
+            return datetime.datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return None
+
+
 def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     """
     根据用户消息，从所有 Markdown 文件中提取相关内容。
@@ -289,6 +386,7 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     2. 对每个 Markdown 文件逐行检查关键词命中
     3. 命中行计入结果（去重，字符上限控制）
     4. 保留 user.md 中的基本信息始终注入
+    5. 当消息含时间敏感词时，摘要类结果仅保留目标时间窗口内的条目
 
     返回：格式化后的字符串（可直接拼入 system prompt），无相关内容时返回空字符串。
     """
@@ -297,6 +395,9 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     keywords = _extract_keywords(user_message)
     if not keywords:
         keywords = [user_message[:10]]
+
+    # ── 时间敏感检测 ──
+    tw_start, tw_end = _detect_time_window(user_message)
 
     sections = []
 
@@ -322,10 +423,16 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
         hits = []
         for line in recent[::-1]:  # 最新在前
             line_lower = line.lower()
-            if any(k.lower() in line_lower for k in keywords):
-                hits.append(line)
-                if len(hits) >= 5:
-                    break
+            if not any(k.lower() in line_lower for k in keywords):
+                continue
+            # 时间窗口过滤：仅对「摘要」类且检测到时间敏感词时生效
+            if cat_name == "摘要" and tw_start is not None:
+                line_date = _parse_summary_timestamp(line)
+                if line_date is None or line_date < tw_start or line_date > tw_end:
+                    continue
+            hits.append(line)
+            if len(hits) >= 5:
+                break
         if hits:
             sections.append((cat_name, hits[::-1]))  # 恢复时间正序
 

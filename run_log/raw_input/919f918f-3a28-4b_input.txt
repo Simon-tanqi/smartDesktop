@@ -1,2 +1,0 @@
-args:('那我如何才能把我主函数里面run_agent嵌到前端代码app.py里面，你给我解释一下用法', {'display': 'DeepSeek (deepseek-chat)', 'provider': 'deepseek', 'model': 'deepseek-chat'}, '2026060716_1')
-kwargs:{}

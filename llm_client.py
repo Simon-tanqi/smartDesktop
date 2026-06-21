@@ -186,6 +186,7 @@ def _ollama_call_stream(messages, model, trace_id=""):
         "model": model,
         "messages": messages,
         "stream": True,
+        "format": "json",
         "options": {"temperature": DEFAULT_TEMPERATURE}
     }
     t0 = time.perf_counter()
@@ -295,7 +296,8 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id=""):
         "model": model,
         "messages": messages,
         "temperature": DEFAULT_TEMPERATURE,
-        "stream": True
+        "stream": True,
+        "response_format": {"type": "json_object"}
     }
     t0 = time.perf_counter()
     try:
@@ -377,7 +379,36 @@ def parse_ai_json(content):
                     continue
             return None
 
-        return repair_loads(clean_content)
+        result = repair_loads(clean_content)
+        if result is not None:
+            return result
+
+        # 兜底：LLM 可能在 JSON 前后输出了文本，从 clean_content 中提取第一个完整 {...} 对象
+        start = clean_content.find('{')
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(clean_content)):
+                c = clean_content[i]
+                if escape:
+                    escape = False
+                    continue
+                if c == '\\':
+                    escape = True
+                    continue
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return repair_loads(clean_content[start:i + 1])
+        return None
     except Exception as e:
         print(f"❌ JSON 解析异常: {e}")
         return None

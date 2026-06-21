@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日志查询 - MyAgent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Microsoft YaHei', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 20px; color: #f5c2e7; }
+
+  .toolbar {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+    margin-bottom: 16px; padding: 16px; background: #313244; border-radius: 8px;
+  }
+  .toolbar label { font-size: 13px; color: #a6adc8; }
+  .toolbar input, .toolbar select, .toolbar button {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid #45475a;
+    background: #1e1e2e; color: #cdd6f4; font-size: 13px;
+  }
+  .toolbar button {
+    background: #89b4fa; color: #1e1e2e; border: none; cursor: pointer; font-weight: 600;
+  }
+  .toolbar button:hover { background: #b4befe; }
+
+  .stats { font-size: 12px; color: #a6adc8; margin-bottom: 10px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #313244; }
+  th { color: #a6adc8; font-weight: 600; background: #313244; position: sticky; top: 0; }
+  tr:hover { background: #313244; }
+
+  .level { font-weight: 700; font-size: 12px; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .level-ERROR { background: #f38ba8; color: #1e1e2e; }
+  .level-WARNING { background: #fab387; color: #1e1e2e; }
+  .level-INFO { background: #a6e3a1; color: #1e1e2e; }
+  .level-DEBUG { background: #89b4fa; color: #1e1e2e; }
+
+  .tid { font-family: monospace; font-size: 11px; color: #89b4fa; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .msg { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .expand-btn { cursor: pointer; color: #89b4fa; font-size: 12px; }
+  .extra-row { display: none; }
+  .extra-row.open { display: table-row; }
+  .extra-cell { padding: 8px 12px; font-family: monospace; font-size: 11px; color: #a6adc8; white-space: pre-wrap; word-break: break-all; background: #181825; border-bottom: 1px solid #313244; }
+
+  .empty { text-align: center; padding: 40px; color: #6c7086; }
+</style>
+</head>
+<body>
+<h1>MyAgent 日志查询</h1>
+
+<div class="toolbar">
+  <div>
+    <label>日期从</label>
+    <input type="date" id="dateFrom">
+  </div>
+  <div>
+    <label>到</label>
+    <input type="date" id="dateTo">
+  </div>
+  <div>
+    <label>级别</label>
+    <select id="level">
+      <option value="">全部</option>
+      <option value="ERROR">ERROR</option>
+      <option value="WARNING">WARNING</option>
+      <option value="INFO">INFO</option>
+      <option value="DEBUG">DEBUG</option>
+    </select>
+  </div>
+  <div>
+    <label>会话名称</label>
+    <input type="text" id="sessionNameInput" placeholder="按会话名称过滤...">
+  </div>
+  <div>
+    <label>关键词</label>
+    <input type="text" id="keyword" placeholder="搜索消息内容...">
+  </div>
+  <button onclick="query()">查询</button>
+</div>
+
+<div class="stats" id="stats"></div>
+<div style="max-height: 70vh; overflow-y: auto;">
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 170px;">时间</th>
+        <th style="width: 70px;">级别</th>
+        <th style="width: 110px;">会话名称</th>
+        <th>消息</th>
+        <th style="width: 50px;">详情</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div class="empty" id="empty">选择日期范围后点击「查询」</div>
+</div>
+
+<script>
+async function query() {
+  const params = new URLSearchParams();
+  const df = document.getElementById('dateFrom').value;
+  const dt = document.getElementById('dateTo').value;
+  const lv = document.getElementById('level').value;
+  const kw = document.getElementById('keyword').value;
+  const sn = document.getElementById('sessionNameInput').value;
+  if (df) params.set('date_from', df);
+  if (dt) params.set('date_to', dt);
+  if (lv) params.set('level', lv);
+  if (kw) params.set('keyword', kw);
+  if (sn) params.set('session_name', sn);
+  params.set('limit', 500);
+
+  const tbody = document.getElementById('tbody');
+  const empty = document.getElementById('empty');
+  const stats = document.getElementById('stats');
+  tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#6c7086;">加载中...</td></tr>';
+  empty.style.display = 'none';
+
+  try {
+    const res = await fetch('/api/logs/query?' + params.toString());
+    const data = await res.json();
+    if (!data.success || !data.logs.length) {
+      tbody.innerHTML = '';
+      empty.style.display = 'block';
+      empty.textContent = '没有匹配的日志记录';
+      stats.textContent = '';
+      return;
+    }
+
+    stats.textContent = `共 ${data.logs.length} 条`;
+
+    tbody.innerHTML = '';
+    data.logs.forEach(entry => {
+      const sessionName = entry.session_name || '';
+      const extra = entry.extra ? JSON.stringify(entry.extra, null, 2) : '';
+      const hasExtra = extra && extra !== '{}';
+      const rowId = 'row_' + Math.random().toString(36).slice(2, 8);
+      tbody.innerHTML += `
+        <tr>
+          <td>${entry.timestamp}</td>
+          <td><span class="level level-${entry.level}">${entry.level}</span></td>
+          <td style="font-size:12px;color:#89b4fa;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${sessionName}">${sessionName}</td>
+          <td class="msg" title="${entry.message}">${entry.message}</td>
+          <td>${hasExtra ? `<span class="expand-btn" onclick="toggleExtra('${rowId}')">展开</span>` : '-'}</td>
+        </tr>
+        ${hasExtra ? `<tr class="extra-row" id="${rowId}"><td colspan="5" class="extra-cell">${extra}</td></tr>` : ''}
+      `;
+    });
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#f38ba8;">查询失败: ${e.message}</td></tr>`;
+  }
+}
+
+function toggleExtra(id) {
+  const row = document.getElementById(id);
+  const btn = event.target;
+  row.classList.toggle('open');
+  btn.textContent = row.classList.contains('open') ? '收起' : '展开';
+}
+
+// 加载可用日期
+(async () => {
+  try {
+    const res = await fetch('/api/logs/dates');
+    const data = await res.json();
+    if (data.dates.length) {
+      const today = new Date().toISOString().slice(0, 10);
+      document.getElementById('dateFrom').value = data.dates[data.dates.length - 1] || today;
+      document.getElementById('dateTo').value = today;
+    }
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>

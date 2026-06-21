@@ -1,2 +1,0 @@
-args:('你帮我分析一下我的main.py的文件，里面除了主程序run_agent，和UI部分，其他内容很少。UI部分你是否可以兼容一下，然后修改前端文件，让其拥有会话选择，模型选择，发送，继续，退出，新建会话与删除会话的能力，就是UI部分全部迁移到前端，保留run_agent主程序。你只改造前端，后面连接部分我来实现就好', {'display': 'DeepSeek (deepseek-chat)', 'provider': 'deepseek', 'model': 'deepseek-chat'}, '2026060716_1')
-kwargs:{}

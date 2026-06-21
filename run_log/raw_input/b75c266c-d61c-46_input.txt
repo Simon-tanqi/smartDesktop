@@ -1,2 +1,0 @@
-args:('我现在的前端项目进展如何，你帮我扫描一下文件总结一下进度', {'display': 'DeepSeek (deepseek-chat)', 'provider': 'deepseek', 'model': 'deepseek-chat'}, '2026060716_1')
-kwargs:{}

@@ -52,7 +52,25 @@ def generate_session_id():
 # 会话 CRUD
 # ═══════════════════════════════════════════════
 
-def create_session(title="新会话"):
+def _get_next_session_name():
+    """获取下一个「新会话N」的可用编号。如果之前的被改名释放了，优先补空位。"""
+    import re
+    db = load_sessions_db()
+    used_numbers = set()
+    for data in db.values():
+        title = data.get("title", "")
+        m = re.match(r"^新会话(\d+)$", title)
+        if m:
+            used_numbers.add(int(m.group(1)))
+    n = 1
+    while n in used_numbers:
+        n += 1
+    return f"新会话{n}"
+
+
+def create_session(title=None):
+    if title is None:
+        title = _get_next_session_name()
     session_id = generate_session_id()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = load_sessions_db()
@@ -64,6 +82,45 @@ def create_session(title="新会话"):
     save_sessions_db(db)
     set_active_session(session_id)
     return session_id
+
+
+def rename_session(session_id, new_title):
+    """修改会话名称。如果原名称是「新会话N」，释放该编号供后续复用。"""
+    new_title = new_title.strip()
+    if not new_title:
+        return False
+    db = load_sessions_db()
+    if session_id not in db:
+        return False
+    db[session_id]["title"] = new_title
+    save_sessions_db(db)
+    return True
+
+
+def ensure_session_titles():
+    """启动时迁移：给所有 title 为 None 或空的旧会话分配「新会话N」名称。"""
+    import re
+    db = load_sessions_db()
+    # 先计算已占用的编号
+    used_numbers = set()
+    for data in db.values():
+        title = data.get("title", "")
+        m = re.match(r"^新会话(\d+)$", title)
+        if m:
+            used_numbers.add(int(m.group(1)))
+
+    changed = False
+    for sid, data in db.items():
+        title = data.get("title", "")
+        if not title or title.strip() == "":
+            n = 1
+            while n in used_numbers:
+                n += 1
+            data["title"] = f"新会话{n}"
+            used_numbers.add(n)
+            changed = True
+    if changed:
+        save_sessions_db(db)
 
 
 def get_active_session_id():

@@ -2,6 +2,7 @@
 安全命令执行模块
 
 防护层（由外到内）：
+  L0: 路径硬拦截 — 删除类命令命中受保护路径时直接拒绝
   L1: 挑战短语验证 — 用户必须完整打出授权文本才能执行危险操作
   L2: 危险模式检测 — 命令语义匹配破坏性关键词
   L3: subprocess.run(list, shell=False) — 切断 OS shell 元字符注入
@@ -15,6 +16,61 @@ import secrets
 import json
 import os
 from datetime import datetime
+
+
+# ═══════════════════════════════════════════════
+# 路径硬拦截（L0）
+# ═══════════════════════════════════════════════
+
+# 删除类命令识别
+_DELETE_COMMAND_PATTERNS = [
+    r"\bdel\b", r"\brmdir\b", r"\brd\b", r"\bRemove-Item\b",
+    r"\brm\b", r"\brmtree\b", r"\bshutil\.rmtree",
+    r"\bClear-RecycleBin\b",
+]
+
+# 受保护路径模式：命中任一即拒绝执行
+# 匹配逻辑基于命令字符串中子串检测，不依赖路径解析
+_PROTECTED_PATH_PATTERNS = [
+    # 系统核心目录
+    (r"(?i)[A-Z]:\\Windows\\",                 "Windows 系统目录"),
+    (r"(?i)[A-Z]:\\Program Files\\",           "Program Files 目录"),
+    (r"(?i)[A-Z]:\\Program Files \(x86\)\\",   "Program Files (x86) 目录"),
+    (r"(?i)[A-Z]:\\ProgramData\\",             "ProgramData 目录"),
+
+    # 聊天记录数据库
+    (r"(?i)WeChat Files\\.+?\\Msg[\\\.]",      "微信聊天记录数据库"),
+    (r"(?i)Tencent Files\\.+?\\Msg[0-9]",      "QQ 聊天记录数据库"),
+    (r"(?i)DingTalk\\.+?\\db[\\\.]",           "钉钉聊天记录数据库"),
+
+    # 安全凭据
+    (r"(?i)\\\.ssh\\",                          "SSH 密钥目录"),
+    (r"(?i)\\\.aws\\",                          "AWS 凭据目录"),
+    (r"(?i)\\\.kube\\",                         "Kubernetes 配置目录"),
+    (r"(?i)\\\.env$",                           "环境变量配置文件"),
+    (r"(?i)\\\.git\\",                          "Git 仓库数据"),
+]
+
+
+def _is_delete_command(command: str) -> bool:
+    """判断命令是否为删除类操作"""
+    for pattern in _DELETE_COMMAND_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return True
+    return False
+
+
+def _check_protected_paths(command: str) -> str | None:
+    """
+    检查删除类命令是否触碰受保护路径。
+    返回被拦截的路径描述，或 None（通过检查）。
+    """
+    if not _is_delete_command(command):
+        return None
+    for pattern, desc in _PROTECTED_PATH_PATTERNS:
+        if re.search(pattern, command):
+            return desc
+    return None
 
 
 # ═══════════════════════════════════════════════
@@ -145,6 +201,12 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"永久拦截 (匹配: {blocked_pattern}): {script[:120]}")
         return {"success": False, "message": f"安全策略：此命令被永久禁止执行。如需操作请手动完成。"}
 
+    # ── 路径硬拦截（L0）──
+    protected_hit = _check_protected_paths(script)
+    if protected_hit:
+        _log("BLOCK", f"路径保护拦截 ({protected_hit}): {script[:120]}")
+        return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
+
     # ── 危险检测 → 发起挑战 ──
     is_danger, danger_desc = _check_danger(script)
     if is_danger:
@@ -222,6 +284,12 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
     if blocked:
         _log("BLOCK", f"永久拦截: {cmd_str[:120]}")
         return {"success": False, "message": "安全策略：此命令被永久禁止执行"}
+
+    # ── 路径硬拦截（L0）──
+    protected_hit = _check_protected_paths(cmd_str)
+    if protected_hit:
+        _log("BLOCK", f"路径保护拦截 ({protected_hit}): {cmd_str[:120]}")
+        return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
     is_danger, danger_desc = _check_danger(cmd_str)
     if is_danger:

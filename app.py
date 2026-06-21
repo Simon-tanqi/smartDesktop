@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
 from intent_router import classify_intent, extract_params
 from tools import TOOL_REGISTRY, build_dynamic_system_prompt
-from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace, build_context_messages)
+from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace, build_context_messages, rename_session)
+from memory.session import ensure_session_titles, create_session
+from logger import get_logger
 
 
 app = Flask(__name__,template_folder='web',static_folder='web/static')
@@ -49,7 +51,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         model_name = model_choice["model"]
         print(f"[DIAG] → 已强制回退为 {model_choice}")
 
-    _trace_data = []
     _call_seq = [0]
     _default_model = model_name
     _default_provider = provider
@@ -60,20 +61,23 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         _call_seq[0] += 1
         actual_model = model_name if model_name else _default_model
         actual_provider = provider if provider else _default_provider
-        label = "intent_classify" if idx == 0 else "param_extract"
-        trace_entry = {"index": idx, "label": label, "model": f"{actual_provider}/{actual_model}", "messages": messages}
-        _trace_data.append(trace_entry)
+        t0 = time.perf_counter()
         result = ai_concat(messages=messages, model_name=actual_model, provider=actual_provider, trace_id=trace_id)
-        trace_entry["response"] = result["message"].get("content", "") if result and result.get("message") else ""
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        response = result["message"].get("content", "") if result and result.get("message") else ""
+        get_logger().log_llm_call(
+            trace_id=trace_id, session_id=session_id, turn_index=idx,
+            messages=messages, response=response,
+            model_name=actual_model, provider=actual_provider,
+            elapsed_ms=elapsed,
+        )
         return result
 
     def llm_stream(messages):
         """流式调用，产出思考过程文本 chunk，最后产出完整结果 dict"""
         idx = _call_seq[0]
         _call_seq[0] += 1
-        label = f"turn{idx - 2}"
-        trace_entry = {"index": idx, "label": label, "model": f"{_default_provider}/{_default_model}", "messages": messages}
-        _trace_data.append(trace_entry)
+        t0 = time.perf_counter()
 
         if _default_provider == "ollama":
             stream_gen = _ollama_call_stream(messages, _default_model, trace_id=trace_id)
@@ -102,25 +106,14 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             yield {"type": "error", "message": f"流式调用异常: {str(e)}"}
             return
 
-        trace_entry["response"] = full_content
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        get_logger().log_llm_call(
+            trace_id=trace_id, session_id=session_id, turn_index=idx,
+            messages=messages, response=full_content,
+            model_name=_default_model, provider=_default_provider,
+            elapsed_ms=elapsed,
+        )
         yield {"content": full_content, "reasoning_content": full_reasoning}
-
-    def _dump_prompt_trace():
-        if not _trace_data:
-            return
-        try:
-            uid = session_id if session_id else f"unknown_{trace_id[-12:]}"
-            dump_dir = os.path.join(os.path.dirname(__file__), "logs", "prompts", "Tank", uid)
-            os.makedirs(dump_dir, exist_ok=True)
-            dump_path = os.path.join(dump_dir, "llm_full_prompt.json")
-            dump_data = {}
-            for item in _trace_data:
-                key = f"{item['index']:02d}_{item['label']}"
-                dump_data[key] = item
-            with open(dump_path, "w", encoding="utf-8") as f:
-                json.dump(dump_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[WARN] 提示词日志写入失败: {e}")
 
     def emit(event_type, **kwargs):
         payload = {"type": event_type}
@@ -129,6 +122,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
     # ===== Phase 0: 立即发送初始状态，确保前端第一时间有反馈 =====
     yield emit("step", text="开始分析问题...", status="进行中")
+    get_logger().info("Agent启动", trace_id=trace_id, session_id=session_id, user_message=user_message[:100])
 
     # ===== Phase 1: 意图识别与参数提取（非流式）=====
     try:
@@ -138,6 +132,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         log_trace(trace_id, "intent.classify", "intent", elapsed_i,
                   session_id=session_id, status="success",
                   input_summary=user_message[:200], output_summary=intent_type)
+        get_logger().info("意图识别完成", trace_id=trace_id, session_id=session_id, intent=intent_type, elapsed_ms=elapsed_i)
 
         t0 = time.perf_counter()
         params = extract_params(user_message, intent_type, llm_nonstream, model_name=model_name, provider=provider) or {}
@@ -259,11 +254,9 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
         for item in llm_gen:
             if isinstance(item, dict) and item.get("type") == "error":
-                _dump_prompt_trace()
                 yield emit("error", text=item.get("message", "AI 请求失败"))
                 return
             if item is None:
-                _dump_prompt_trace()
                 yield emit("error", text="AI 请求失败")
                 return
             if isinstance(item, str):
@@ -272,7 +265,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 last_result = item
 
         if not last_result:
-            _dump_prompt_trace()
             yield emit("error", text="AI 请求失败")
             return
 
@@ -312,7 +304,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
             # 连续 progress 轮次超限，强制收尾
             if consecutive_progress >= MAX_CONSECUTIVE_PROGRESS:
-                _dump_prompt_trace()
                 yield emit("step", text=progress_msg, status="进行中")
                 yield emit("final",
                     text=f"任务执行中（连续 {consecutive_progress} 轮状态更新），已中止自动循环。可以发送新指令继续。",
@@ -330,7 +321,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         # final_message
         if ai_content and isinstance(ai_content, dict) and "final_message" in ai_content:
             final_msg = ai_content["final_message"]
-            _dump_prompt_trace()
             yield emit("final", text=final_msg, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
@@ -338,7 +328,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
             fallback = raw_content
             if intent_type == "general_chat":
-                _dump_prompt_trace()
                 yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 return
             RETRY_PROMPTS = [
@@ -350,7 +339,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 messages.append({"role": "system", "content": RETRY_PROMPTS[retry_count]})
                 retry_count += 1
                 continue
-            _dump_prompt_trace()
             yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
@@ -359,7 +347,6 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         arguments = ai_content.get("arguments", {})
 
         if tool_name == "finished":
-            _dump_prompt_trace()
             yield emit("final", text="任务已完成", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
@@ -417,6 +404,8 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                               session_id=session_id, status="success",
                               input_summary=str(arguments)[:200],
                               output_summary=result_str[:200])
+                    get_logger().info("工具调用成功", trace_id=trace_id, session_id=session_id,
+                                      tool=tool_name, elapsed_ms=elapsed_t)
                 except Exception as e:
                     elapsed_t = int((time.perf_counter() - t_tool) * 1000)
                     result_str = f"工具执行错误: {str(e)}"
@@ -426,6 +415,8 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                               session_id=session_id, status="error",
                               input_summary=str(arguments)[:200],
                               error=str(e)[:500])
+                    get_logger().warning("工具调用失败", trace_id=trace_id, session_id=session_id,
+                                         tool=tool_name, error=str(e)[:200], elapsed_ms=elapsed_t)
         else:
             result_str = f"工具 '{tool_name}' 不存在"
             collected_steps.append({"step": f"未知工具 {tool_name}", "status": "错误"})
@@ -435,12 +426,10 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         messages.append({"role": "assistant", "content": tool_call_msg})
         messages.append({"role": "user", "content": tool_result_msg})
 
-    _dump_prompt_trace()
     yield emit("final", text="任务未完成，已保存进度。可以继续。", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 # ---------- Flask 路由 ----------
-# 1. 补充 /api/sessions 的 POST 方法（接收前端保存的会话）
 @app.route('/api/sessions', methods=['POST'])
 def save_session():
     try:
@@ -476,6 +465,17 @@ def save_session():
                             msg_type=msg.get("msgType", "chat"),
                             timestamp=frontend_ts)
         return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/sessions/new', methods=['POST'])
+def new_session():
+    """创建新会话，由后端统一分配 ID 和名称"""
+    try:
+        session_id = create_session(title=None)
+        sessions = list_sessions()
+        session_data = next((s for s in sessions if s["id"] == session_id), None)
+        return jsonify({"success": True, "session": session_data})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -587,8 +587,84 @@ def api_chat():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+
+# ---------- 日志查询 API ----------
+@app.route('/logs/view')
+def log_viewer():
+    return app.send_static_file('log_viewer.html')
+
+
+@app.route('/api/logs/query')
+def api_logs_query():
+    lg = get_logger()
+    date_from = request.args.get("date_from", "")
+    date_to = request.args.get("date_to", "")
+    level = request.args.get("level", "")
+    keyword = request.args.get("keyword", "")
+    session_name = request.args.get("session_name", "")
+    limit = int(request.args.get("limit", 200))
+
+    # 会话名称 → session_id 映射
+    sid = None
+    if session_name:
+        for s in list_sessions():
+            if session_name.lower() in s["title"].lower():
+                sid = s["id"]
+                break
+
+    results = lg.query(
+        date_from=date_from or None, date_to=date_to or None,
+        level=level or None, keyword=keyword or None,
+        session_id=sid, limit=min(limit, 500),
+    )
+
+    # 为每条日志附加 session_name
+    if results:
+        session_map = {s["id"]: s["title"] for s in list_sessions()}
+        for entry in results:
+            eid = (entry.get("extra") or {}).get("session_id", "")
+            entry["session_name"] = session_map.get(eid, "")
+
+    return jsonify({"success": True, "logs": results})
+
+
+@app.route('/api/logs/dates')
+def api_logs_available_dates():
+    from logger import LOG_DIR
+    dates = []
+    if LOG_DIR.exists():
+        for f in sorted(LOG_DIR.glob("agent_*.jsonl"), reverse=True):
+            dates.append(f.stem.replace("agent_", ""))
+    return jsonify({"success": True, "dates": dates})
+
+
+@app.route('/api/logs/llm_call')
+def api_logs_llm_call():
+    trace_id = request.args.get("trace_id", "")
+    turn = int(request.args.get("turn", 0))
+    if not trace_id:
+        return jsonify({"success": False, "message": "缺少 trace_id"}), 400
+    lg = get_logger()
+    file_path = lg.get_llm_call_file(trace_id, turn)
+    if file_path and os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return jsonify({"success": True, "data": json.load(f)})
+    return jsonify({"success": False, "message": "未找到该 LLM 调用记录"}), 404
+
+
+@app.route('/api/sessions/<session_id>/rename', methods=['POST'])
+def api_rename_session(session_id):
+    data = request.json or {}
+    new_title = data.get("title", "").strip()
+    if not new_title:
+        return jsonify({"success": False, "message": "名称不能为空"}), 400
+    ok = rename_session(session_id, new_title)
+    return jsonify({"success": ok, "message": "已修改" if ok else "会话不存在"})
+
+
 # ---------- 启动 ----------
 if __name__ == '__main__':
+    ensure_session_titles()
     port = 8765
     print(f"Agent 前端已启动，请访问: http://127.0.0.1:{port}")
     app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)

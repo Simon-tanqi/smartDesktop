@@ -1,6 +1,7 @@
 import os
 import json
 import inspect
+import datetime
 from pathlib import Path
 
 TOOL_REGISTRY = {}
@@ -21,8 +22,76 @@ def _load_prompt(filename: str) -> str:
     return text
 
 
-# ── 工具 → 意图映射 ──
-# 每个工具名对应一个意图列表，表示该工具在哪些意图下暴露
+# ── 域定义 ──
+# 每个域包含：关键词列表 + 额外工具列表
+# L1 全局兜底工具 ALWAYS_INJECT 始终注入，不在此重复
+DOMAIN_DEFINITIONS = {
+    "file_manage": {
+        "keywords": [
+            "文件", "文件夹", "目录", "复制", "副本", "移动", "删除", "备份",
+            "拷贝", "重命名", "改名", "移到", "整理", "扫描", "列出", "查找",
+            "创建", "新建", "生成文件", "写入", "保存", "读取文件", "打开文件",
+            "路径", "桌面", "下载", "文档", "图片", "视频", "音乐", "压缩",
+            "解压", "格式转换", "pdf", "excel", "word", "ppt", "csv",
+            "txt", "json", "yaml", "md", "pdf转", "转pdf", "转格式",
+            "整个副本", "整一份", "来一份", "弄一份", "搞个备份", "存一份",
+        ],
+        "tools": ["move_file", "copy_file", "resolve_folder", "search_files"],
+    },
+    "code_generate": {
+        "keywords": [
+            "代码", "生成", "写一个", "编程", "脚本", "函数", "类", "程序",
+            "项目", "模块", "重构", "实现", "开发", "前端", "后端", "api",
+            "接口", "算法", "排序", "爬虫", "正则", "sql",
+        ],
+        "tools": [
+            "get_workspace_path", "search_content", "replace_in_file",
+            "search_files", "get_project_summary",
+        ],
+    },
+    "web_browse": {
+        "keywords": [
+            "搜索", "查询", "天气", "新闻", "网页", "链接", "上网",
+            "百度", "google", "互联网", "最新", "实时", "热点",
+            "汇率", "股价", "比赛", "比分",
+        ],
+        "tools": ["web_search", "fetch_webpage", "fetch_multiple", "get_weather"],
+    },
+    "system_config": {
+        "keywords": [
+            "注册表", "安装软件", "卸载", "系统设置", "壁纸", "主题",
+            "配置", "服务", "进程", "启动项", "环境变量", "驱动",
+            "任务管理器", "控制面板", "磁盘管理", "设备管理器",
+        ],
+        "tools": ["modify_registry"],
+    },
+    "user_memory": {
+        "keywords": [
+            "记住", "我叫", "我的名字", "记忆", "我的爱好", "我的目标",
+            "我的信息", "个人信息", "记一下",
+        ],
+        "tools": [],
+    },
+    "db_query": {
+        "keywords": ["数据库", "sql", "数据表", "表结构", "建表", "字段", "连接", "mongodb", "mysql"],
+        "tools": [],
+    },
+}
+
+# 角色模式关键词（显式触发，替换 persona）
+PERSONA_KEYWORDS = {
+    "architect":       ["架构师", "架构分析", "系统设计", "用架构师"],
+    "code_review":     ["代码审查", "code review", "审查代码", "审查一下"],
+    "product_manager": ["产品经理", "产品规划", "需求分析", "需求文档", "prd"],
+    "debugger":        ["调试", "debug", "排查bug", "排查 bug", "帮我调试"],
+    "growth":          ["增长", "用户获取", "运营策略", "增长方案"],
+    "boss":            ["商业决策", "老板模式", "投入产出", "roi"],
+}
+
+# ── L1 全局兜底工具（始终注入，能力黑洞） ──
+ALWAYS_INJECT = ["execute_command", "write_file", "read_file", "scan_directory"]
+
+# ── 工具注册（保留原有映射用于兼容） ──
 TOOL_INTENT_MAP = {
     "scan_directory":       ["file_manage", "general_chat"],
     "move_file":            ["file_manage"],
@@ -38,19 +107,9 @@ TOOL_INTENT_MAP = {
     "get_project_summary":  ["code_generate"],
     "web_search":           ["web_browse"],
     "fetch_webpage":        ["web_browse"],
+    "fetch_multiple":       ["web_browse"],
     "get_weather":          ["web_browse", "general_chat"],
     "modify_registry":      ["system_config"],
-}
-
-# ── 技能包摘要（先告诉大模型有哪些技能包可用） ──
-SKILL_PACK_SUMMARIES = {
-    "file_manage":    "文件扫描、复制、移动、删除、终端命令执行等本地文件操作",
-    "code_generate":  "代码读写、内容搜索、文件替换、项目结构分析",
-    "db_query":       "数据库查询（待扩展）",
-    "user_memory":    "用户信息记忆与召回（姓名/爱好/目标）",
-    "web_browse":     "网页搜索、内容抓取、天气查询等互联网信息获取",
-    "general_chat":   "记忆管理、日志追加、通用问答",
-    "system_config":  "注册表修改、软件安装卸载(winget/msiexec)、系统外观调整",
 }
 
 
@@ -65,17 +124,7 @@ def path_params(*params):
 
 
 def register_tool(func=None, *, timeout=60):
-    """将函数注册为可用工具。
-
-    用法：
-        @register_tool
-        def my_tool(...): ...
-
-        @register_tool(timeout=120)
-        def slow_tool(...): ...
-
-    timeout 字段用于 ReAct 循环中的工具执行超时控制，默认 60s。
-    """
+    """将函数注册为可用工具。"""
     def decorator(fn):
         sig = inspect.signature(fn)
         parameters = {}
@@ -99,48 +148,116 @@ def register_tool(func=None, *, timeout=60):
     return decorator
 
 
+# ── 关键词匹配 ──
+
+def _keyword_hit(text: str, keywords: list[str]) -> bool:
+    """任一关键词命中即返回 True"""
+    text_lower = text.lower()
+    for kw in keywords:
+        if kw.lower() in text_lower:
+            return True
+    return False
+
+
+def match_domains(user_input: str) -> list[str]:
+    """
+    本地关键词匹配域，零延迟。
+    返回命中域列表 + 始终包含 'general' 兜底。
+    """
+    domains = set()
+    for domain_name, definition in DOMAIN_DEFINITIONS.items():
+        if _keyword_hit(user_input, definition["keywords"]):
+            domains.add(domain_name)
+    # 始终追加兜底域
+    domains.add("general_chat")
+    return sorted(domains)
+
+
+def match_persona(user_input: str) -> str | None:
+    """检测是否显式触发角色模式"""
+    for persona, keywords in PERSONA_KEYWORDS.items():
+        if _keyword_hit(user_input, keywords):
+            return persona
+    return None
+
+
 # ── 动态 System Prompt ──
 
-def _get_tool_descriptions(intent_type: str) -> str:
+def _get_tool_descriptions(domains: list[str]) -> str:
     """
-    按意图筛选激活的工具，返回 Claude Code 风格的详细工具描述。
-    优先读 prompts/tools/<tool>.md，找不到则退化为 docstring。
+    按域筛选激活的工具：
+    - L1 ALWAYS_INJECT 工具始终注入
+    - L2 命中域的工具追加注入（去重）
     """
+    active_tools = set(ALWAYS_INJECT)
+    for domain in domains:
+        if domain in DOMAIN_DEFINITIONS:
+            active_tools.update(DOMAIN_DEFINITIONS[domain]["tools"])
+
     lines = ["# 当前可用工具\n"]
-    for name, info in TOOL_REGISTRY.items():
-        allowed = TOOL_INTENT_MAP.get(name, ["general_chat"])
-        if intent_type not in allowed and "general_chat" not in allowed:
+    seen = set()
+    for name in sorted(active_tools):
+        if name not in TOOL_REGISTRY:
             continue
-        # 优先加载详细的工具描述文件
+        if name in seen:
+            continue
+        seen.add(name)
+        info = TOOL_REGISTRY[name]
         tool_md = _load_prompt(f"tools/{name}.md")
         if tool_md:
             lines.append(tool_md)
         else:
-            # 退化：使用 docstring
             lines.append(f"## {name}\n{info['description']}\n")
     return "\n".join(lines)
 
 
+def _get_skill_prompts(domains: list[str]) -> str:
+    """合并所有命中域的技能规则"""
+    parts = []
+    from intent_router import SKILL_PROMPTS
+    for domain in domains:
+        skill_md = _load_prompt(f"skills/{domain}.md")
+        if skill_md:
+            parts.append(skill_md)
+        elif domain in SKILL_PROMPTS and SKILL_PROMPTS[domain]:
+            parts.append(SKILL_PROMPTS[domain])
+    return "\n\n".join(parts)
+
+
 def build_dynamic_system_prompt(
-    intent_type: str = "general_chat",
+    domains: list[str] = None,
     plan_mode: bool = False,
     persona_mode: str = None,
 ) -> str:
     """
     五层动态组装 System Prompt：
-    1. core.md / persona — 身份 + 输出风格（persona 模式替换 core）
-    2. safety.md          — 安全约束（始终加载）
-    3. tools/*.md         — 工具详细描述（按意图筛选）
-    4. skills/*.md        — 技能包提示词（按意图加载，persona 模式跳过）
-    5. modes/plan.md      — 计划模式（条件加载）
+    1. core.md / persona — 身份 + 输出风格
+    2. safety.md          — 安全约束
+    3. L1兜底工具 + L2域工具 — 工具详细描述
+    4. 域技能规则          — 按命中域合并注入
+    5. modes/plan.md      — 计划模式
+
+    domains: 关键词命中的域列表，如 ["file_manage", "general_chat"]
     """
-    cache_key = f"{intent_type}_{plan_mode}_{persona_mode}"
+    if domains is None:
+        domains = ["general_chat"]
+
+    cache_key = f"{'_'.join(domains)}_{plan_mode}_{persona_mode}"
     if cache_key in _PROMPT_CACHE:
         return _PROMPT_CACHE[cache_key]
 
     parts = []
 
-    # 第 1 层：核心身份 + 输出风格（persona 模式替换）
+    # 第 0 层：当前日期时间（LLM 时间基准，必须先注入）
+    now = datetime.datetime.now()
+    date_header = (
+        f"## 当前时间\n"
+        f"- 日期: {now.strftime('%Y-%m-%d')}（{['星期一','星期二','星期三','星期四','星期五','星期六','星期日'][now.weekday()]}）\n"
+        f"- 时间: {now.strftime('%H:%M:%S')}\n"
+    )
+    parts.append(date_header)
+
+    # 第 1 层：核心身份 + 输出风格
     if persona_mode:
         persona = _load_prompt(f"modes/{persona_mode}.md")
         parts.append(persona if persona else _load_prompt("core.md"))
@@ -150,22 +267,17 @@ def build_dynamic_system_prompt(
     # 第 2 层：安全约束
     parts.append(_load_prompt("safety.md"))
 
-    # 第 3 层：工具详细描述（按意图筛选）
-    tools_desc = _get_tool_descriptions(intent_type)
+    # 第 3 层：工具（L1 兜底 + L2 域命中）
+    tools_desc = _get_tool_descriptions(domains)
     parts.append(tools_desc)
 
-    # 第 4 层：技能包专用规则（persona 模式跳过，避免规则冲突）
+    # 第 4 层：域技能规则（persona 模式跳过）
     if not persona_mode:
-        skill_md = _load_prompt(f"skills/{intent_type}.md")
-        if skill_md:
-            parts.append(skill_md)
-        else:
-            from intent_router import SKILL_PROMPTS
-            fallback = SKILL_PROMPTS.get(intent_type, "")
-            if fallback:
-                parts.append(fallback)
+        skills = _get_skill_prompts(domains)
+        if skills:
+            parts.append(skills)
 
-    # 第 5 层：计划模式（与 persona 互斥，persona 自带行为约束）
+    # 第 5 层：计划模式
     if plan_mode and not persona_mode:
         parts.append(_load_prompt("modes/plan.md"))
 

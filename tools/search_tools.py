@@ -52,6 +52,18 @@ def search_files(keyword: str, search_path: str = None, file_extensions: list = 
 # ═══════════════════════════════════════════
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+_MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+# JS 渲染页面的典型空壳特征
+_JS_SHELL_PATTERNS = [
+    r'<div\s+id="root"></div>',
+    r'<div\s+id="app"></div>',
+    r'正在加载',
+    r'loading',
+    r'请启用\s*JavaScript',
+    r'Please enable JavaScript',
+    r'开启JavaScript',
+]
 
 
 def _strip_html(html: str) -> str:
@@ -64,7 +76,7 @@ def _strip_html(html: str) -> str:
 
 
 @register_tool
-def web_search(query: str, max_results: int = 5):
+def web_search(query: str, max_results: int = 10):
     """使用 Bing 搜索引擎搜索网页，返回标题、链接和摘要。适合获取最新新闻、实时信息。"""
     try:
         url = "https://www.bing.com/search"
@@ -97,30 +109,92 @@ def web_search(query: str, max_results: int = 5):
 
 @register_tool
 def fetch_webpage(url: str, max_length: int = 3000):
-    """抓取指定 URL 的网页正文（去除 HTML 标签）。适合在搜索后深入阅读某个页面。"""
-    try:
-        resp = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        if resp.encoding and resp.encoding.lower() != "utf-8":
-            resp.encoding = resp.apparent_encoding or "utf-8"
-        raw = resp.text
-    except Exception as e:
-        return json.dumps({"success": False, "error": f"网页抓取失败: {str(e)}"}, ensure_ascii=False)
+    """抓取指定 URL 的网页正文（去除 HTML 标签）。适合在搜索后深入阅读某个页面。
+    自动尝试桌面 UA → 移动端 UA → 移动端子域名(m.) 三级回退。"""
+    raw = None
+    resp_url = url
+    errors = []
+
+    for attempt in range(3):
+        try:
+            if attempt == 0:
+                ua = _USER_AGENT
+                target_url = url
+            elif attempt == 1:
+                ua = _MOBILE_UA
+                target_url = url
+            else:
+                # 尝试 m. 子域名
+                ua = _MOBILE_UA
+                target_url = re.sub(r'https?://(www\.)?', 'https://m.', url, count=1)
+            resp = requests.get(target_url, headers={"User-Agent": ua}, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            if resp.encoding and resp.encoding.lower() != "utf-8":
+                try:
+                    resp.encoding = resp.apparent_encoding or "utf-8"
+                except Exception:
+                    pass
+            raw = resp.text
+            resp_url = resp.url
+            break
+        except Exception as e:
+            errors.append(f"[{attempt}] {str(e)[:80]}")
+            continue
+
+    if raw is None:
+        return json.dumps({"success": False, "error": f"网页抓取失败: {'; '.join(errors)}"}, ensure_ascii=False)
 
     body_m = re.search(r"<body[^>]*>(.*?)</body>", raw, re.DOTALL | re.IGNORECASE)
     body = body_m.group(1) if body_m else raw
 
-    for tag in ["nav", "footer", "header", "aside", "noscript", "iframe"]:
+    for tag in ["nav", "footer", "header", "aside", "noscript", "iframe", "script", "style"]:
         body = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", "", body, flags=re.DOTALL | re.IGNORECASE)
 
     text = _strip_html(body)
+
+    # 检测 JS 空壳
+    is_js_shell = False
+    if len(text.strip()) < 200:
+        for pattern in _JS_SHELL_PATTERNS:
+            if re.search(pattern, raw, re.IGNORECASE):
+                is_js_shell = True
+                break
+
+    if is_js_shell:
+        text += ("\n\n⚠ [检测到 JS 渲染页面，正文可能不完整。建议搜索该文章的转载(知乎/CSDN/博客园)，"
+                 "或使用移动端 URL 重试。]")
+
     if len(text) > max_length:
         text = text[:max_length] + f"\n… [内容截断，原文约 {len(text)} 字符]"
 
     title_m = re.search(r"<title>(.*?)</title>", raw, re.DOTALL | re.IGNORECASE)
-    title = _strip_html(title_m.group(1)) if title_m else resp.url
+    title = _strip_html(title_m.group(1)) if title_m else resp_url
 
-    return json.dumps({"success": True, "url": resp.url, "title": title, "text": text}, ensure_ascii=False)
+    return json.dumps({"success": True, "url": resp_url, "title": title, "text": text}, ensure_ascii=False)
+
+
+@register_tool
+def fetch_multiple(urls: list, max_length: int = 2000):
+    """批量抓取多个 URL，返回合并结果。适合同时阅读多篇搜索结果。urls 为 URL 字符串列表，建议 3-5 个。"""
+    results = []
+    for url in urls[:5]:
+        try:
+            resp = requests.get(url, headers={"User-Agent": _MOBILE_UA}, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            raw = resp.text
+            body_m = re.search(r"<body[^>]*>(.*?)</body>", raw, re.DOTALL | re.IGNORECASE)
+            body = body_m.group(1) if body_m else raw
+            for tag in ["nav", "footer", "header", "aside", "noscript", "iframe", "script", "style"]:
+                body = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", "", body, flags=re.DOTALL | re.IGNORECASE)
+            text = _strip_html(body)
+            title_m = re.search(r"<title>(.*?)</title>", raw, re.DOTALL | re.IGNORECASE)
+            title = _strip_html(title_m.group(1)) if title_m else url
+            if len(text) > max_length:
+                text = text[:max_length] + "…[截断]"
+            results.append(f"---\n来源: {title}\n{text[:max_length]}")
+        except Exception as e:
+            results.append(f"---\n来源: {url}\n[抓取失败: {str(e)[:100]}]")
+    return json.dumps({"success": True, "combined": "\n\n".join(results)}, ensure_ascii=False)
 
 
 @register_tool

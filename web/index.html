@@ -92,7 +92,19 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            max-width: 150px;
+            max-width: 130px;
+            cursor: pointer;
+        }
+        .session-title:hover { text-decoration: underline; }
+        .session-title-edit {
+            display: none;
+            width: 120px;
+            padding: 2px 6px;
+            border: 1px solid #3498db;
+            border-radius: 4px;
+            background: #1a252f;
+            color: white;
+            font-size: 13px;
         }
         
         .session-time {
@@ -465,12 +477,31 @@
 					li.className = session.id === currentSessionId ? 'session-item active' : 'session-item';
 					li.dataset.id = session.id;
 					li.innerHTML = `
-						<span class="session-title" title="${session.title}">${session.title}</span>
+						<span class="session-title" title="${session.title}" data-id="${session.id}">${session.title}</span>
+						<input class="session-title-edit" data-id="${session.id}" maxlength="30">
 						<span class="session-time">${formatTime(session.createdAt)}</span>
 						<span class="session-delete" title="删除会话" style="margin-left:auto;cursor:pointer;color:#e74c3c;font-size:14px;">&#10005;</span>
 					`;
+
+					// 双击标题 → 进入编辑模式
+					const titleSpan = li.querySelector('.session-title');
+					const editInput = li.querySelector('.session-title-edit');
+					titleSpan.addEventListener('dblclick', () => {
+						editInput.style.display = 'inline-block';
+						titleSpan.style.display = 'none';
+						editInput.value = sessions[session.id].title;
+						editInput.focus();
+						editInput.select();
+					});
+					editInput.addEventListener('blur', () => finishEdit(session.id, editInput, titleSpan));
+					editInput.addEventListener('keydown', (e) => {
+						if (e.key === 'Enter') finishEdit(session.id, editInput, titleSpan);
+						if (e.key === 'Escape') cancelEdit(editInput, titleSpan);
+					});
+
 					li.addEventListener('click', (e) => {
 						if (e.target.classList.contains('session-delete')) return;
+						if (e.target.classList.contains('session-title-edit')) return;
 						switchSession(session.id);
 					});
 					li.querySelector('.session-delete').addEventListener('click', (e) => {
@@ -479,6 +510,31 @@
 					});
 					sessionListEl.appendChild(li);
 				});
+		}
+
+		async function finishEdit(sessionId, input, titleSpan) {
+			const newTitle = input.value.trim();
+			input.style.display = 'none';
+			titleSpan.style.display = '';
+			if (!newTitle || newTitle === sessions[sessionId].title) return;
+			try {
+				const res = await fetch(`/api/sessions/${sessionId}/rename`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ title: newTitle })
+				});
+				const data = await res.json();
+				if (data.success) {
+					sessions[sessionId].title = newTitle;
+					titleSpan.textContent = newTitle;
+					titleSpan.title = newTitle;
+				}
+			} catch (e) {}
+		}
+
+		function cancelEdit(input, titleSpan) {
+			input.style.display = 'none';
+			titleSpan.style.display = '';
 		}
 
 		function generateSessionId() {
@@ -574,20 +630,39 @@
 		}
 
 		async function createNewSession() {
-			const sessionId = generateSessionId();
-			const sessionTitle = `新对话 ${new Date().toLocaleTimeString()}`;
-			sessions[sessionId] = {
-				id: sessionId,
-				title: sessionTitle,
-				messages: [],
-				createdAt: new Date()
-			};
-			currentSessionId = sessionId;
-			renderSessionList();
-			clearChatArea();
-			appendMessage('system', `会话 [${sessionTitle}] 已启动`);
-			await saveSessionToBackend(sessionId);
-			return sessionId;
+			try {
+				const res = await fetch('/api/sessions/new', { method: 'POST' });
+				const data = await res.json();
+				if (!data.success || !data.session) throw new Error(data.message || '创建失败');
+				const sess = data.session;
+				sessions[sess.id] = {
+					id: sess.id,
+					title: sess.title || sess.id,
+					messages: [],
+					createdAt: sess.created_at ? new Date(sess.created_at) : new Date()
+				};
+				currentSessionId = sess.id;
+				renderSessionList();
+				clearChatArea();
+				appendMessage('system', `会话 [${sess.title || sess.id}] 已启动`);
+				return sess.id;
+			} catch (e) {
+				// 兜底：本地创建
+				const sessionId = generateSessionId();
+				const sessionTitle = `新对话`;
+				sessions[sessionId] = {
+					id: sessionId,
+					title: sessionTitle,
+					messages: [],
+					createdAt: new Date()
+				};
+				currentSessionId = sessionId;
+				renderSessionList();
+				clearChatArea();
+				appendMessage('system', `会话 [${sessionTitle}] 已启动`);
+				await saveSessionToBackend(sessionId);
+				return sessionId;
+			}
 		}
 
 		async function deleteSessionById(sessionId) {

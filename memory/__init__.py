@@ -75,6 +75,7 @@ from memory.compressor import (
 # ── 会话管理 ──
 from memory.session import (
     create_session,
+    rename_session,
     get_active_session_id,
     set_active_session,
     list_sessions,
