@@ -7,6 +7,7 @@
   - build_context_messages 将摘要注入 LLM 上下文
 """
 import os
+import re
 import datetime
 
 from memory.config import (
@@ -184,6 +185,62 @@ def get_last_turn(session_id):
 # 上下文构建：SQLite 消息 + 压缩摘要
 # ═══════════════════════════════════════════════
 
+def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35):
+    """
+    检测当前用户消息是否与历史中的某条用户消息高度相似。
+    使用中文 bigram Jaccard 相似度。
+    返回需要排除的旧 assistant 摘要消息索引列表（保留工具调用 + 工具结果对）。
+    """
+    if not current_user_msg or not messages:
+        return []
+
+    def _bigrams(text):
+        """提取中文 bigram 特征"""
+        chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
+        if len(chinese) < 2:
+            return set()
+        return {chinese[i:i+2] for i in range(len(chinese)-1)}
+
+    def _is_tool_call(content):
+        """判断 assistant 消息是否为工具调用（JSON 格式），而非自然语言摘要"""
+        content = content.strip()
+        return content.startswith('{"tool_call"') or content.startswith('{"type":"tool"')
+
+    current_bigrams = _bigrams(current_user_msg)
+    if not current_bigrams:
+        return []
+
+    exclude_indices = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        hist_content = msg.get("content", "")
+        hist_bigrams = _bigrams(hist_content)
+        if not hist_bigrams:
+            continue
+
+        intersection = len(current_bigrams & hist_bigrams)
+        union = len(current_bigrams | hist_bigrams)
+        if union == 0:
+            continue
+        jaccard = intersection / union
+
+        if jaccard >= similarity_threshold:
+            # 找到该轮次的 assistant 消息，只排除摘要（非工具调用），保留工具调用结果供复用
+            j = i + 1
+            turn_assistants = []
+            while j < len(messages) and messages[j].get("role") != "user":
+                if messages[j].get("role") == "assistant":
+                    turn_assistants.append(j)
+                j += 1
+            for idx in turn_assistants:
+                content = messages[idx].get("content", "")
+                if not _is_tool_call(content):
+                    exclude_indices.append(idx)
+
+    return sorted(set(exclude_indices), reverse=True)
+
+
 def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
     """
     构建 LLM 上下文消息列表（SQLite 近期消息 + 压缩摘要）。
@@ -200,6 +257,27 @@ def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOK
         [{"role": ..., "content": ...}, ...]
     """
     messages = get_session_messages(session_id, limit=limit)
+
+    # ── 重复提问检测：排除旧的工具调用结果 ──
+    # 获取当前会话最后一条用户消息
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = m.get("content", "")
+            break
+
+    if last_user_msg:
+        exclude_indices = _detect_repeated_query(messages, last_user_msg)
+        if exclude_indices:
+            # 从后往前删除，避免索引偏移
+            for idx in exclude_indices:
+                if idx < len(messages):
+                    del messages[idx]
+            # 插入一条标记，告知 LLM 可复用已完成结果，但失败/遗漏部分需重新执行
+            messages.append({
+                "role": "system",
+                "content": "【注意】用户重复了之前的提问。历史中的工具调用结果已保留，已完成的部分可直接引用其输出内容，但执行失败或遗漏的部分请重新执行对应工具补充，不要假设所有步骤都已完成。"
+            })
 
     # ── 注入压缩摘要 ──
     latest = get_latest_summary(days=30)

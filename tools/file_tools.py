@@ -4,6 +4,7 @@ import json
 import shutil
 import shlex
 from datetime import datetime
+import subprocess
 
 from . import register_tool, path_params
 from . import safe_exec
@@ -221,3 +222,94 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
 
     _log_confirmation(command, "FAILED", result.get("message", ""))
     return json.dumps({"success": False, "message": result.get("message", "")}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════
+# Python 代码执行工具
+# ═══════════════════════════════════════════════
+
+PYTHON_OUTPUT_MAX_CHARS = 8000
+PYTHON_TIMEOUT_DEFAULT = 300
+
+
+@register_tool(timeout=320)
+def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT) -> str:
+    """直接执行 Python 代码并返回输出结果。适用于复杂文件遍历、数据处理等命令行难以胜任的任务。
+
+    code: 完整的 Python 代码字符串（不是文件路径）。可以用 print() 输出结果，结果会被自动捕获返回。
+    timeout: 超时秒数，默认 300 秒（5 分钟），全盘扫描等耗时操作可设更长。
+
+    使用场景：
+    - 遍历多层目录、按条件过滤文件（如查找大于某大小的文件）
+    - 多步文件操作需要一次性完成，避免反复调用命令
+    - 数据处理、格式转换等复杂逻辑
+    - 命令行工具超时时，改用本工具
+
+    注意事项：
+    - 代码中不要使用 input()（无交互终端）
+    - 代码中不要使用 os.system()（应使用 subprocess）
+    - 结果通过 print() 输出，stdout 和 stderr 会被分别捕获
+    - 文件操作优先在 work_space 目录下进行"""
+    if not code or not code.strip():
+        return json.dumps({"success": False, "message": "代码不能为空"})
+
+    import sys
+    import tempfile
+
+    code = code.strip()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(code)
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+
+        if result.returncode != 0:
+            error_msg = stderr if stderr else f"脚本退出码: {result.returncode}"
+            return json.dumps({
+                "success": False,
+                "message": f"Python 执行失败:\n{error_msg}",
+                "stdout": stdout[:2000] if stdout else "",
+            }, ensure_ascii=False)
+
+        output = stdout
+        truncated = len(output) > PYTHON_OUTPUT_MAX_CHARS
+        if truncated:
+            output = output[:PYTHON_OUTPUT_MAX_CHARS] + (
+                f"\n\n[输出已截断：原始长度 {len(stdout)} 字符 → {PYTHON_OUTPUT_MAX_CHARS} 字符。"
+                f"请优化代码减少输出量，或写入文件后用 read_file 读取。]"
+            )
+
+        return json.dumps({
+            "success": True,
+            "output": output,
+            "output_total_chars": len(stdout),
+            "truncated": truncated,
+        }, ensure_ascii=False)
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({
+            "success": False,
+            "message": f"Python 代码执行超时 ({timeout} 秒)。请优化代码逻辑或增大 timeout 参数。"
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"执行异常: {str(e)}"})
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass

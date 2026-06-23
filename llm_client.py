@@ -186,8 +186,8 @@ def _ollama_call_stream(messages, model, trace_id=""):
         "model": model,
         "messages": messages,
         "stream": True,
-        "format": "json",
-        "options": {"temperature": DEFAULT_TEMPERATURE}
+        "options": {"temperature": DEFAULT_TEMPERATURE},
+        "format": "json"
     }
     t0 = time.perf_counter()
     try:
@@ -429,17 +429,17 @@ def get_available_models():
         provider: 模型服务商标识 (ollama / deepseek)
         model: 具体模型名称
     """
-    # 内置双模型：本地Ollama + DeepSeek在线API
+    # 内置双模型：DeepSeek 置顶为默认（Ollama 需本地部署，不一定可用）
     models = [
-        {
-            "display": "本地 Ollama (deepseek-r1:7b)",
-            "provider": "ollama",
-            "model": "deepseek-r1:7b"
-        },
         {
             "display": "DeepSeek (deepseek-chat)",
             "provider": "deepseek",
             "model": "deepseek-chat"
+        },
+        {
+            "display": "本地 Ollama (deepseek-r1:7b)",
+            "provider": "ollama",
+            "model": "deepseek-r1:7b"
         }
     ]
     return models

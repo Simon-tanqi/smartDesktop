@@ -175,13 +175,15 @@ class StructuredLogger:
     # ── 查询接口 ──
     def query(self, date_from: str = None, date_to: str = None,
               level: str = None, keyword: str = None,
-              session_id: str = None, limit: int = 200) -> list[dict]:
+              session_id: str = None, trace_id: str = None,
+              limit: int = 200) -> list[dict]:
         """
         按条件查询日志。
         date_from / date_to: "YYYY-MM-DD"
         level: "ERROR" / "WARNING" / "INFO" / "DEBUG"
         keyword: 搜索 message 字段和 extra 值
         session_id: 精确匹配 extra.session_id
+        trace_id: 精确匹配 extra.trace_id
         limit: 最多返回条数
         """
         # 确定要扫描的文件范围
@@ -232,6 +234,12 @@ class StructuredLogger:
                         if session_id:
                             extra = entry.get("extra", {})
                             if extra.get("session_id") != session_id:
+                                continue
+
+                        # 追踪 ID 过滤
+                        if trace_id:
+                            extra = entry.get("extra", {})
+                            if extra.get("trace_id") != trace_id:
                                 continue
 
                         results.append(entry)

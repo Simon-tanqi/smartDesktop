@@ -142,6 +142,7 @@ def _init_chat_tables(conn):
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             msg_type TEXT DEFAULT 'chat',
+            msg_id TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -150,6 +151,7 @@ def _init_chat_tables(conn):
         ("msg_type", "TEXT DEFAULT 'chat'"),
         ("trace_id", "TEXT NOT NULL DEFAULT ''"),
         ("user_id", "TEXT NOT NULL DEFAULT ''"),
+        ("msg_id", "TEXT DEFAULT ''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE chat_history ADD COLUMN {col} {col_type}")
@@ -157,10 +159,11 @@ def _init_chat_tables(conn):
             pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_trace ON chat_history(trace_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg_id ON chat_history(session_id, msg_id)")
     conn.commit()
 
 
-def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", user_id="", timestamp=""):
+def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", user_id="", timestamp="", msg_id=""):
     """写入聊天记录。timestamp 为 ISO 格式字符串（如 '2026-06-15 23:11:10'），不传则使用当前时间。"""
     if role not in ("user", "assistant", "system"):
         return
@@ -168,13 +171,13 @@ def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", us
         _init_chat_tables(conn)
         if timestamp:
             conn.execute(
-                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type, timestamp),
+                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (trace_id, user_id, session_id, role, content, msg_type, msg_id, timestamp),
             )
         else:
             conn.execute(
-                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type) VALUES (?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type),
+                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (trace_id, user_id, session_id, role, content, msg_type, msg_id),
             )
         conn.commit()
 
@@ -184,11 +187,11 @@ def get_chat_messages(session_id, limit=200, offset=0):
     with _get_conn(CHAT_DB, row_factory=True) as conn:
         _init_chat_tables(conn)
         rows = conn.execute(
-            "SELECT role, content, msg_type, created_at FROM chat_history "
+            "SELECT role, content, msg_type, msg_id, created_at FROM chat_history "
             "WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
-    return [{"role": r[0], "content": r[1], "msg_type": r[2], "created_at": r[3]} for r in rows]
+    return [{"role": r[0], "content": r[1], "msg_type": r[2], "msg_id": r[3], "created_at": r[4]} for r in rows]
 
 
 def get_session_messages(session_id, limit=500):

@@ -60,5 +60,6 @@ NOISE_PHRASES = ["你好", "在吗", "谢谢", "再见", "哦", "嗯", "哈哈",
 
 
 def generate_trace_id():
-    """生成每次请求的追踪 ID（12 位 hex）。"""
-    return uuid.uuid4().hex[:12]
+    """生成每次请求的追踪 ID（日期 + 12 位 hex，如 20260621_a1b2c3d4e5f6）。"""
+    from datetime import datetime
+    return f"{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:12]}"

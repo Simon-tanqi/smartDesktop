@@ -89,7 +89,7 @@ PERSONA_KEYWORDS = {
 }
 
 # ── L1 全局兜底工具（始终注入，能力黑洞） ──
-ALWAYS_INJECT = ["execute_command", "write_file", "read_file", "scan_directory"]
+ALWAYS_INJECT = ["execute_command", "run_python", "write_file", "read_file", "scan_directory"]
 
 # ── 工具注册（保留原有映射用于兼容） ──
 TOOL_INTENT_MAP = {
@@ -212,7 +212,7 @@ def _get_tool_descriptions(domains: list[str]) -> str:
 
 
 def _get_skill_prompts(domains: list[str]) -> str:
-    """合并所有命中域的技能规则"""
+    """合并所有命中域的技能规则（保留供外部调用，不在 upfront system prompt 中使用）"""
     parts = []
     from intent_router import SKILL_PROMPTS
     for domain in domains:
@@ -222,6 +222,17 @@ def _get_skill_prompts(domains: list[str]) -> str:
         elif domain in SKILL_PROMPTS and SKILL_PROMPTS[domain]:
             parts.append(SKILL_PROMPTS[domain])
     return "\n\n".join(parts)
+
+
+def get_skill_prompt(domain: str) -> str:
+    """按需加载指定域的技能 prompt，供回路护板在基础工具失败后动态注入。"""
+    skill_prompt = _load_prompt(f"skills/{domain}.md")
+    if skill_prompt:
+        return skill_prompt
+    from intent_router import SKILL_PROMPTS
+    if domain in SKILL_PROMPTS and SKILL_PROMPTS[domain]:
+        return SKILL_PROMPTS[domain]
+    return ""
 
 
 def build_dynamic_system_prompt(
@@ -271,11 +282,8 @@ def build_dynamic_system_prompt(
     tools_desc = _get_tool_descriptions(domains)
     parts.append(tools_desc)
 
-    # 第 4 层：域技能规则（persona 模式跳过）
-    if not persona_mode:
-        skills = _get_skill_prompts(domains)
-        if skills:
-            parts.append(skills)
+    # 第 4 层：域技能规则 — 不再 upfront 注入，改为回路护板按需动态注入
+    # skills 由 app.py ReAct 循环中的 _try_inject_skill 在基础工具失败后注入
 
     # 第 5 层：计划模式
     if plan_mode and not persona_mode:

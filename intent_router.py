@@ -8,6 +8,9 @@ SKILL_PROMPTS = {
     - 先使用 scan_directory 确认目录内容，再执行复制/移动/删除。
     - 目标文件夹不明确时，必须使用 resolve_folder 查找真实文件夹名（支持拼音/英文匹配）。
     - 源路径必须包含完整文件名（含扩展名），不得猜测。
+    - 简单文件搜索（单层目录、通配符匹配）优先用 execute_command（PowerShell Get-ChildItem）。
+    - 仅当 execute_command 超时、或需要遍历多层目录且按复杂条件过滤（如递归 os.walk + 多条件判断）时，再改用 run_python 编写 Python 脚本。run_python 可一次性处理，超时 320 秒。
+    - execute_command 执行超时时，应立即改用 run_python，不要反复重试。
     """,
     "code_generate": """
     【代码生成强制规则】

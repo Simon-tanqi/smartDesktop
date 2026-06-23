@@ -2,8 +2,7 @@ from flask import Flask, render_template, request, jsonify, Response, stream_wit
 import os, json, time, datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
-from intent_router import classify_intent, extract_params
-from tools import TOOL_REGISTRY, build_dynamic_system_prompt
+from tools import TOOL_REGISTRY, build_dynamic_system_prompt, match_domains, match_persona, get_skill_prompt
 from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace, build_context_messages, rename_session)
 from memory.session import ensure_session_titles, create_session
 from logger import get_logger
@@ -100,7 +99,8 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                     full_content = chunk.get("content", full_content)
                     full_reasoning = chunk.get("reasoning_content", full_reasoning)
                 elif chunk.get("type") == "error":
-                    yield {"type": "error", "message": chunk.get("message", "未知错误")}
+                    err_msg = chunk.get("message") or chunk.get("error") or "未知错误"
+                    yield {"type": "error", "message": err_msg}
                     return
         except Exception as e:
             yield {"type": "error", "message": f"流式调用异常: {str(e)}"}
@@ -124,23 +124,16 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
     yield emit("step", text="开始分析问题...", status="进行中")
     get_logger().info("Agent启动", trace_id=trace_id, session_id=session_id, user_message=user_message[:100])
 
-    # ===== Phase 1: 意图识别与参数提取（非流式）=====
+    # ===== Phase 1: 本地关键词域匹配（零延迟）=====
     try:
         t0 = time.perf_counter()
-        intent_type = classify_intent(user_message, llm_nonstream, model_name=model_name, provider=provider)
+        domains = match_domains(user_message)
+        persona_mode = match_persona(user_message)
         elapsed_i = int((time.perf_counter() - t0) * 1000)
-        log_trace(trace_id, "intent.classify", "intent", elapsed_i,
+        log_trace(trace_id, "intent.match_domains", "intent", elapsed_i,
                   session_id=session_id, status="success",
-                  input_summary=user_message[:200], output_summary=intent_type)
-        get_logger().info("意图识别完成", trace_id=trace_id, session_id=session_id, intent=intent_type, elapsed_ms=elapsed_i)
-
-        t0 = time.perf_counter()
-        params = extract_params(user_message, intent_type, llm_nonstream, model_name=model_name, provider=provider) or {}
-        elapsed_p = int((time.perf_counter() - t0) * 1000)
-        log_trace(trace_id, "intent.extract_params", "intent", elapsed_p,
-                  session_id=session_id, status="success",
-                  input_summary=f"intent={intent_type} | {user_message[:150]}",
-                  output_summary=str(params)[:200])
+                  input_summary=user_message[:200], output_summary=str(domains))
+        get_logger().info("域匹配完成", trace_id=trace_id, session_id=session_id, domains=domains, persona=persona_mode, elapsed_ms=elapsed_i)
 
         # ===== Phase 2: 构建 System Prompt =====
         # 使用 build_context_messages 获取 SQLite 消息 + 压缩摘要
@@ -166,9 +159,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
         cleaned_history = _normalize_messages(cleaned_history)
 
-        from intent_router import PERSONA_MODES
-        persona_mode = intent_type if intent_type in PERSONA_MODES else None
-        base_system = build_dynamic_system_prompt(intent_type=intent_type, persona_mode=persona_mode)
+        base_system = build_dynamic_system_prompt(domains=domains, persona_mode=persona_mode)
 
         # 2. 按需注入长期记忆（关键词匹配 + 字符上限）
         relevant_memory = get_relevant_memory(user_message)
@@ -208,6 +199,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
     MAX_CONSECUTIVE_PROGRESS = 3  # 连续 progress 轮次上限，防止无限循环
     retry_count = 0
     consecutive_progress = 0
+    _skills_injected = set()  # 按需注入的技能 prompt 跟踪，防止重复注入
 
     # ── 工具执行辅助：重试 + 超时 + 缓存 ──
     _cache = {}
@@ -219,8 +211,9 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
     _last_tool_name = ""
     _last_args_norm = ""
     _consecutive_same_tool = 0
-    MAX_SAME_TOOL_STREAK = 5      # 连续调用同一工具 ≥5 次 → 强提醒
-    MAX_EXACT_REPEAT = 2          # 完全相同的参数 ≥2 次 → 强提醒
+    MAX_SAME_TOOL_STREAK = 5      # 连续调用同一工具 ≥5 次 → 拒绝执行本轮
+    MAX_EXACT_REPEAT = 2          # 完全相同的参数 ≥2 次 → 拒绝执行本轮
+    MAX_FORCED_ABORT = 8          # 同类工具连续调用 ≥8 次 → 强制终止 ReAct 循环
 
     def _is_retryable(exc):
         import errno
@@ -230,6 +223,18 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             return exc.errno in (errno.EAGAIN, errno.EBUSY, errno.EINTR)
         if isinstance(exc, PermissionError):
             return True
+        return False
+
+    def _try_inject_skill():
+        """基础工具失败后按需注入域技能 prompt（每域仅注入一次）"""
+        skill_domains = ["file_manage", "system_config"]
+        for domain in domains:
+            if domain in skill_domains and domain not in _skills_injected:
+                skill = get_skill_prompt(domain)
+                if skill:
+                    messages.append({"role": "system", "content": skill})
+                    _skills_injected.add(domain)
+                    return True
         return False
 
     def _execute_tool_with_retry(tool_name, arguments, timeout=60):
@@ -303,6 +308,12 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
         ai_content = parse_ai_json(raw_content)
 
+        # 提取 _thinking 字段作为思考过程展示
+        if ai_content and isinstance(ai_content, dict) and "_thinking" in ai_content:
+            thinking_text = str(ai_content.pop("_thinking")).strip()
+            if thinking_text:
+                yield emit("thinking", text=thinking_text)
+
         # progress 类型
         if ai_content and isinstance(ai_content, dict) and "progress" in ai_content:
             consecutive_progress += 1
@@ -334,7 +345,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         # 纯文本回退（最多 3 次渐进式重试）
         if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
             fallback = raw_content
-            if intent_type == "general_chat":
+            if domains == ["general_chat"]:
                 yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 return
             RETRY_PROMPTS = [
@@ -352,10 +363,70 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         # 工具调用
         tool_name = ai_content["tool_name"]
         arguments = ai_content.get("arguments", {})
+        _is_tool_error = False  # ← 初始化错误标记
 
         if tool_name == "finished":
             yield emit("final", text="任务已完成", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
+
+        # ── 硬性回路护板：执行前拦截（不再依赖 LLM 自觉）──
+        args_norm = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        is_exact_repeat = (tool_name == _last_tool_name and args_norm == _last_args_norm)
+        is_same_tool = (tool_name == _last_tool_name)
+
+        if is_same_tool:
+            _consecutive_same_tool += 1
+        else:
+            _consecutive_same_tool = 1
+        _last_tool_name = tool_name
+        _last_args_norm = args_norm
+
+        # 硬性终止：全局同类工具重复 ≥ MAX_FORCED_ABORT → 强制结束 ReAct 循环
+        if _consecutive_same_tool >= MAX_FORCED_ABORT:
+            yield emit("final",
+                text=f"已连续 {_consecutive_same_tool} 次调用 {tool_name}，达到系统硬性上限，已中止本轮思考。请重新描述你的需求。",
+                timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            return
+
+        # 硬性拦截：连续同一工具 ≥ MAX_SAME_TOOL_STREAK → 拒绝执行本轮
+        if _consecutive_same_tool >= MAX_SAME_TOOL_STREAK and is_same_tool:
+            if tool_name == "execute_command":
+                hint = (
+                    f"请改用 write_file 将你的脚本写入 .py 文件（保存到 temp 目录），"
+                    f"然后用 execute_command 执行 `python 脚本路径.py`。不要继续在内联命令中死磕。"
+                )
+            else:
+                hint = "请立即换一种完全不同的工具或方案。"
+            guard = (
+                f"【回路护板-拦截】你已连续 {_consecutive_same_tool} 次调用 {tool_name}，"
+                f"该调用已被系统拒绝。{hint}"
+            )
+            messages.append({"role": "system", "content": guard})
+            _try_inject_skill()
+            collected_steps.append({"step": f"拦截同工具连续调用 {tool_name}", "status": "完成"})
+            yield emit("step", text=f"拦截同工具连续调用 {tool_name}", status="完成")
+            _consecutive_same_tool = 0
+            continue
+
+        # 硬性拦截：完全相同的参数 ≥ MAX_EXACT_REPEAT → 拒绝执行本轮
+        if _consecutive_same_tool >= MAX_EXACT_REPEAT and is_exact_repeat:
+            if tool_name == "execute_command":
+                hint = (
+                    f"请改用 write_file 将你的脚本写入 .py 文件（保存到 temp 目录），"
+                    f"然后用 execute_command 执行 `python 脚本路径.py`。不要继续在内联命令中死磕。"
+                )
+            else:
+                hint = "请立即换一种完全不同的参数或方案。"
+            guard = (
+                f"【回路护板-拦截】你已连续 {_consecutive_same_tool} 次调用 {tool_name} 且参数完全相同，"
+                f"该调用已被系统拒绝。{hint}"
+            )
+            messages.append({"role": "system", "content": guard})
+            _try_inject_skill()
+            collected_steps.append({"step": f"拦截完全相同调用 {tool_name}", "status": "完成"})
+            yield emit("step", text=f"拦截完全相同调用 {tool_name}", status="完成")
+            _consecutive_same_tool = 0
+            continue
 
         if tool_name in TOOL_REGISTRY:
             tool_info = TOOL_REGISTRY[tool_name]
@@ -386,11 +457,23 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 yield emit("step", text=f"执行 {tool_name} (缓存命中)", status="完成")
             else:
                 t_tool = time.perf_counter()
+                _is_tool_error = False
+                # 工具执行前发送等待态，让前端显示剩余超时时间
+                yield emit("step", text=f"执行 {tool_name} (最长 {tool_timeout}秒)...", status="等待中",
+                           timeout=tool_timeout, tool_name=tool_name)
                 try:
                     result = _execute_tool_with_retry(tool_name, arguments, timeout=tool_timeout)
                     elapsed_t = int((time.perf_counter() - t_tool) * 1000)
                     result_str = str(result)
-                    _cache[cache_key] = result
+                    # ❌ 工具返回 success=false 时不缓存，避免重试永远命中同一个错误
+                    try:
+                        _parsed = json.loads(result) if isinstance(result, str) else result
+                        if isinstance(_parsed, dict) and _parsed.get("success") is False:
+                            _is_tool_error = True
+                    except Exception:
+                        pass
+                    if not _is_tool_error:
+                        _cache[cache_key] = result
                     if tool_name in _WRITE_TOOLS:
                         _cache = {k: v for k, v in _cache.items() if k[0] not in _WRITE_TOOLS}
                     result_len = len(result_str)
@@ -405,60 +488,60 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                             )
                         else:
                             result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
-                    collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
-                    yield emit("step", text=f"执行 {tool_name}", status="完成")
+                    # ❌ 工具返回 success=false 时，给大模型更明确的错误提示，敦促其修改方案
+                    if _is_tool_error:
+                        _err_short = result_str[:120].replace('\n', ' ')
+                        collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": result_str[:200]})
+                        yield emit("step", text=f"执行 {tool_name} 失败: {_err_short}", status="错误")
+                    else:
+                        collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
+                        yield emit("step", text=f"执行 {tool_name}", status="完成")
                     log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
-                              session_id=session_id, status="success",
+                              session_id=session_id, status="error" if _is_tool_error else "success",
                               input_summary=str(arguments)[:200],
                               output_summary=result_str[:200])
-                    get_logger().info("工具调用成功", trace_id=trace_id, session_id=session_id,
+                    get_logger().info("工具调用" + ("失败" if _is_tool_error else "成功"), trace_id=trace_id, session_id=session_id,
                                       tool=tool_name, elapsed_ms=elapsed_t)
                 except Exception as e:
                     elapsed_t = int((time.perf_counter() - t_tool) * 1000)
-                    result_str = f"工具执行错误: {str(e)}"
-                    collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": str(e)})
-                    yield emit("step", text=f"执行 {tool_name} 失败", status="错误")
+                    _err_msg = str(e)
+                    result_str = f"工具执行错误: {_err_msg}"
+                    collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": _err_msg})
+                    yield emit("step", text=f"执行 {tool_name} 失败: {_err_msg[:100]}", status="错误")
                     log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
                               session_id=session_id, status="error",
                               input_summary=str(arguments)[:200],
                               error=str(e)[:500])
                     get_logger().warning("工具调用失败", trace_id=trace_id, session_id=session_id,
                                          tool=tool_name, error=str(e)[:200], elapsed_ms=elapsed_t)
+                    if tool_name == "execute_command" and ("超时" in _err_msg or "timeout" in _err_msg.lower()):
+                        result_str += (
+                            f"\n\n【系统提示】命令行已超时({tool_timeout}秒)。"
+                            f"如果任务是批量文件操作，请改用 run_python 工具编写 Python 脚本完成；"
+                            f"如果是安装/下载类任务，请检查网络或改用其他安装方式。"
+                        )
+                        _try_inject_skill()
         else:
             result_str = f"工具 '{tool_name}' 不存在"
             collected_steps.append({"step": f"未知工具 {tool_name}", "status": "错误"})
 
         tool_call_msg = json.dumps(ai_content, ensure_ascii=False)
-        tool_result_msg = f"工具 {tool_name} 返回：{result_str}"
+        # ✅ 工具返回 success=false 时，给大模型更明确的错误反馈和修改建议
+        if _is_tool_error:
+            tool_result_msg = (
+                f"❌ 工具 {tool_name} 执行失败！返回结果：{result_str}\n\n"
+                f"【系统提示】请仔细阅读错误信息，修改你的工具调用参数或换一种方案。\n"
+                f"不要用相同参数重复调用，否则会被回路护板拦截。\n"
+                f"常见修复方法：\n"
+                f"- 如果是语法错误，检查代码中的引号、括号、缩进\n"
+                f"- 如果是超时，优化代码逻辑减少执行时间，或增大 timeout 参数\n"
+                f"- 如果是模块不存在，使用 pip install 安装或换一种实现方式\n"
+                f"- 如果是文件路径错误，使用 scan_directory 先确认路径是否存在"
+            )
+        else:
+            tool_result_msg = f"工具 {tool_name} 返回：{result_str}"
         messages.append({"role": "assistant", "content": tool_call_msg})
         messages.append({"role": "user", "content": tool_result_msg})
-
-        # ── 回路护板：同类工具重复调用 ──
-        args_norm = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
-        is_exact_repeat = (tool_name == _last_tool_name and args_norm == _last_args_norm)
-        is_same_tool = (tool_name == _last_tool_name)
-
-        if is_same_tool:
-            _consecutive_same_tool += 1
-        else:
-            _consecutive_same_tool = 1
-        _last_tool_name = tool_name
-        _last_args_norm = args_norm
-
-        def _inject_guard(reason):
-            guard = (
-                f"【回路护板】{reason}\n"
-                f"你必须立即停止尝试当前的命令/工具模式，换一种完全不同的方案。\n"
-                f"如果不确定怎么做，直接告诉用户当前方法的局限性并请求指引。"
-            )
-            messages.append({"role": "system", "content": guard})
-            nonlocal _consecutive_same_tool
-            _consecutive_same_tool = 0
-
-        if _consecutive_same_tool >= MAX_EXACT_REPEAT and is_exact_repeat:
-            _inject_guard(f"你已连续 {_consecutive_same_tool} 次调用 {tool_name} 且参数完全相同。")
-        elif _consecutive_same_tool >= MAX_SAME_TOOL_STREAK and is_same_tool:
-            _inject_guard(f"你已连续 {_consecutive_same_tool} 次调用同一工具 {tool_name}。")
 
     yield emit("final", text="任务未完成，已保存进度。可以继续。", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -471,33 +554,53 @@ def save_session():
         session_id = data.get("id")
         if session_id:
             set_active_session(session_id)
+            # 确保会话在 JSON DB 中存在（本地创建 fallback 路径不会写入 JSON DB）
+            from memory.session import load_sessions_db, save_sessions_db
+            db = load_sessions_db()
+            if session_id not in db:
+                db[session_id] = {
+                    "id": session_id,
+                    "title": data.get("title", "新会话"),
+                    "created": data.get("created_at", datetime.datetime.now().isoformat()),
+                }
+                save_sessions_db(db)
             # 同步保存前端传递的消息到 SQLite（处理前端缓存中的消息）
             messages = data.get("messages", [])
             if messages:
                 from memory.stores.sqlite_store import get_chat_messages, add_chat_message
                 existing = get_chat_messages(session_id)
-                existing_keys = {(m["role"], m["content"][:80]) for m in existing}
+                # 精确去重：优先使用 msgId（UUID），回退到 (role, msg_type, content[:80])
+                existing_ids = {m.get("msg_id", "") for m in existing if m.get("msg_id")}
+                existing_keys = {(m["role"], m.get("msg_type", "chat"), m["content"][:80]) for m in existing}
                 sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
                 for msg in messages:
                     role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
-                    key = (role, (msg.get("text") or "")[:80])
-                    if key not in existing_keys:
-                        # 使用前端携带的真实时间戳，而非 SQL CURRENT_TIMESTAMP
-                        frontend_ts = msg.get("timestamp", "")
-                        if frontend_ts:
-                            # 前端 ISO 格式 "2026-06-15T15:11:10.000Z" → SQLite 兼容 "2026-06-15 23:11:10"
-                            try:
-                                from datetime import datetime, timezone, timedelta
-                                dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
-                                local_dt = dt.astimezone(timezone(timedelta(hours=8)))
-                                frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
-                            except Exception:
-                                frontend_ts = frontend_ts.replace("T", " ")[:19]
-                        add_chat_message(session_id,
-                            "user" if msg.get("sender") == "user" else "assistant",
-                            msg.get("text", ""),
-                            msg_type=msg.get("msgType", "chat"),
-                            timestamp=frontend_ts)
+                    msg_id = msg.get("msgId", "")
+                    # 精确去重：有 msgId 时优先用它判断
+                    if msg_id and msg_id in existing_ids:
+                        continue
+                    # 回退到三元组去重（兼容无 msgId 的旧消息）
+                    if not msg_id:
+                        key = (role, msg.get("msgType", "chat"), (msg.get("text") or "")[:80])
+                        if key in existing_keys:
+                            continue
+                    # 使用前端携带的真实时间戳，而非 SQL CURRENT_TIMESTAMP
+                    frontend_ts = msg.get("timestamp", "")
+                    if frontend_ts:
+                        # 前端 ISO 格式 "2026-06-15T15:11:10.000Z" → SQLite 兼容 "2026-06-15 23:11:10"
+                        try:
+                            from datetime import datetime, timezone, timedelta
+                            dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
+                            local_dt = dt.astimezone(timezone(timedelta(hours=8)))
+                            frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            frontend_ts = frontend_ts.replace("T", " ")[:19]
+                    add_chat_message(session_id,
+                        "user" if msg.get("sender") == "user" else "assistant",
+                        msg.get("text", ""),
+                        msg_type=msg.get("msgType", "chat"),
+                        msg_id=msg_id,
+                        timestamp=frontend_ts)
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -567,7 +670,8 @@ def get_session(session_id):
                 "sender": sender,
                 "text": msg["content"],
                 "msgType": msg.get("msg_type", "chat"),
-                "timestamp": msg.get("created_at", "")
+                "timestamp": msg.get("created_at", ""),
+                "msgId": msg.get("msg_id", "")
             })
         return jsonify({"success": True, "messages": formatted})
     except Exception as e:
@@ -577,6 +681,15 @@ def get_session(session_id):
 def index():
     # 因为 template_folder 已经指向 'web'，这里直接写文件名即可
     return render_template('index.html')
+
+@app.after_request
+def add_no_cache(response):
+    """禁止浏览器缓存 HTML/JS 静态资源，确保前端始终拉取最新版本。"""
+    if request.path == '/' or request.path.endswith('.html') or request.path.endswith('.js'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -597,6 +710,8 @@ def api_chat():
         if not model_choice or not isinstance(model_choice, dict):
             model_display = data.get("model", None)
             model_choice = get_model_choice(model_display)
+
+        print(f"[DIAG /chat] session={session_id} model_choice={model_choice} msg_len={len(user_input)}", flush=True)
 
         return Response(
             stream_with_context(run_agent(
