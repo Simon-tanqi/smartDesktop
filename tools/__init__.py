@@ -55,7 +55,7 @@ DOMAIN_DEFINITIONS = {
             "百度", "google", "互联网", "最新", "实时", "热点",
             "汇率", "股价", "比赛", "比分",
         ],
-        "tools": ["web_search", "fetch_webpage", "fetch_multiple", "get_weather"],
+        "tools": ["web_search", "fetch_webpage", "fetch_multiple", "get_weather", "web_download"],
     },
     "system_config": {
         "keywords": [
@@ -89,7 +89,7 @@ PERSONA_KEYWORDS = {
 }
 
 # ── L1 全局兜底工具（始终注入，能力黑洞） ──
-ALWAYS_INJECT = ["execute_command", "run_python", "write_file", "read_file", "scan_directory"]
+ALWAYS_INJECT = ["execute_command", "run_python", "write_file", "read_file", "scan_directory", "web_download"]
 
 # ── 工具注册（保留原有映射用于兼容） ──
 TOOL_INTENT_MAP = {
@@ -108,6 +108,7 @@ TOOL_INTENT_MAP = {
     "web_search":           ["web_browse"],
     "fetch_webpage":        ["web_browse"],
     "fetch_multiple":       ["web_browse"],
+    "web_download":         ["web_browse", "file_manage"],
     "get_weather":          ["web_browse", "general_chat"],
     "modify_registry":      ["system_config"],
 }
@@ -253,19 +254,15 @@ def build_dynamic_system_prompt(
     if domains is None:
         domains = ["general_chat"]
 
-    cache_key = f"{'_'.join(domains)}_{plan_mode}_{persona_mode}"
+    cache_key = f"{'_'.join(domains)}_{plan_mode}"
     if cache_key in _PROMPT_CACHE:
-        return _PROMPT_CACHE[cache_key]
+        # Token优化：日期头不缓存，动态注入；其余部分缓存命中后直接拼接
+        return _build_date_header() + "\n\n" + _PROMPT_CACHE[cache_key]
 
     parts = []
 
     # 第 0 层：当前日期时间（LLM 时间基准，必须先注入）
-    now = datetime.datetime.now()
-    date_header = (
-        f"## 当前时间\n"
-        f"- 日期: {now.strftime('%Y-%m-%d')}（{['星期一','星期二','星期三','星期四','星期五','星期六','星期日'][now.weekday()]}）\n"
-        f"- 时间: {now.strftime('%H:%M:%S')}\n"
-    )
+    date_header = _build_date_header()
     parts.append(date_header)
 
     # 第 1 层：核心身份 + 输出风格
@@ -289,9 +286,20 @@ def build_dynamic_system_prompt(
     if plan_mode and not persona_mode:
         parts.append(_load_prompt("modes/plan.md"))
 
-    prompt = "\n\n".join(parts)
-    _PROMPT_CACHE[cache_key] = prompt
-    return prompt
+    # 缓存不含日期头的部分（日期头由 _build_date_header 动态生成）
+    prompt_core = "\n\n".join(parts[1:])  # parts[0] 是 date_header，不缓存
+    _PROMPT_CACHE[cache_key] = prompt_core
+    return date_header + "\n\n" + prompt_core
+
+
+def _build_date_header() -> str:
+    """Token优化辅助：生成当前日期时间头，不参与缓存。"""
+    now = datetime.datetime.now()
+    return (
+        f"## 当前时间\n"
+        f"- 日期: {now.strftime('%Y-%m-%d')}（{['星期一','星期二','星期三','星期四','星期五','星期六','星期日'][now.weekday()]}）\n"
+        f"- 时间: {now.strftime('%H:%M:%S')}\n"
+    )
 
 
 # ── 延迟导入子模块 ──
@@ -301,3 +309,4 @@ from . import search_tools
 from . import chat_tools
 from . import db_tools
 from . import registry_tools
+from . import web_download

@@ -57,9 +57,9 @@ class StructuredLogger:
             self._cleanup()
 
     def _cleanup(self):
-        """删除超过保留天数的日志文件"""
+        """删除超过保留天数的日志文件及索引"""
         cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
-        for f in LOG_DIR.glob("agent_*.jsonl"):
+        for f in list(LOG_DIR.glob("agent_*.jsonl")) + list(LOG_DIR.glob("agent_*.idx")):
             try:
                 date_part = f.stem.replace("agent_", "")
                 file_date = datetime.strptime(date_part, "%Y-%m-%d")
@@ -69,14 +69,37 @@ class StructuredLogger:
                 pass
 
     def _flush(self):
-        """缓冲刷盘"""
+        """缓冲刷盘，同时写入 byte-offset 索引以加速后续查询"""
         with self._lock:
             if not self._buffer:
                 return
             self._rotate_if_needed()
             if self._fh:
+                idx_entries = []
+                offset = self._fh.tell()
+
+                for line in self._buffer:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        offset += len(line.encode("utf-8"))
+                        continue
+                    level = entry.get("level", "")
+                    extra = entry.get("extra", {})
+                    idx_entries.append(
+                        f"{offset}\t{level}\t{extra.get('session_id', '')}\t{extra.get('trace_id', '')}"
+                    )
+                    offset += len(line.encode("utf-8"))
+
                 self._fh.write("".join(self._buffer))
                 self._fh.flush()
+
+                # 追加写入索引文件
+                if idx_entries:
+                    idx_path = LOG_DIR / f"agent_{self._current_date}.idx"
+                    with open(idx_path, "a", encoding="utf-8") as idx_fh:
+                        idx_fh.write("\n".join(idx_entries) + "\n")
+
             self._buffer.clear()
 
     def _schedule_flush(self):
@@ -144,16 +167,24 @@ class StructuredLogger:
         response_chars = len(response)
 
         with open(full_path, "w", encoding="utf-8") as f:
-            json.dump({
+            # Token优化：完整 messages 写入磁盘较耗 I/O（每轮数 KB）
+            # 仅当 LOG_FULL_LLM_MESSAGES=1 时全量保存；默认只保存摘要
+            payload = {
                 "trace_id": trace_id,
                 "session_id": session_id,
                 "turn": turn_index,
                 "model": f"{provider}/{model_name}",
                 "elapsed_ms": elapsed_ms,
                 "token_estimate": token_estimate,
-                "messages": messages,
                 "response": response,
-            }, f, ensure_ascii=False, indent=2)
+            }
+            if os.environ.get("LOG_FULL_LLM_MESSAGES") == "1":
+                payload["messages"] = messages
+            else:
+                payload["messages_count"] = len(messages)
+                payload["messages_keys"] = [m.get("role") for m in messages[:20]]
+                payload["messages_sample"] = messages[:2] if len(messages) >= 2 else messages
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
         # ── 元信息写入检索层 ──
         self.info("LLM调用",
@@ -178,15 +209,15 @@ class StructuredLogger:
               session_id: str = None, trace_id: str = None,
               limit: int = 200) -> list[dict]:
         """
-        按条件查询日志。
+        按条件查询日志。有索引（.idx）时利用 byte-offset 精准跳转；无索引时降级为全量扫描。
+
         date_from / date_to: "YYYY-MM-DD"
         level: "ERROR" / "WARNING" / "INFO" / "DEBUG"
-        keyword: 搜索 message 字段和 extra 值
+        keyword: 搜索 message 字段和 extra 值（触发全量扫描）
         session_id: 精确匹配 extra.session_id
         trace_id: 精确匹配 extra.trace_id
         limit: 最多返回条数
         """
-        # 确定要扫描的文件范围
         if date_from:
             start = datetime.strptime(date_from, "%Y-%m-%d")
         else:
@@ -197,55 +228,121 @@ class StructuredLogger:
         else:
             end = datetime.now()
 
+        # 关键词搜索无法利用索引，走全量扫描
+        use_index = (keyword is None)
+
         results = []
         current = start
         while current <= end and len(results) < limit:
             date_str = current.strftime("%Y-%m-%d")
             log_path = LOG_DIR / f"agent_{date_str}.jsonl"
-            if log_path.exists():
-                with open(log_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+            if not log_path.exists():
+                current += timedelta(days=1)
+                continue
 
-                        # 级别过滤
-                        if level and entry.get("level") != level:
-                            continue
-                        # 关键词过滤
-                        if keyword:
-                            msg = entry.get("message", "")
-                            if keyword.lower() not in msg.lower():
-                                # 也在 extra 中搜
-                                extra = entry.get("extra", {})
-                                found = False
-                                for v in extra.values():
-                                    if keyword.lower() in str(v).lower():
-                                        found = True
-                                        break
-                                if not found:
-                                    continue
+            if use_index:
+                idx_results = self._query_with_index(
+                    log_path, date_str, level, session_id, trace_id, limit - len(results)
+                )
+                results.extend(idx_results)
+            else:
+                idx_results = self._query_scan(
+                    log_path, level, keyword, session_id, trace_id, limit - len(results)
+                )
+                results.extend(idx_results)
 
-                        # 会话 ID 过滤
-                        if session_id:
-                            extra = entry.get("extra", {})
-                            if extra.get("session_id") != session_id:
-                                continue
-
-                        # 追踪 ID 过滤
-                        if trace_id:
-                            extra = entry.get("extra", {})
-                            if extra.get("trace_id") != trace_id:
-                                continue
-
-                        results.append(entry)
-                        if len(results) >= limit:
-                            break
             current += timedelta(days=1)
+
+        return results
+
+    def _query_with_index(self, log_path, date_str, level, session_id, trace_id, limit):
+        """利用 .idx 索引文件按 byte offset 精准读取匹配行"""
+        idx_path = LOG_DIR / f"agent_{date_str}.idx"
+        if not idx_path.exists():
+            # 无索引，降级为全量扫描
+            return self._query_scan(log_path, level, None, session_id, trace_id, limit)
+
+        # 1. 读取索引，收集匹配的 byte offset
+        matched_offsets = []
+        with open(idx_path, "r", encoding="utf-8") as idx_fh:
+            for idx_line in idx_fh:
+                idx_line = idx_line.strip()
+                if not idx_line:
+                    continue
+                parts = idx_line.split("\t", 3)
+                if len(parts) < 4:
+                    continue
+                offset_str, idx_level, idx_sid, idx_tid = parts
+                if level and idx_level != level:
+                    continue
+                if session_id and idx_sid != session_id:
+                    continue
+                if trace_id and idx_tid != trace_id:
+                    continue
+                matched_offsets.append(int(offset_str))
+                if len(matched_offsets) >= limit:
+                    break
+
+        if not matched_offsets:
+            return []
+
+        # 2. 按 offset 精准读取匹配行
+        results = []
+        with open(log_path, "r", encoding="utf-8") as f:
+            for offset in matched_offsets:
+                f.seek(offset)
+                line = f.readline()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                results.append(entry)
+                if len(results) >= limit:
+                    break
+
+        return results
+
+    @staticmethod
+    def _query_scan(log_path, level, keyword, session_id, trace_id, limit):
+        """全量扫描（无索引或需要关键词搜索时使用）"""
+        results = []
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if level and entry.get("level") != level:
+                    continue
+                if keyword:
+                    msg = entry.get("message", "")
+                    if keyword.lower() not in msg.lower():
+                        extra = entry.get("extra", {})
+                        found = False
+                        for v in extra.values():
+                            if keyword.lower() in str(v).lower():
+                                found = True
+                                break
+                        if not found:
+                            continue
+                if session_id:
+                    extra = entry.get("extra", {})
+                    if extra.get("session_id") != session_id:
+                        continue
+                if trace_id:
+                    extra = entry.get("extra", {})
+                    if extra.get("trace_id") != trace_id:
+                        continue
+
+                results.append(entry)
+                if len(results) >= limit:
+                    break
 
         return results
 

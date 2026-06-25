@@ -112,6 +112,28 @@ ALWAYS_BLOCKED = [
 # ═══════════════════════════════════════════════
 
 _pending_challenges = {}  # token → {command, desc, timestamp}
+_CHALLENGE_TTL_SECONDS = 300  # 挑战令牌 5 分钟未应答自动过期
+
+
+def _evict_stale_challenges():
+    """清理过期的挑战令牌，防止挑战未应答导致永久内存泄漏。"""
+    now = datetime.now()
+    stale = []
+    for token, entry in _pending_challenges.items():
+        ts_str = entry.get("timestamp")
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if (now - ts).total_seconds() > _CHALLENGE_TTL_SECONDS:
+                    stale.append(token)
+            except ValueError:
+                stale.append(token)
+        else:
+            stale.append(token)  # 无时间戳的记录也视为异常，一并清理
+    for token in stale:
+        _pending_challenges.pop(token, None)
+        _log("EVICT", f"过期挑战令牌清理: {token[:8]}...")
+    return len(stale)
 
 
 def _get_log_path():
@@ -182,6 +204,9 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
           或  {"challenge_required": True, "challenge_token": "...", "challenge_phrase": "...", "message": "..."}
           或  {"success": False, "message": "..."}
     """
+    # ── TTL 过期清理（入口处执行一次）──
+    _evict_stale_challenges()
+
     # ── 挑战验证流程 ──
     if challenge_response is not None and challenge_token:
         pending = _pending_challenges.pop(challenge_token, None)
@@ -267,6 +292,9 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
     """
     # 将 list 转为字符串用于危险检测
     cmd_str = " ".join(command_list)
+
+    # ── TTL 过期清理（入口处执行一次）──
+    _evict_stale_challenges()
 
     # ── 挑战验证 + 永久拦截 + 危险检测 ──
     if challenge_response is not None and challenge_token:

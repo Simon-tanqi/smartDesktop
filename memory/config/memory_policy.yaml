@@ -1,0 +1,49 @@
+# MyAgent 记忆策略配置
+# 修改后重启生效，或调用 memory.config.reload_policy() 热重载
+
+compression:
+  # 压缩用本地模型
+  model:
+    provider: ollama          # ollama | openai | deepseek
+    model_name: deepseek-r1:7b
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+
+  # Token 预算：反向累加确定切割点
+  token_budget:
+    soft_threshold: 30000     # 软阈值：超过后异步触发压缩
+    hard_threshold: 50000     # 硬阈值：必须压缩
+    target_tokens: 15000      # 压缩后保留近 N token 原文
+
+  # 保留最近 N 轮完整对话（不压缩）
+  recent_turns: 3
+
+  # 摘要最大字符数
+  max_summary_chars: 500
+
+extraction:
+  # 长期记忆提取用本地模型
+  model:
+    provider: ollama
+    model_name: deepseek-r1:7b
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+
+retrieval:
+  # 长期记忆检索：每次注入 Top-K 条
+  long_term_top_k: 3
+  # 注入 system prompt 的最大字符数
+  max_chars: 800
+
+# 自定义技能：用户可扩展的技能类别
+# skills.custom 下的每个 key 会动态注入 extractor 提取提示词
+# 技能知识写入 memory/long_term/custom/<key>.md
+skills:
+  custom:
+    # 示例（按需取消注释）:
+    # 前端开发:
+    #   keywords: ["React", "Vue", "CSS", "组件"]
+    #   description: "前端框架与组件开发经验"
+    # DevOps:
+    #   keywords: ["Docker", "K8s", "CI/CD", "部署"]
+    #   description: "运维部署相关技能"

@@ -1,14 +1,29 @@
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os, json, time, datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, AI_CONFIG
+from llm_client import ai_concat, parse_ai_json, normalize_path_component, get_available_models, _ollama_call_stream, _deepseek_call_stream, get_config, get_api_key, get_base_url
 from tools import TOOL_REGISTRY, build_dynamic_system_prompt, match_domains, match_persona, get_skill_prompt
 from memory import (get_relevant_memory, log_session_turn, get_session_messages, append_session_message, set_active_session, get_active_session_id, list_sessions, add_chat_message, get_chat_messages, delete_session, get_user_id, generate_trace_id, log_operation, log_trace, build_context_messages, rename_session)
 from memory.session import ensure_session_titles, create_session
+from utils.error_mapper import translate_error
 from logger import get_logger
 
 
 app = Flask(__name__,template_folder='web',static_folder='web/static')
+
+# ── CORS ──
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+# ── Rate Limiting (IP 级，全 API 路由) ──
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["30 per minute", "200 per hour"],
+    storage_uri="memory://",
+)
 
 # ── 工具执行线程池单例（避免每次工具调用重复新建/销毁）──
 import atexit
@@ -82,7 +97,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             stream_gen = _ollama_call_stream(messages, _default_model, trace_id=trace_id)
         else:
             stream_gen = _deepseek_call_stream(messages, _default_model,
-                AI_CONFIG.get("api_key", ""), AI_CONFIG.get("base_url", "https://api.deepseek.com"),
+                get_api_key(), get_base_url(),
                 trace_id=trace_id)
 
         full_content = ""
@@ -100,10 +115,10 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                     full_reasoning = chunk.get("reasoning_content", full_reasoning)
                 elif chunk.get("type") == "error":
                     err_msg = chunk.get("message") or chunk.get("error") or "未知错误"
-                    yield {"type": "error", "message": err_msg}
+                    yield {"type": "error", "message": translate_error(err_msg)}
                     return
         except Exception as e:
-            yield {"type": "error", "message": f"流式调用异常: {str(e)}"}
+            yield {"type": "error", "message": translate_error(str(e))}
             return
 
         elapsed = int((time.perf_counter() - t0) * 1000)
@@ -190,7 +205,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield emit("error", text=f"启动失败: {str(e)[:500]}")
+        yield emit("error", text=translate_error(str(e)[:500]))
         return
 
     # ===== Phase 3: ReAct 循环（流式）=====
@@ -200,6 +215,16 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
     retry_count = 0
     consecutive_progress = 0
     _skills_injected = set()  # 按需注入的技能 prompt 跟踪，防止重复注入
+    _final_saved = False      # 防止多次重复存储 AI 最终回复
+
+    def _save_ai_reply(text):
+        """在 yield emit("final") 之后立即持久化 AI 回复到 SQLite。"""
+        nonlocal _final_saved
+        if not _final_saved and session_id and text:
+            _final_saved = True
+            append_session_message(session_id, "assistant", text,
+                                   trace_id=trace_id, user_id=user_id,
+                                   skip_compress=True)
 
     # ── 工具执行辅助：重试 + 超时 + 缓存 ──
     _cache = {}
@@ -323,15 +348,15 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             # 连续 progress 轮次超限，强制收尾
             if consecutive_progress >= MAX_CONSECUTIVE_PROGRESS:
                 yield emit("step", text=progress_msg, status="进行中")
-                yield emit("final",
-                    text=f"任务执行中（连续 {consecutive_progress} 轮状态更新），已中止自动循环。可以发送新指令继续。",
+                final_text = f"任务执行中（连续 {consecutive_progress} 轮状态更新），已中止自动循环。可以发送新指令继续。"
+                yield emit("final", text=final_text,
                     timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                _save_ai_reply(final_text)
                 return
 
             yield emit("step", text=progress_msg, status="进行中")
-            # 将 progress 加入消息历史，避免 LLM 失忆
-            messages.append({"role": "assistant", "content": json.dumps(ai_content, ensure_ascii=False)})
-            messages.append({"role": "user", "content": f"进度已记录，继续下一步。"})
+            # Token优化：progress 消息仅通知前端，不再注入 messages 上下文（每轮省 ~60 token）
+            # LLM 无需"知道自己发了 progress"，下一步由前端驱动的 user 消息自然触发
             continue
         else:
             consecutive_progress = 0
@@ -340,6 +365,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         if ai_content and isinstance(ai_content, dict) and "final_message" in ai_content:
             final_msg = ai_content["final_message"]
             yield emit("final", text=final_msg, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _save_ai_reply(final_msg)
             return
 
         # 纯文本回退（最多 3 次渐进式重试）
@@ -347,6 +373,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             fallback = raw_content
             if domains == ["general_chat"]:
                 yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                _save_ai_reply(fallback)
                 return
             RETRY_PROMPTS = [
                 "你的回复不符合格式要求。必须严格输出 {\"tool_name\": \"...\", \"arguments\": {...}} 或 {\"final_message\": \"...\"}。",
@@ -358,6 +385,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 retry_count += 1
                 continue
             yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _save_ai_reply(fallback)
             return
 
         # 工具调用
@@ -367,6 +395,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
         if tool_name == "finished":
             yield emit("final", text="任务已完成", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _save_ai_reply("任务已完成")
             return
 
         # ── 硬性回路护板：执行前拦截（不再依赖 LLM 自觉）──
@@ -383,9 +412,10 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
         # 硬性终止：全局同类工具重复 ≥ MAX_FORCED_ABORT → 强制结束 ReAct 循环
         if _consecutive_same_tool >= MAX_FORCED_ABORT:
-            yield emit("final",
-                text=f"已连续 {_consecutive_same_tool} 次调用 {tool_name}，达到系统硬性上限，已中止本轮思考。请重新描述你的需求。",
+            abort_text = f"已连续 {_consecutive_same_tool} 次调用 {tool_name}，达到系统硬性上限，已中止本轮思考。请重新描述你的需求。"
+            yield emit("final", text=abort_text,
                 timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _save_ai_reply(abort_text)
             return
 
         # 硬性拦截：连续同一工具 ≥ MAX_SAME_TOOL_STREAK → 拒绝执行本轮
@@ -444,12 +474,14 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 result_len = len(result_str)
                 max_len = 4000 if tool_name in ("read_file", "search_content", "get_project_summary") else 2000
                 if result_len > max_len:
-                    if tool_name == "read_file":
-                        result_str = result_str[:max_len] + (
-                            f"\n\n⚠️ 结果已截断（完整长度 {result_len} 字符）。"
-                            f"如需定位特定代码，请使用 search_content 先搜索关键词获取行号，"
-                            f"再用 read_file(start_line=行号-5, end_line=行号+30) 局部读取。"
-                            f"严禁继续通过缩小 read_file 范围来搜索——你只会反复读到文件开头区域。"
+                    if tool_name in ("read_file", "search_content", "get_project_summary"):
+                        # Token优化：保留头尾结构而非简单截断，让 LLM 能同时看到开头和结尾
+                        head_size = int(max_len * 0.6)
+                        tail_size = int(max_len * 0.25)
+                        result_str = (
+                            result_str[:head_size]
+                            + f"\n\n··· 中间省略 {result_len - head_size - tail_size} 字符 ···\n\n"
+                            + result_str[-tail_size:]
                         )
                     else:
                         result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
@@ -479,12 +511,13 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                     result_len = len(result_str)
                     max_len = 4000 if tool_name in ("read_file", "search_content", "get_project_summary") else 2000
                     if result_len > max_len:
-                        if tool_name == "read_file":
-                            result_str = result_str[:max_len] + (
-                                f"\n\n⚠️ 结果已截断（完整长度 {result_len} 字符）。"
-                                f"如需定位特定代码，请使用 search_content 先搜索关键词获取行号，"
-                                f"再用 read_file(start_line=行号-5, end_line=行号+30) 局部读取。"
-                                f"严禁继续通过缩小 read_file 范围来搜索——你只会反复读到文件开头区域。"
+                        if tool_name in ("read_file", "search_content", "get_project_summary"):
+                            head_size = int(max_len * 0.6)
+                            tail_size = int(max_len * 0.25)
+                            result_str = (
+                                result_str[:head_size]
+                                + f"\n\n··· 中间省略 {result_len - head_size - tail_size} 字符 ···\n\n"
+                                + result_str[-tail_size:]
                             )
                         else:
                             result_str = result_str[:max_len] + f"... (已截断，完整长度 {result_len} 字符)"
@@ -507,19 +540,31 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                     _err_msg = str(e)
                     result_str = f"工具执行错误: {_err_msg}"
                     collected_steps.append({"step": f"执行 {tool_name}", "status": "错误", "detail": _err_msg})
-                    yield emit("step", text=f"执行 {tool_name} 失败: {_err_msg[:100]}", status="错误")
+                    # 给前端的错误提示：翻译后友好展示
+                    yield emit("step", text=f"执行 {tool_name} 失败: {translate_error(_err_msg)[:100]}", status="错误")
                     log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
                               session_id=session_id, status="error",
                               input_summary=str(arguments)[:200],
                               error=str(e)[:500])
                     get_logger().warning("工具调用失败", trace_id=trace_id, session_id=session_id,
                                          tool=tool_name, error=str(e)[:200], elapsed_ms=elapsed_t)
-                    if tool_name == "execute_command" and ("超时" in _err_msg or "timeout" in _err_msg.lower()):
-                        result_str += (
-                            f"\n\n【系统提示】命令行已超时({tool_timeout}秒)。"
-                            f"如果任务是批量文件操作，请改用 run_python 工具编写 Python 脚本完成；"
-                            f"如果是安装/下载类任务，请检查网络或改用其他安装方式。"
-                        )
+                    # 超时处理：扩展至所有工具，不只 execute_command
+                    is_timeout = "超时" in _err_msg or "timeout" in _err_msg.lower()
+                    if is_timeout:
+                        timeout_tips = {
+                            "execute_command": "如果是批量文件操作，请改用 run_python 工具编写 Python 脚本；否则请减少单次命令复杂度。",
+                            "shell_executor": "如果是批量文件操作，请改用 Python 脚本；否则请简化命令或分批执行。",
+                            "run_python": "请优化代码逻辑减少执行时间，或增大 timeout 参数。",
+                            "web_fetch": "网页加载超时，可能是目标网站响应慢，请稍后重试或换用其他来源。",
+                            "web_search": "搜索超时，请尝试缩小搜索范围或换用更具体的关键词。",
+                        }
+                        tip = timeout_tips.get(tool_name,
+                            f"工具执行超时({tool_timeout}秒)。建议：减少单次数据量或优化执行逻辑。")
+                        result_str += f"\n\n【系统提示】{tip}"
+                        # 同时给前端发送用户友好的超时提示
+                        yield emit("step",
+                            text=f"{tool_name} 执行超时，建议：减少处理量或简化任务。",
+                            status="警告")
                         _try_inject_skill()
         else:
             result_str = f"工具 '{tool_name}' 不存在"
@@ -544,6 +589,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         messages.append({"role": "user", "content": tool_result_msg})
 
     yield emit("final", text="任务未完成，已保存进度。可以继续。", timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    _save_ai_reply("任务未完成，已保存进度。可以继续。")
 
 
 # ---------- Flask 路由 ----------
@@ -569,9 +615,9 @@ def save_session():
             if messages:
                 from memory.stores.sqlite_store import get_chat_messages, add_chat_message
                 existing = get_chat_messages(session_id)
-                # 精确去重：优先使用 msgId（UUID），回退到 (role, msg_type, content[:80])
+                # 精确去重：优先使用 msgId（UUID），回退到 (role, msg_type, content) 完整匹配
                 existing_ids = {m.get("msg_id", "") for m in existing if m.get("msg_id")}
-                existing_keys = {(m["role"], m.get("msg_type", "chat"), m["content"][:80]) for m in existing}
+                existing_keys = {(m["role"], m.get("msg_type", "chat"), m["content"]) for m in existing if not m.get("msg_id")}
                 sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
                 for msg in messages:
                     role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
@@ -579,9 +625,9 @@ def save_session():
                     # 精确去重：有 msgId 时优先用它判断
                     if msg_id and msg_id in existing_ids:
                         continue
-                    # 回退到三元组去重（兼容无 msgId 的旧消息）
+                    # 回退到完整内容三元组去重（兼容无 msgId 的旧消息，避免 content[:80] 截断碰撞）
                     if not msg_id:
-                        key = (role, msg.get("msgType", "chat"), (msg.get("text") or "")[:80])
+                        key = (role, msg.get("msgType", "chat"), (msg.get("text") or ""))
                         if key in existing_keys:
                             continue
                     # 使用前端携带的真实时间戳，而非 SQL CURRENT_TIMESTAMP
@@ -603,7 +649,7 @@ def save_session():
                         timestamp=frontend_ts)
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 @app.route('/api/sessions/new', methods=['POST'])
 def new_session():
@@ -614,7 +660,7 @@ def new_session():
         session_data = next((s for s in sessions if s["id"] == session_id), None)
         return jsonify({"success": True, "session": session_data})
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 # 2. 修复 /api/sessions GET 方法（实际获取会话列表，而非返回空）
 @app.route('/api/sessions', methods=['GET'])
@@ -652,7 +698,7 @@ def delete_session_route(session_id):
         delete_session(session_id)
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 @app.route('/api/sessions/active', methods=['GET'])
 def get_active_session():
@@ -675,7 +721,7 @@ def get_session(session_id):
             })
         return jsonify({"success": True, "messages": formatted})
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 @app.route('/')
 def index():
@@ -733,7 +779,7 @@ def api_chat():
                       "error", str(e))
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 
 

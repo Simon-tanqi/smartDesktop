@@ -1,31 +1,57 @@
 """
 会话生命周期管理：创建、切换、删除会话，以及消息写入主入口。
 
-核心改动（v3 — Token 预算制 + 摘要注入）：
-  - extract_facts → extract_facts_async（不阻塞主流程）
-  - 压缩触发从"轮次计数"改为"Token 预算"
-  - build_context_messages 将摘要注入 LLM 上下文
+v4：
+  - 适配 per-session 消息存储
+  - 压缩摘要从 per-session summaries.db 读取
+  - Token 预算制触发压缩
 """
 import os
 import re
 import datetime
+import threading
 
 from memory.config import (
     ACTIVE_SESSION_FILE, LOGS_DIR, NOISE_PHRASES,
-    DEFAULT_KEEP_ROUNDS, DEFAULT_SUMMARY_MODEL,
     RECENT_TOKEN_MIN, RECENT_TOKEN_MAX, SUMMARY_TOKEN_BUDGET,
 )
 from memory.stores.json_store import load_sessions_db, save_sessions_db
 from memory.stores.sqlite_store import (
     add_chat_message, get_chat_messages, log_operation,
-    get_session_messages,
+    get_session_messages, get_latest_summary,
 )
 from memory.extractor import extract_facts_async
 from memory.compressor import (
     compress_conversation_async,
     estimate_messages_tokens,
-    get_latest_summary,
 )
+
+# ── 标题生成：剥离代码块与多余空白后再截断 ──
+def _make_title(content: str) -> str:
+    """从用户消息生成会话标题：剥离 Markdown 代码块后取前 25 字符。"""
+    if not content:
+        return "新会话"
+    # 剥离 ```...``` 代码块
+    cleaned = re.sub(r"```[\s\S]*?```", "", content)
+    # 压缩空白
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "新会话"
+    return cleaned[:25]
+
+
+
+# Token优化：这些纯确认/招呼短消息跳过事实提取（"我叫XX"等有信息量短输入不在此列）
+_FACT_EXTRACT_SKIP = set(NOISE_PHRASES) | {
+    "好的", "行", "可以", "继续", "收到", "明白",
+    "ok", "OK", "yes", "no", "对", "没错", "知道", "了解",
+    "来了", "在", "有", "没", "啥", "？", "?", "。。", "...",
+    "下一步", "然后呢", "还有呢", "开始", "开始吧",
+}
+_FACT_EXTRACT_MIN_LEN = 3
+
+# 会话创建锁：防止多线程并发创建会话时产生重复 ID（TOCTOU 竞态）
+_session_lock = threading.Lock()
 
 
 # ═══════════════════════════════════════════════
@@ -33,7 +59,6 @@ from memory.compressor import (
 # ═══════════════════════════════════════════════
 
 def generate_session_id():
-    """生成会话 ID：年月日小时_序号，如 2026061415_1"""
     now = datetime.datetime.now()
     base = now.strftime("%Y%m%d%H")
     db = load_sessions_db()
@@ -54,8 +79,6 @@ def generate_session_id():
 # ═══════════════════════════════════════════════
 
 def _get_next_session_name():
-    """获取下一个「新会话N」的可用编号。如果之前的被改名释放了，优先补空位。"""
-    import re
     db = load_sessions_db()
     used_numbers = set()
     for data in db.values():
@@ -70,23 +93,23 @@ def _get_next_session_name():
 
 
 def create_session(title=None):
-    if title is None:
-        title = _get_next_session_name()
-    session_id = generate_session_id()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db = load_sessions_db()
-    db[session_id] = {
-        "id": session_id,
-        "title": title,
-        "created": now,
-    }
-    save_sessions_db(db)
+    with _session_lock:
+        if title is None:
+            title = _get_next_session_name()
+        session_id = generate_session_id()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        db = load_sessions_db()
+        db[session_id] = {
+            "id": session_id,
+            "title": title,
+            "created": now,
+        }
+        save_sessions_db(db)
     set_active_session(session_id)
     return session_id
 
 
 def rename_session(session_id, new_title):
-    """修改会话名称。如果原名称是「新会话N」，释放该编号供后续复用。"""
     new_title = new_title.strip()
     if not new_title:
         return False
@@ -99,17 +122,13 @@ def rename_session(session_id, new_title):
 
 
 def ensure_session_titles():
-    """启动时迁移：给所有 title 为 None 或空的旧会话分配「新会话N」名称。"""
-    import re
     db = load_sessions_db()
-    # 先计算已占用的编号
     used_numbers = set()
     for data in db.values():
         title = data.get("title", "")
         m = re.match(r"^新会话(\d+)$", title)
         if m:
             used_numbers.add(int(m.group(1)))
-
     changed = False
     for sid, data in db.items():
         title = data.get("title", "")
@@ -166,7 +185,7 @@ def delete_session(session_id):
 
 
 # ═══════════════════════════════════════════════
-# 轮次追踪（保留兼容）
+# 轮次追踪
 # ═══════════════════════════════════════════════
 
 def update_last_turn(session_id, turn):
@@ -182,27 +201,20 @@ def get_last_turn(session_id):
 
 
 # ═══════════════════════════════════════════════
-# 上下文构建：SQLite 消息 + 压缩摘要
+# 上下文构建：SQLite 消息 + per-session 摘要
 # ═══════════════════════════════════════════════
 
 def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35):
-    """
-    检测当前用户消息是否与历史中的某条用户消息高度相似。
-    使用中文 bigram Jaccard 相似度。
-    返回需要排除的旧 assistant 摘要消息索引列表（保留工具调用 + 工具结果对）。
-    """
     if not current_user_msg or not messages:
         return []
 
     def _bigrams(text):
-        """提取中文 bigram 特征"""
         chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
         if len(chinese) < 2:
             return set()
         return {chinese[i:i+2] for i in range(len(chinese)-1)}
 
     def _is_tool_call(content):
-        """判断 assistant 消息是否为工具调用（JSON 格式），而非自然语言摘要"""
         content = content.strip()
         return content.startswith('{"tool_call"') or content.startswith('{"type":"tool"')
 
@@ -218,15 +230,11 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
         hist_bigrams = _bigrams(hist_content)
         if not hist_bigrams:
             continue
-
         intersection = len(current_bigrams & hist_bigrams)
         union = len(current_bigrams | hist_bigrams)
         if union == 0:
             continue
-        jaccard = intersection / union
-
-        if jaccard >= similarity_threshold:
-            # 找到该轮次的 assistant 消息，只排除摘要（非工具调用），保留工具调用结果供复用
+        if intersection / union >= similarity_threshold:
             j = i + 1
             turn_assistants = []
             while j < len(messages) and messages[j].get("role") != "user":
@@ -234,32 +242,15 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
                     turn_assistants.append(j)
                 j += 1
             for idx in turn_assistants:
-                content = messages[idx].get("content", "")
-                if not _is_tool_call(content):
+                if not _is_tool_call(messages[idx].get("content", "")):
                     exclude_indices.append(idx)
-
     return sorted(set(exclude_indices), reverse=True)
 
 
 def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
-    """
-    构建 LLM 上下文消息列表（SQLite 近期消息 + 压缩摘要）。
-
-    返回：与 get_session_messages 相同格式的 dict 列表。
-    摘要以 role="system" 形式追加在消息列表末尾，由上层决定如何使用。
-
-    Args:
-        session_id: 会话 ID
-        limit: SQLite 消息上限
-        summary_max_tokens: 摘要最大 token 数
-
-    Returns:
-        [{"role": ..., "content": ...}, ...]
-    """
+    """构建 LLM 上下文消息列表。"""
     messages = get_session_messages(session_id, limit=limit)
 
-    # ── 重复提问检测：排除旧的工具调用结果 ──
-    # 获取当前会话最后一条用户消息
     last_user_msg = ""
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -269,28 +260,35 @@ def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOK
     if last_user_msg:
         exclude_indices = _detect_repeated_query(messages, last_user_msg)
         if exclude_indices:
-            # 从后往前删除，避免索引偏移
             for idx in exclude_indices:
                 if idx < len(messages):
                     del messages[idx]
-            # 插入一条标记，告知 LLM 可复用已完成结果，但失败/遗漏部分需重新执行
             messages.append({
                 "role": "system",
-                "content": "【注意】用户重复了之前的提问。历史中的工具调用结果已保留，已完成的部分可直接引用其输出内容，但执行失败或遗漏的部分请重新执行对应工具补充，不要假设所有步骤都已完成。"
+                "content": "【注意】用户重复了之前提问。历史工具调用结果已保留，已完成部分可直接引用，但失败/遗漏部分需重新执行。"
             })
 
-    # ── 注入压缩摘要 ──
-    latest = get_latest_summary(days=30)
+    # 注入 per-session 压缩摘要
+    latest = get_latest_summary(session_id)
     if latest:
-        # 截断到预算
         truncated = latest
+        max_iterations = 20
+        iterations = 0
         while estimate_messages_tokens([{"role": "system", "content": truncated}]) > summary_max_tokens:
-            truncated = truncated[:int(len(truncated) * 0.8)]
-        summary_msg = {
-            "role": "system",
-            "content": f"【历史对话摘要】{truncated}"
-        }
-        messages.append(summary_msg)
+            new_len = int(len(truncated) * 0.8)
+            if new_len >= len(truncated) or new_len == 0:
+                truncated = ""  # 无法再缩减，放弃摘要注入
+                break
+            truncated = truncated[:new_len]
+            iterations += 1
+            if iterations >= max_iterations:
+                truncated = ""
+                break
+        if truncated:
+            messages.append({
+                "role": "system",
+                "content": f"【历史对话摘要】{truncated}"
+            })
 
     return messages
 
@@ -301,62 +299,46 @@ def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOK
 
 def append_session_message(session_id, role, content,
                            trace_id="", user_id="",
-                           max_turns=DEFAULT_KEEP_ROUNDS,
-                           summary_model=DEFAULT_SUMMARY_MODEL,
                            skip_compress=False):
-    """
-    智能记忆写入：
-
-    1. 闲聊过滤
-    2. 确保会话元数据存在
-    3. 写入 SQLite 聊天记录（追加式）
-    4. 用户消息：异步事实提取 + Token 预算制压缩检查
-    5. 操作日志
-    """
     content = content.strip()
     if not content:
         return session_id
 
-    # ── 1. 闲聊过滤 ──
+    # 闲聊过滤 — 统一精确匹配，消除子串误杀风险
     if content in NOISE_PHRASES:
         log_session_turn(role, content, trace_id=trace_id, user_id=user_id, session_id=session_id)
         return session_id
-    if len(content) < 3 and any(p in content for p in ["好的", "没问题", "知道了"]):
-        log_session_turn(role, content, trace_id=trace_id, user_id=user_id, session_id=session_id)
-        return session_id
 
-    # ── 2. 确保会话元数据存在 ──
+    # 确保会话元数据存在
     db = load_sessions_db()
     if session_id not in db:
         db[session_id] = {
             "id": session_id,
-            "title": content[:25] if content else "新会话",
+            "title": _make_title(content),
             "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         save_sessions_db(db)
 
-    # ── 3. 写入 SQLite ──
+    # 写入 per-session messages.db
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     add_chat_message(session_id, role, content, msg_type="chat",
                      trace_id=trace_id, user_id=user_id, timestamp=now_ts)
 
-    # ── 4. 用户消息：异步事实提取 + Token 预算制压缩 ──
     if role == "user":
-        # 异步事实提取（不阻塞主流程）
-        extract_facts_async(content, trace_id=trace_id, user_id=user_id,
-                            session_id=session_id, model=summary_model)
+        # Token优化：纯确认/招呼类短消息不触发事实提取，但放过"我叫XX"等有信息量的短输入
+        stripped = content.strip()
+        if len(stripped) >= _FACT_EXTRACT_MIN_LEN and stripped not in _FACT_EXTRACT_SKIP:
+            extract_facts_async(content, trace_id=trace_id, user_id=user_id,
+                                session_id=session_id)
 
-        # 更新标题（如果仍是默认值）
-        if db[session_id]["title"] in ("新会话", "") or db[session_id]["title"].startswith("Session_"):
-            db[session_id]["title"] = content[:25]
+        if db[session_id].get("title", "") in ("新会话", "") or \
+           (db[session_id].get("title", "") or "").startswith("Session_"):
+            db[session_id]["title"] = _make_title(content)
             save_sessions_db(db)
 
-        # ── Token 预算制压缩检查 ──
         if not skip_compress:
             messages = get_chat_messages(session_id)
             total_tokens = estimate_messages_tokens(messages)
-
-            # 软阈值触发：超过最小值且用户在发消息（任务间隙），启动异步压缩
             if total_tokens > RECENT_TOKEN_MIN:
                 threshold_label = "soft" if total_tokens <= RECENT_TOKEN_MAX else "hard"
                 log_operation(trace_id, user_id, session_id,
@@ -366,22 +348,19 @@ def append_session_message(session_id, role, content,
                     session_id,
                     recent_token_min=RECENT_TOKEN_MIN,
                     recent_token_max=RECENT_TOKEN_MAX,
-                    summary_model=summary_model,
                     trace_id=trace_id,
                     user_id=user_id,
                 )
 
-    # ── 5. 操作日志 ──
     log_session_turn(role, content, trace_id=trace_id, user_id=user_id, session_id=session_id)
     return session_id
 
 
 # ═══════════════════════════════════════════════
-# 辅助函数
+# 辅助
 # ═══════════════════════════════════════════════
 
 def log_session_turn(role, content, trace_id="", user_id="", session_id=""):
-    """记录会话轮次到操作日志。"""
     log_operation(trace_id, user_id, session_id,
                   operation=f"chat.{role}", detail=content)
 
@@ -391,7 +370,6 @@ def get_log_dir():
 
 
 def save_ai_log(content: str, filename: str = None):
-    """追加 AI 调用日志到 Markdown 文件。"""
     if not content.strip():
         return
     if filename is None:

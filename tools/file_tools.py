@@ -2,7 +2,6 @@
 import os
 import json
 import shutil
-import shlex
 from datetime import datetime
 import subprocess
 
@@ -153,14 +152,34 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
     challenge_token: 挑战令牌（safe_exec 返回的临时凭证）。
     """
     try:
-        parts = shlex.split(command)
-    except ValueError:
-        return json.dumps({"success": False, "message": "命令解析失败，请检查引号配对。"})
-    if not parts:
-        return json.dumps({"success": False, "message": "空命令"})
-    prog = os.path.basename(parts[0]).lower()
+        # 仅提取第一个 token 做程序名白名单检查，不使用 shlex.split
+        # shlex 是 POSIX 解析器，会误处理 PowerShell 的反斜杠路径（\t→TAB 等）
+        stripped = command.lstrip()
+        if not stripped:
+            return json.dumps({"success": False, "message": "空命令"})
+        # 提取第一个 token（支持双引号/单引号包裹）
+        first_token = ""
+        i = 0
+        if stripped[0] == '"':
+            i = 1
+            while i < len(stripped) and stripped[i] != '"':
+                i += 1
+            first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
+        elif stripped[0] == "'":
+            i = 1
+            while i < len(stripped) and stripped[i] != "'":
+                i += 1
+            first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
+        else:
+            i = 0
+            while i < len(stripped) and stripped[i] not in (' ', '\t'):
+                i += 1
+            first_token = stripped[:i]
+        prog = os.path.basename(first_token).lower()
+    except Exception:
+        return json.dumps({"success": False, "message": "命令解析失败。"})
     if prog not in ALLOWED_COMMANDS:
-        return json.dumps({"success": False, "message": f"安全限制：不允许执行程序 '{parts[0]}'。白名单: {list(ALLOWED_COMMANDS)}"})
+        return json.dumps({"success": False, "message": f"安全限制：不允许执行程序 '{first_token}'。白名单: {list(ALLOWED_COMMANDS)}"})
 
     cmd_lower = command.lower()
     for pattern in FORBIDDEN_PATTERNS:

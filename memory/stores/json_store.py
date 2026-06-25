@@ -3,6 +3,7 @@ JSON 存储后端：长期记忆、压缩记忆、会话元数据、用户标识
 """
 import json
 import os
+import tempfile
 import uuid
 from memory.config import (
     MEMORY_FILE, COMPRESSED_FILE, SHORT_TERM_FILE,
@@ -65,11 +66,16 @@ def save_compressed(compressed_list):
 # ═══════════════════════════════════════════════
 
 def load_sessions_db():
-    """加载会话元数据（id / title / created / last_turn）。"""
+    """加载会话元数据（id / title / created / last_turn）。JSON 损坏时备份并返回空。"""
     if not os.path.exists(SHORT_TERM_FILE):
         return {}
-    with open(SHORT_TERM_FILE, "r", encoding="utf-8") as f:
-        db = json.load(f)
+    try:
+        with open(SHORT_TERM_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
+    except json.JSONDecodeError:
+        backup_path = SHORT_TERM_FILE + ".corrupted"
+        os.replace(SHORT_TERM_FILE, backup_path)
+        return {}
     # 兼容旧数据：如果 messages 字段存在，删除它（消息已迁移到 SQLite）
     for s in db.values():
         s.pop("messages", None)
@@ -77,8 +83,13 @@ def load_sessions_db():
 
 
 def save_sessions_db(db):
-    with open(SHORT_TERM_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+    """原子写入：先写临时文件，再 os.replace 保证不会写坏。"""
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                      dir=os.path.dirname(SHORT_TERM_FILE),
+                                      delete=False, suffix='.tmp') as tf:
+        json.dump(db, tf, ensure_ascii=False, indent=2)
+        tmpname = tf.name
+    os.replace(tmpname, SHORT_TERM_FILE)
 
 
 # ═══════════════════════════════════════════════

@@ -1,52 +1,53 @@
 """
-对话压缩器：异步生成摘要 + 追加到 summaries.md。
+对话压缩器：Token 预算制 + 本地模型（Ollama）+ per-session 摘要存储
 
-核心改动（v3 — Token 预算制 + 递归摘要）：
-  - 异步执行（daemon 线程），不阻塞主流程
-  - 触发条件从"轮次计数"改为"Token 预算"
-  - 递归摘要：每次压缩合并旧摘要，防止信息衰减
-  - 同一会话防并发：同一时刻只允许一个压缩任务
+v4：
+  - 摘要写入 per-session summaries.db（替代旧 summaries.md）
+  - 使用 YAML 配置的本地模型
+  - 反向累加 Token 确定切割点
+  - 保留最近 N 轮完整原文（可配置）
+  - 递归摘要：新旧合并
 """
 import json
 import threading
-from memory.llm import call_llm
-from memory.config import MAX_SUMMARY_LENGTH, SUMMARY_MODEL
-from memory.long_term import append_summary, read_summaries
+from memory.config import (
+    COMPRESS_MODEL_CONFIG, TOKEN_SOFT_THRESHOLD, TOKEN_HARD_THRESHOLD,
+    TOKEN_TARGET, RECENT_TURNS_KEEP, MAX_SUMMARY_CHARS, SUMMARY_MODEL,
+    RECENT_TOKEN_MIN, RECENT_TOKEN_MAX, SUMMARY_TOKEN_BUDGET,
+)
+from memory.llm import call_llm_with_config
 from memory.stores.sqlite_store import (
     _get_chat_messages_with_ids,
     delete_chat_messages_before,
+    add_summary,
+    get_latest_summary,
     log_operation,
 )
+
 
 # ── Token 估算 ──
 
 def estimate_tokens(text):
-    """估算文本 token 数（中文约 1 字≈1 token，英文约 1 词≈1.3 token，混合取 1 字≈0.5 token 保守值）。
-
-    不使用 tiktoken（避免依赖），采用安全近似：
-      中文场景 token 略少于字符数，按 1 字符≈0.55 token 计算。
-    """
     if not text:
         return 0
     return max(1, int(len(text) * 0.55))
 
 
 def estimate_messages_tokens(messages):
-    """估算消息列表的总 token 数。"""
     total = 0
     for m in messages:
-        total += estimate_tokens(m.get("content", ""))
-        # role 标记约 4 token
-        total += 4
+        total += estimate_tokens(m.get("content", "")) + 4
     return total
 
 
-# ── 递归摘要提示词 ──
+# ── 摘要提示词 ──
 
 SUMMARY_PROMPT_TEMPLATE = (
-    "请用简洁的中文（不超过{max_len}字）总结以下对话内容，保留关键事实、用户需求、项目信息和技术决策。\n"
+    "你是一个对话压缩助手。请用简洁中文（≤{max_len}字）总结以下对话。\n"
+    "必须保留：未解决的任务、用户偏好/否定指令、关键参数值、已确认的技术方案。\n"
+    "省略：纯闲聊内容（问候/谢谢/表情等），简短确认语。\n"
     "{old_summary}"
-    "对话：\n{dialogue}"
+    "对话内容：\n{dialogue}"
 )
 
 
@@ -55,70 +56,85 @@ _compression_locks = {}
 
 
 # ═══════════════════════════════════════════════
-# 摘要生成（支持递归合并）
+# 摘要生成
 # ═══════════════════════════════════════════════
 
-def _generate_summary(messages, old_summary="", model=None):
-    """调用 LLM 生成对话摘要。
-
-    Args:
-        messages: [{"role":..., "content":...}] 列表
-        old_summary: 上一次压缩的摘要（用于递归合并）
-        model: LLM 模型名，默认使用 SUMMARY_MODEL
-
-    Returns:
-        摘要字符串，失败返回空字符串
-    """
+def _generate_summary(messages, old_summary="", max_len=MAX_SUMMARY_CHARS):
     if not messages and not old_summary:
         return ""
-    dialogue = json.dumps(messages, ensure_ascii=False)[:3000]
-    old_block = f"【之前的摘要】{old_summary}\n" if old_summary else ""
-    prompt = {
+    # Token优化：不序列化完整 JSON，只提取 role + content 拼成自然对话，去掉 tool_calls 等噪音
+    dialogue_parts = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if content:
+            dialogue_parts.append(f"[{role}]: {str(content)[:500]}")
+    dialogue = "\n".join(dialogue_parts)[:3000]
+    old_block = f"【之前摘要】{old_summary}\n" if old_summary else ""
+    system_prompt = {
         "role": "system",
         "content": SUMMARY_PROMPT_TEMPLATE.format(
-            max_len=MAX_SUMMARY_LENGTH,
+            max_len=max_len,
             old_summary=old_block,
             dialogue=dialogue,
         ),
     }
-    resp = call_llm([prompt], model=model or SUMMARY_MODEL)
+    # 省略 role=user 正文，已包含在 system prompt 中
+    resp = call_llm_with_config(
+        [system_prompt, {"role": "user", "content": "请生成摘要"}],
+        COMPRESS_MODEL_CONFIG,
+    )
     if resp and "message" in resp:
-        return resp["message"]["content"].strip()
+        content = resp["message"]["content"].strip()
+        # 去掉可能的 <｜end▁of▁thinking｜>... 包裹
+        if content.startswith("<｜end▁of▁thinking｜>"):
+            content = content.split(" response", 1)[-1].strip()
+        return content
     return ""
 
 
 # ═══════════════════════════════════════════════
-# 异步压缩主函数（Token 预算制）
+# Token 预算制切割
 # ═══════════════════════════════════════════════
 
-def compress_conversation_async(session_id, recent_token_min=30000,
-                                 recent_token_max=50000, summary_model=None,
-                                 trace_id="", user_id=""):
-    """
-    异步压缩指定会话的历史消息（Token 预算制）。
+def _find_cut_point(messages, target_tokens):
+    """反向累加 token，找到保留起点。保留最近 N 轮完整对话不动。"""
+    if not messages:
+        return len(messages)
 
-    触发逻辑：
-      当前消息总 token > recent_token_min → 触发压缩
-      当前消息总 token > recent_token_max → 必须压缩（硬阈值）
+    # 保留最近 RECENT_TURNS_KEEP 轮用户消息（完整原文不压缩）
+    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+    keep_turns = min(RECENT_TURNS_KEEP, len(user_indices))
 
-    压缩流程：
-      1. 计算当前消息 token 数
-      2. 读取旧摘要（递归合并）
-      3. 找到需要压缩的消息范围
-      4. 生成递归摘要（旧摘要 + 新消息 → 合并摘要）
-      5. 追加合并摘要到 summaries.md
-      6. 删除 SQLite 中的旧消息
+    if keep_turns >= len(user_indices):
+        # 所有轮次都在保留范围内
+        return len(messages)
 
-    参数：
-        session_id: 会话 ID
-        recent_token_min: 软阈值（默认 30000）
-        recent_token_max: 硬阈值（默认 50000）
-        summary_model: LLM 模型名（默认 SUMMARY_MODEL）
-        trace_id, user_id: 日志用
-    """
+    # 从后往前累加 token，参考用户轮次边界
+    accumulated = 0
+    cut_i = len(messages)
+    last_user_idx = user_indices[-keep_turns] if keep_turns > 0 else len(messages)
+
+    for i in range(len(messages) - 1, -1, -1):
+        accumulated += estimate_tokens(messages[i].get("content", "")) + 4
+        if accumulated >= target_tokens and i <= last_user_idx:
+            cut_i = i
+            break
+
+    # 确保切割点不在中间打断一轮对话
+    return cut_i
+
+
+# ═══════════════════════════════════════════════
+# 异步压缩
+# ═══════════════════════════════════════════════
+
+def compress_conversation_async(session_id, recent_token_min=RECENT_TOKEN_MIN,
+                                 recent_token_max=RECENT_TOKEN_MAX,
+                                 summary_model=None, trace_id="", user_id=""):
     lock = _compression_locks.setdefault(session_id, threading.Lock())
     if lock.locked():
-        return  # 已有压缩任务在进行中
+        return
 
     def _run():
         with lock:
@@ -128,63 +144,51 @@ def compress_conversation_async(session_id, recent_token_min=30000,
                     return
 
                 total_tokens = estimate_messages_tokens(messages)
-
-                # ── Token 预算判断 ──
-                # 找到用户消息索引
-                user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
-                if not user_indices:
-                    return
-
-                # 软阈值：当前 token 未超过最小值，无需压缩
                 if total_tokens <= recent_token_min:
                     return
 
-                # 硬阈值：必须压缩；软阈值：可压缩
-                # 保留最近若干轮用户消息，使剩余 token 在预算内
-                target_tokens = max(recent_token_min // 2, 10000)  # 压缩后目标：一半软阈值
+                # 读取旧摘要（递归合并）
+                old_summary = get_latest_summary(session_id)
 
-                # 从后往前找保留点
-                keep_start = len(messages)
-                accumulated = 0
-                for i in range(len(messages) - 1, -1, -1):
-                    accumulated += estimate_tokens(messages[i].get("content", "")) + 4
-                    if accumulated >= target_tokens:
-                        # 确保保留点在用户消息边界
-                        for ui in reversed(user_indices):
-                            if ui <= i:
-                                keep_start = ui
-                                break
-                        else:
-                            keep_start = i
-                        break
+                # 找到切割点
+                cut_i = _find_cut_point(messages, TOKEN_TARGET)
+                if cut_i >= len(messages):
+                    return
 
-                if keep_start >= len(messages):
-                    return  # 无需压缩
+                old_msgs = messages[:cut_i]
+                if not old_msgs:
+                    return
 
-                old_msgs = messages[:keep_start]
-
-                # ── 递归摘要：读取旧摘要 ──
-                old_summaries = read_summaries(days=30)
-                old_summary = old_summaries[-1] if old_summaries else ""
-
-                # ── 生成合并摘要 ──
-                summary = _generate_summary(old_msgs, old_summary=old_summary,
-                                            model=summary_model)
+                # 生成合并摘要
+                summary = _generate_summary(old_msgs, old_summary=old_summary)
                 if not summary:
                     return
 
-                # ── 追加合并摘要到 summaries.md ──
-                append_summary(f"【自动压缩】{summary}")
+                # 写入 per-session summaries.db
+                user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+                cover_start = 0
+                cover_end = 0
+                for ui in user_indices:
+                    if messages[ui]["id"] < messages[cut_i]["id"]:
+                        cover_end += 1
+                    else:
+                        break
 
-                # ── 删除 SQLite 中的旧消息 ──
-                cutoff_id = messages[keep_start]["id"]
+                summary_token_est = estimate_tokens(summary)
+                add_summary(session_id, summary,
+                            cover_turn_start=cover_start,
+                            cover_turn_end=cover_end,
+                            token_est=summary_token_est)
+
+                # 删除旧消息
+                cutoff_id = messages[cut_i]["id"]
                 delete_chat_messages_before(session_id, cutoff_id)
 
                 log_operation(trace_id, user_id, session_id,
                               "memory.compress.done",
-                              f"tokens {total_tokens}→{estimate_tokens(summary)} | {summary[:80]}")
-                print(f"[Memory] 会话 {session_id} 压缩完成 "
-                      f"(tokens {total_tokens}→{estimate_tokens(summary)}): {summary[:60]}...")
+                              f"tokens {total_tokens}→{summary_token_est} | {summary[:80]}")
+                print(f"[Memory] 会话 {session_id[:12]} 压缩完成 "
+                      f"(token {total_tokens}→{summary_token_est})")
 
             except Exception as e:
                 print(f"[Memory] 异步压缩失败: {e}")
@@ -198,58 +202,49 @@ def compress_conversation_async(session_id, recent_token_min=30000,
 # 同步版本（保留兼容）
 # ═══════════════════════════════════════════════
 
-def compress_conversation(session_id, keep_rounds=8, summary_model=None,
-                           trace_id="", user_id=""):
-    """
-    同步压缩（保留兼容，新代码请用 compress_conversation_async）。
-    注意：此函数阻塞主链路 3-5s，不推荐生产使用。
-    """
+def compress_conversation(session_id, keep_rounds=RECENT_TURNS_KEEP,
+                           summary_model=None, trace_id="", user_id=""):
+    """同步压缩，阻塞主链路。"""
     messages = _get_chat_messages_with_ids(session_id)
-
     user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
     if len(user_indices) <= keep_rounds:
         return
 
     keep_start = user_indices[-keep_rounds]
     old_msgs = messages[:keep_start]
+    old_summary = get_latest_summary(session_id)
 
-    # 递归摘要：读取旧摘要
-    old_summaries = read_summaries(days=30)
-    old_summary = old_summaries[-1] if old_summaries else ""
-
-    summary = _generate_summary(old_msgs, old_summary=old_summary,
-                                model=summary_model)
+    summary = _generate_summary(old_msgs, old_summary=old_summary)
     if not summary:
         return
 
-    append_summary(f"【自动压缩】{summary}")
-
+    add_summary(session_id, summary, token_est=estimate_tokens(summary))
     cutoff_id = messages[keep_start]["id"]
     delete_chat_messages_before(session_id, cutoff_id)
-
-    log_operation(trace_id, user_id, session_id,
-                  "memory.compress.done", summary)
+    log_operation(trace_id, user_id, session_id, "memory.compress.done", summary)
 
 
 # ═══════════════════════════════════════════════
-# 兼容接口
+# 兼容旧接口
 # ═══════════════════════════════════════════════
 
 def add_compressed_summary(summary, source_type="auto"):
-    """兼容旧接口：追加到 summaries.md。"""
-    prefix = "【自动压缩】" if source_type == "auto" else ""
-    append_summary(f"{prefix}{summary}")
+    """兼容旧接口，写入当前活跃会话。"""
+    from memory.session import get_active_session_id
+    sid = get_active_session_id()
+    add_summary(sid, summary)
 
 
 def get_recent_compressed(days=7):
-    """兼容旧接口：从 summaries.md 读取最近 N 天的摘要。"""
-    recent = read_summaries(days)
-    if not recent:
+    """兼容旧接口。"""
+    from memory.session import get_active_session_id
+    sid = get_active_session_id()
+    latest = get_latest_summary(sid)
+    if not latest:
         return ""
-    return "【历史对话摘要】\n" + "\n".join(f"- {s}" for s in recent)
+    return f"【历史对话摘要】\n- {latest}"
 
 
-def get_latest_summary(days=30):
-    """获取最近一条压缩摘要（用于注入上下文）。"""
-    recent = read_summaries(days)
-    return recent[-1] if recent else ""
+def get_latest_summary_for_session(session_id):
+    """获取指定会话的最新摘要。"""
+    return get_latest_summary(session_id)

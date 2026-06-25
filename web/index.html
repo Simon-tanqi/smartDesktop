@@ -284,6 +284,70 @@
             30% { transform: translateY(-10px); }
         }
 
+        /* 脉冲加载点：发送消息后等待首条 SSE 的过渡阶段 */
+        .pulse-spinner {
+            display: flex; gap: 6px; padding: 8px 16px;
+            align-items: center; color: #667eea; font-size: 13px;
+        }
+        .pulse-spinner .dot {
+            width: 8px; height: 8px; border-radius: 50%; background: #667eea;
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+        .pulse-spinner .dot:nth-child(2) { animation-delay: 0.2s; }
+        .pulse-spinner .dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes pulse { 0%,100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
+
+        /* 超时/慢响应提示 */
+        .slow-response-hint {
+            padding: 8px 16px; font-size: 12px; color: #e67e22;
+            display: none; align-items: center; gap: 8px;
+        }
+        .slow-response-hint button {
+            background: none; border: 1px solid #e67e22; color: #e67e22;
+            border-radius: 4px; padding: 2px 10px; cursor: pointer; font-size: 12px;
+        }
+
+        /* 工具执行进度 */
+        .tool-progress {
+            display: none;
+            padding: 8px 16px; margin-bottom: 8px;
+            background: #f0f4ff; border-left: 3px solid #667eea;
+            border-radius: 6px;
+            animation: fadeIn 0.2s ease;
+        }
+        .tool-progress .tp-header {
+            font-size: 12px; color: #555; margin-bottom: 4px;
+            display: flex; align-items: center;
+        }
+        .tool-progress .tp-name {
+            font-weight: 600; color: #667eea;
+        }
+        .tool-progress .tp-bar-track {
+            width: 100%; height: 4px; background: #e0e6f0;
+            border-radius: 2px; overflow: hidden;
+        }
+        .tool-progress .tp-bar-fill {
+            height: 100%; width: 40%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 2px;
+            animation: tpIndeterminate 1.4s ease-in-out infinite;
+        }
+        @keyframes tpIndeterminate {
+            0%   { transform: translateX(-100%); }
+            50%  { transform: translateX(250%); }
+            100% { transform: translateX(-100%); }
+        }
+
+        /* 可操作错误气泡 */
+        .error-actionable {
+            margin-top: 6px; display: flex; gap: 8px;
+        }
+        .error-actionable button {
+            background: #f0f0f0; border: 1px solid #ccc;
+            border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px;
+        }
+        .error-actionable button:hover { background: #e0e0e0; }
+
         /* --- 输入区域 --- */
         .input-area {
             padding: 20px;
@@ -372,6 +436,25 @@
                 <div class="typing-indicator" id="typingIndicator">
                     <span></span><span></span><span></span>
                 </div>
+                <!-- 脉冲加载动画：发送后等待首条 SSE -->
+                <div class="pulse-spinner" id="pulseSpinner" style="display:none">
+                    <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                    <span>正在响应...</span>
+                </div>
+                <!-- 慢响应提示 -->
+                <div class="slow-response-hint" id="slowHint">
+                    <span>响应时间较长，请耐心等待...</span>
+                    <button onclick="cancelCurrentRequest()">取消</button>
+                </div>
+                <!-- 工具执行进度 -->
+                <div class="tool-progress" id="toolProgress">
+                    <div class="tp-header">
+                        <span class="tp-name" id="tpName">执行工具</span>
+                    </div>
+                    <div class="tp-bar-track">
+                        <div class="tp-bar-fill"></div>
+                    </div>
+                </div>
             </div>
             
             <!-- 3. 输入与模型选择 -->
@@ -398,8 +481,11 @@
 		
 		let currentSessionId = null;
 		const sessions = {};
-		let currentAbortController = null;
+		// 问题4：每个会话独立的 AbortController，支持多会话并行
+		const sessionAbortControllers = {};  // sessionId → AbortController
 		let contextMenuTargetId = null;
+		// 问题6：自动滚动意图跟踪
+		let userScrolledUp = false;
 
 		// ============================
 		// 2. DOM 元素
@@ -410,6 +496,10 @@
 		const messageInput = document.getElementById('messageInput');
 		const sendButton = document.getElementById('sendButton');
 		const typingIndicator = document.getElementById('typingIndicator');
+		const pulseSpinner = document.getElementById('pulseSpinner');
+		const slowHint = document.getElementById('slowHint');
+		const toolProgress = document.getElementById('toolProgress');
+		const tpName = document.getElementById('tpName');
 		const modelSelect = document.getElementById('modelSelect');
 		const sessionContextMenu = document.getElementById('sessionContextMenu');
 
@@ -439,6 +529,30 @@
 			}
 			sessionContextMenu.style.display = 'none';
 		});
+
+		// 问题6：滚动意图检测 — 用户手动上滚后不再自动追底
+		chatContainer.addEventListener('scroll', () => {
+			const atBottom = chatContainer.scrollHeight - chatContainer.scrollTop <= 
+			                 chatContainer.clientHeight + 50;
+			userScrolledUp = !atBottom;
+		});
+		function autoScrollToBottom() {
+			if (!userScrolledUp) {
+				chatContainer.scrollTop = chatContainer.scrollHeight;
+			}
+		}
+
+		// 问题3+4：取消当前请求
+		function cancelCurrentRequest() {
+			const ctrl = sessionAbortControllers[currentSessionId];
+			if (ctrl) {
+				ctrl.abort();
+				delete sessionAbortControllers[currentSessionId];
+			}
+			pulseSpinner.style.display = 'none';
+			slowHint.style.display = 'none';
+			typingIndicator.style.display = 'none';
+		}
 
 		// ============================
 		// 3. 辅助函数
@@ -525,7 +639,13 @@
 		function clearChatArea() {
 			chatContainer.innerHTML = '';
 			chatContainer.appendChild(typingIndicator);
+			chatContainer.appendChild(pulseSpinner);
+			chatContainer.appendChild(slowHint);
+			chatContainer.appendChild(toolProgress);
 			typingIndicator.style.display = 'none';
+			pulseSpinner.style.display = 'none';
+			slowHint.style.display = 'none';
+			toolProgress.style.display = 'none';
 		}
 
 		function renderChatHistory(messages) {
@@ -667,10 +787,13 @@
 			currentSessionId = data.session_id;
 		}
 		async function switchSession(sessionId) {
-			// 中断当前正在进行的 SSE 流
-			if (currentAbortController) {
-				currentAbortController.abort();
-				currentAbortController = null;
+			// 问题4：如果当前会话有正在运行的请求，弹窗确认后再切换
+			if (sessionAbortControllers[currentSessionId]) {
+				const confirmed = confirm(
+					'当前会话正在生成回复中。\n\n切换后该回复将在后台继续完成，你可以随时切回来查看。\n\n是否切换到新会话？'
+				);
+				if (!confirmed) return;
+				// 不中止旧请求，保留 sessionAbortControllers[currentSessionId]
 			}
 			try {
 				const res = await fetch(`/api/sessions/${sessionId}`);
@@ -683,6 +806,11 @@
 				sessions[sessionId].messages = data.messages || [];
 				renderSessionList();
 				renderChatHistory(sessions[sessionId].messages);
+				// 切换后重置 UI 状态
+				userScrolledUp = false;
+				pulseSpinner.style.display = 'none';
+				slowHint.style.display = 'none';
+				typingIndicator.style.display = 'none';
 			} catch (error) {
 				console.error("切换会话失败:", error);
 				appendMessage('ai', `加载会话失败：${error.message}`);
@@ -708,6 +836,13 @@
 		}
 
 		async function createNewSession() {
+			// 问题4：如果当前会话有正在运行的请求，弹窗确认后再创建新会话
+			if (sessionAbortControllers[currentSessionId]) {
+				const confirmed = confirm(
+					'当前会话正在生成回复中。\n\n创建新会话后，原会话回复将在后台继续完成。\n\n是否创建新会话？'
+				);
+				if (!confirmed) return;
+			}
 			try {
 				const res = await fetch('/api/sessions/new', { method: 'POST' });
 				const data = await res.json();
@@ -772,6 +907,11 @@
 		// ============================
 		let isSending = false;
 
+		// 工具执行进度管理（CSS 动画驱动，无需 JS 计时器）
+		function resetToolProgress() {
+			toolProgress.style.display = 'none';
+		}
+
 		async function sendMessage() {
 			const text = messageInput.value.trim();
 			if (!text || !currentSessionId || isSending) return;
@@ -780,15 +920,29 @@
 			isSending = true;
 			sendButton.disabled = true;
 			messageInput.value = '';
+			// 问题4：捕获请求时的会话 ID，SSE 事件处理器全部用此值
+			const requestSessionId = currentSessionId;
 
 			try {
 			const userTimestamp = new Date().toISOString();
 			appendMessage('user', text, 'chat', userTimestamp);
 			// 立即保存用户消息到本地缓存，避免流式过程中丢失
-			if (sessions[currentSessionId]) {
-				sessions[currentSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp, msgId: generateUUID() });
+			if (sessions[requestSessionId]) {
+				sessions[requestSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp, msgId: generateUUID() });
 			}
-			typingIndicator.style.display = 'flex';
+
+			// 问题3：显示脉冲加载动画（替代纯文字 typing indicator）
+			typingIndicator.style.display = 'none';
+			pulseSpinner.style.display = 'flex';
+			slowHint.style.display = 'none';
+			userScrolledUp = false;  // 新消息重置滚动意图
+
+			// 问题3：3 秒后首条 SSE 未到达时显示超时提示
+			const slowTimer = setTimeout(() => {
+				if (pulseSpinner.style.display !== 'none') {
+					slowHint.style.display = 'flex';
+				}
+			}, 3000);
 
 			// 创建思考过程折叠块（等待流式填充）
 			const thinkBlock = document.createElement('div');
@@ -812,21 +966,24 @@
 					try { modelChoice = JSON.parse(modelValue); } catch(e) {}
 				}
 
-				currentAbortController = new AbortController();
+				// 问题4：每会话独立的 AbortController
+				sessionAbortControllers[requestSessionId] = new AbortController();
 				const response = await fetch('/api/chat', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
 						message: text,
-						session_id: currentSessionId,
+						session_id: requestSessionId,
 						model_choice: modelChoice
 					}),
-					signal: currentAbortController.signal
+					signal: sessionAbortControllers[requestSessionId].signal
 				});
 
 				// 非 SSE 响应（如 JSON 错误），直接展示错误信息
 				const contentType = response.headers.get('Content-Type') || '';
 				if (!contentType.includes('text/event-stream')) {
+					clearTimeout(slowTimer);
+					pulseSpinner.style.display = 'none';
 					typingIndicator.style.display = 'none';
 					let errMsg = '未知错误';
 					try {
@@ -856,22 +1013,37 @@
 							const data = JSON.parse(line.slice(6));
 							switch (data.type) {
 								case 'thinking':
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
 									hasThinking = true;
 									thinkContent += data.text;
 									thinkBody.style.display = 'block';
 									thinkBody.textContent = thinkContent;
-									chatContainer.scrollTop = chatContainer.scrollHeight;
+									autoScrollToBottom();
 									break;
 								case 'step':
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
 									hasThinking = true;
 									const stepText = '\n【' + data.status + '】' + data.text;
 									thinkContent += stepText;
 									thinkBody.style.display = 'block';
 									thinkBody.textContent = thinkContent;
-									chatContainer.scrollTop = chatContainer.scrollHeight;
+									// 工具执行进度（CSS 不定长动画，不依赖超时预测）
+									if (data.tool_name) {
+										tpName.textContent = data.tool_name;
+										toolProgress.style.display = 'block';
+									}
+									autoScrollToBottom();
 									break;
 								case 'final':
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
 									typingIndicator.style.display = 'none';
+									resetToolProgress();
 									appendMessage('ai', data.text, 'chat', data.timestamp);
 									// 思考区域折叠回默认状态
 									if (hasThinking) {
@@ -880,16 +1052,21 @@
 									} else {
 										thinkBlock.remove();
 									}
-									// 更新本地缓存（用户消息已在 sendMessage 开头保存）
-									if (sessions[currentSessionId]) {
+									// 问题4：使用 requestSessionId 而非 currentSessionId
+									if (sessions[requestSessionId]) {
 										if (hasThinking) {
-											sessions[currentSessionId].messages.push({ sender: 'ai', text: thinkContent, msgType: 'think', timestamp: data.timestamp, msgId: generateUUID() });
+											sessions[requestSessionId].messages.push({ sender: 'ai', text: thinkContent, msgType: 'think', timestamp: data.timestamp, msgId: generateUUID() });
 										}
-										sessions[currentSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat', timestamp: data.timestamp, msgId: generateUUID() });
+										sessions[requestSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat', timestamp: data.timestamp, msgId: generateUUID() });
 									}
+									autoScrollToBottom();
 									break;
 								case 'error':
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
 									typingIndicator.style.display = 'none';
+									resetToolProgress();
 									appendMessage('ai', '错误: ' + (data.text || '未知错误'));
 									thinkBlock.remove();
 									break;
@@ -901,22 +1078,39 @@
 				}
 
 				// 异常结束处理
+				if (pulseSpinner.style.display !== 'none') {
+					pulseSpinner.style.display = 'none';
+				}
+				if (slowHint.style.display !== 'none') {
+					slowHint.style.display = 'none';
+				}
 				if (typingIndicator.style.display !== 'none') {
 					typingIndicator.style.display = 'none';
 					thinkBody.style.display = '';
 				}
-				// 流式完成后备份本地缓存到后端
-				saveSessionToBackend(currentSessionId);
+				// 问题4：使用 requestSessionId
+				saveSessionToBackend(requestSessionId);
 			} catch (error) {
+				clearTimeout(slowTimer);
+				pulseSpinner.style.display = 'none';
+				slowHint.style.display = 'none';
 				typingIndicator.style.display = 'none';
-				appendMessage('ai', '网络错误: ' + error.message);
+				resetToolProgress();
+				if (error.name !== 'AbortError') {
+					appendMessage('ai', '网络错误: ' + error.message);
+				}
 				if (thinkBlock.parentNode) thinkBlock.remove();
 			}
 		} catch (e) {
+			pulseSpinner.style.display = 'none';
+			slowHint.style.display = 'none';
 			typingIndicator.style.display = 'none';
+			resetToolProgress();
 			appendMessage('ai', '发送失败: ' + (e.message || '未知错误'));
 			console.error('sendMessage error:', e);
 		} finally {
+			// 问题4：清理该会话的 AbortController
+			delete sessionAbortControllers[requestSessionId];
 			isSending = false;
 			sendButton.disabled = false;
 		}
@@ -938,11 +1132,22 @@
 					option.textContent = item.display || `${item.provider} - ${item.model}`;
 					modelSelect.appendChild(option);
 				});
-				// 默认选中 DeepSeek（provider 含 deepseek），避免默认选中不可用的 Ollama
-				const deepseekOpt = Array.from(modelSelect.options).find(opt => {
-					try { return JSON.parse(opt.value).provider === 'deepseek'; } catch(e) { return false; }
+				// 问题5：优先读取 localStorage 中的模型选择，没有则回退到 DeepSeek
+				const savedModel = localStorage.getItem('selectedModel');
+				if (savedModel) {
+					const opt = Array.from(modelSelect.options).find(o => o.value === savedModel);
+					if (opt) opt.selected = true;
+				}
+				if (!savedModel || !Array.from(modelSelect.options).some(o => o.value === savedModel && o.selected)) {
+					const deepseekOpt = Array.from(modelSelect.options).find(opt => {
+						try { return JSON.parse(opt.value).provider === 'deepseek'; } catch(e) { return false; }
+					});
+					if (deepseekOpt) deepseekOpt.selected = true;
+				}
+				// 问题5：选中变更时写入 localStorage（后台服务不重启就一直用此模型）
+				modelSelect.addEventListener('change', () => {
+					localStorage.setItem('selectedModel', modelSelect.value);
 				});
-				if (deepseekOpt) deepseekOpt.selected = true;
 			} catch (e) {
 				modelSelect.innerHTML = '<option value="">无法加载模型</option>';
 				console.error("加载模型失败:", e);

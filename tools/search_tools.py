@@ -7,6 +7,9 @@ import requests
 
 from . import register_tool, path_params
 
+# LLM 提取回退：仅在正则解析失败时按需导入
+_LLM_EXTRACTION_AVAILABLE = None  # None=未检测, True/False=缓存结果
+
 SKIP_DIRS = {
     "Windows", "Program Files", "Program Files (x86)", "ProgramData",
     "$RECYCLE.BIN", "System Volume Information", "Recovery",
@@ -75,6 +78,66 @@ def _strip_html(html: str) -> str:
     return text
 
 
+def _check_llm_available():
+    """检测本地 Ollama 是否可用（结果缓存）。"""
+    global _LLM_EXTRACTION_AVAILABLE
+    if _LLM_EXTRACTION_AVAILABLE is not None:
+        return _LLM_EXTRACTION_AVAILABLE
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        _LLM_EXTRACTION_AVAILABLE = r.status_code == 200
+    except Exception:
+        _LLM_EXTRACTION_AVAILABLE = False
+    return _LLM_EXTRACTION_AVAILABLE
+
+
+def _llm_extract_results(html: str, max_results: int):
+    """
+    将 Bing 搜索结果页的 HTML 发给本地 LLM，让 LLM 自行判断结构并提取结果。
+    只返回 body 区域的 clean text 给 LLM，避免 token 浪费。
+    """
+    # 提取 body 并去掉大块噪音标签
+    body_m = re.search(r"<body[^>]*>(.*?)</body>", html, re.DOTALL | re.IGNORECASE)
+    body = body_m.group(1) if body_m else html
+    for tag in ["script", "style", "noscript", "svg", "iframe"]:
+        body = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", "", body, flags=re.DOTALL | re.IGNORECASE)
+    # 限制长度，避免超长 HTML 撑爆 token
+    body = body[:15000]
+
+    prompt = f"""下面是一段 Bing 搜索引擎的结果页 HTML 片段。请从中提取搜索结果，返回 JSON 数组。
+
+要求：
+1. 每个结果包含 title（标题纯文本）、url（完整链接）、snippet（摘要纯文本，最多 300 字）
+2. 最多提取 {max_results} 条
+3. 只返回 JSON 数组，不要任何解释
+
+HTML 片段：
+{body}
+
+JSON 输出："""
+
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-r1:7b", "prompt": prompt, "stream": False,
+                  "options": {"temperature": 0.1}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+
+        # 提取 JSON 数组
+        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+            if isinstance(parsed, list):
+                return [r for r in parsed if isinstance(r, dict) and r.get("title")]
+    except Exception:
+        pass
+
+    return None
+
+
 @register_tool
 def web_search(query: str, max_results: int = 10):
     """使用 Bing 搜索引擎搜索网页，返回标题、链接和摘要。适合获取最新新闻、实时信息。"""
@@ -87,12 +150,12 @@ def web_search(query: str, max_results: int = 10):
         return json.dumps({"success": False, "error": f"搜索请求失败: {str(e)}"}, ensure_ascii=False)
 
     results = []
-    # 解析 b_algo 结果块
+    html_raw = html  # 保留原始 HTML 供 LLM 回退使用
+
+    # 1. 正则解析 b_algo 结果块
     blocks = re.split(r'<li class="b_algo"', html)[1:]
     for block in blocks[:max_results]:
-        # 标题 + 链接
         title_m = re.search(r'<h2[^>]*>.*?<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
-        # 摘要（b_caption 内的 p）
         snippet_m = re.search(r'<div class="b_caption"[^>]*>.*?<p[^>]*>(.*?)</p>', block, re.DOTALL)
 
         if title_m:
@@ -100,6 +163,12 @@ def web_search(query: str, max_results: int = 10):
             link = title_m.group(1)
             snippet = _strip_html(snippet_m.group(1))[:300] if snippet_m else ""
             results.append({"title": title, "url": link, "snippet": snippet})
+
+    # 2. 正则解析失败 → 尝试 LLM 提取（让 LLM 自行判断 HTML 结构）
+    if not results and _check_llm_available():
+        llm_results = _llm_extract_results(html_raw, max_results)
+        if llm_results:
+            results = llm_results
 
     if not results:
         return json.dumps({"success": True, "results": [], "message": "未找到相关结果"}, ensure_ascii=False)
@@ -110,7 +179,8 @@ def web_search(query: str, max_results: int = 10):
 @register_tool
 def fetch_webpage(url: str, max_length: int = 3000):
     """抓取指定 URL 的网页正文（去除 HTML 标签）。适合在搜索后深入阅读某个页面。
-    自动尝试桌面 UA → 移动端 UA → 移动端子域名(m.) 三级回退。"""
+    自动尝试桌面 UA → 移动端 UA → 移动端子域名(m.) 三级回退。
+    若 URL 指向可下载文件（PDF/图片/音视频等），自动路由到 web_download 工具。"""
     raw = None
     resp_url = url
     errors = []
@@ -143,6 +213,29 @@ def fetch_webpage(url: str, max_length: int = 3000):
 
     if raw is None:
         return json.dumps({"success": False, "error": f"网页抓取失败: {'; '.join(errors)}"}, ensure_ascii=False)
+
+    # ── Content-Type 检测：非文本类型自动路由到下载 ──
+    content_type = ""
+    # 从首次成功响应中获取 Content-Type（raw 不为空时已有 response 信息，用近似检测）
+    # 通过解析 HTML <meta> 或直接匹配魔数判断
+    if raw:
+        # 若返回内容并非 HTML（如直接是二进制数据被误解析），检测文件魔术字
+        if raw.startswith("%PDF") or raw.startswith("PK\x03\x04"):
+            from .web_download import web_download
+            return web_download(url)
+
+    # 对常见文件扩展名做路由
+    parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(resp_url)
+    path_lower = parsed.path.lower()
+    downloadable_exts = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".mp4", ".mp3", ".docx", ".xlsx", ".pptx"}
+    if any(path_lower.endswith(ext) for ext in downloadable_exts):
+        from .web_download import web_download
+        result = web_download(url)
+        data = json.loads(result)
+        if data.get("success"):
+            data["_routed_from"] = "fetch_webpage（自动检测到可下载文件）"
+            return json.dumps(data, ensure_ascii=False)
+        # 下载失败时继续尝试文本抓取
 
     body_m = re.search(r"<body[^>]*>(.*?)</body>", raw, re.DOTALL | re.IGNORECASE)
     body = body_m.group(1) if body_m else raw
@@ -274,6 +367,13 @@ def get_weather(city: str = "Shenzhen"):
                     "title": _strip_html(title_m.group(2)).strip(),
                     "snippet": _strip_html(snippet_m.group(1))[:200] if snippet_m else "",
                 })
+
+        # 正则解析失败 → LLM 回退
+        if not results and _check_llm_available():
+            llm_results = _llm_extract_results(html, 5)
+            if llm_results:
+                results = [{"title": r["title"], "snippet": r["snippet"]} for r in llm_results]
+
         return json.dumps({
             "success": True,
             "weather": {"city": city, "source": "Bing搜索摘要", "search_results": results}

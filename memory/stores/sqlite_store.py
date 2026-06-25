@@ -1,21 +1,95 @@
 """
-SQLite 存储后端：Agent 追踪日志、操作日志、聊天记录
+SQLite 存储后端：Agent 追踪日志、操作日志、聊天记录、压缩摘要
 
-连接管理：所有数据库操作通过 _get_conn() 上下文管理器获取连接，
-          try/finally 保证异常时连接必然关闭，杜绝连接泄漏。
+v4: 短期记忆改为 per-session 目录隔离
+    summary 改为 per-session summaries.db（替代 summaries.md）
+    全局日志和追踪仍在 DATA_DIR 下
 """
+import os
 import sqlite3
+import threading
+import datetime
 from contextlib import contextmanager
-from memory.config import TRACE_DB, OPERATION_LOG_DB, CHAT_DB
+from memory.config import (
+    TRACE_DB, OPERATION_LOG_DB,
+    get_session_messages_db, get_session_summaries_db,
+)
 
 
 # ═══════════════════════════════════════════════
-# 连接管理（核心修复）
+# 连接管理（线程本地 + LRU，防止 per-session DB 过多）
 # ═══════════════════════════════════════════════
+
+_MAX_CONNS_PER_THREAD = 8
+
+class _ThreadLocalPool(threading.local):
+    def __init__(self):
+        self.conn_pool = {}    # db_path -> conn
+        self.access = []       # LRU 追踪
+
+    def __del__(self):
+        """线程终止时关闭所有连接并从全局注册表移除。"""
+        for path, conn in list(self.conn_pool.items()):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                with _global_conn_lock:
+                    if path in _global_conns and conn in _global_conns[path]:
+                        _global_conns[path].remove(conn)
+            except Exception:
+                pass  # 解释器关闭时锁可能已失效
+        self.conn_pool.clear()
+        self.access.clear()
+
+_tl_pool = _ThreadLocalPool()
+
+# 全局连接注册表：跟踪所有线程持有的连接，用于跨线程关闭
+_global_conn_lock = threading.Lock()
+_global_conns = {}  # db_path -> list of sqlite3.Connection
+
 
 @contextmanager
 def _get_conn(db_path, row_factory=False):
-    """获取 SQLite 连接，finally 保证异常时必然关闭。"""
+    """获取 SQLite 连接。线程本地 LRU 池，避免跨线程共享。"""
+    conn = None
+    pool = _tl_pool.conn_pool
+    access = _tl_pool.access
+    try:
+        if db_path in pool:
+            conn = pool[db_path]
+            access.remove(db_path)
+        else:
+            if len(pool) >= _MAX_CONNS_PER_THREAD:
+                oldest = access.pop(0)
+                oldest_conn = pool[oldest]
+                oldest_conn.close()
+                del pool[oldest]
+                # 从全局注册表移除被驱逐的连接
+                with _global_conn_lock:
+                    if oldest in _global_conns and oldest_conn in _global_conns[oldest]:
+                        _global_conns[oldest].remove(oldest_conn)
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            pool[db_path] = conn
+            # 注册到全局表，以便跨线程关闭
+            with _global_conn_lock:
+                _global_conns.setdefault(db_path, []).append(conn)
+        access.append(db_path)
+        orig_row_factory = conn.row_factory
+        if row_factory:
+            conn.row_factory = sqlite3.Row
+        yield conn
+    finally:
+        if conn:
+            if row_factory:
+                conn.row_factory = orig_row_factory
+            conn.commit()
+
+
+@contextmanager
+def _get_conn_simple(db_path, row_factory=False):
+    """简单连接：每次创建关闭，用于低频操作（trace / oplog）。"""
     conn = sqlite3.connect(db_path)
     if row_factory:
         conn.row_factory = sqlite3.Row
@@ -30,20 +104,18 @@ def _get_conn(db_path, row_factory=False):
 # ═══════════════════════════════════════════════
 
 def _sanitize(text):
-    """清洗日志内容：移除回车/换行/制表符，压缩多余空白。"""
     if not text:
         return ""
     return " ".join(text.replace("\r", " ").replace("\n", " ").replace("\t", " ").split())
 
 
 def _truncate(s, max_len=500):
-    """截断字符串，超长时附加标记。"""
     s = str(s) if s else ""
     return s[:max_len] + "...(截断)" if len(s) > max_len else s
 
 
 # ═══════════════════════════════════════════════
-# Agent 追踪日志 —— 表初始化
+# Agent 追踪日志（全局）
 # ═══════════════════════════════════════════════
 
 def _init_trace_tables(conn):
@@ -69,7 +141,6 @@ def _init_trace_tables(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_trace_id ON agent_trace(trace_id)")
-    conn.commit()
 
 
 def log_trace(trace_id, span_name, node_type, duration_ms,
@@ -77,7 +148,7 @@ def log_trace(trace_id, span_name, node_type, duration_ms,
               provider=None, model_name=None, model_params=None,
               input_summary=None, output_summary=None,
               error=None, status="success", extra=None):
-    with _get_conn(TRACE_DB) as conn:
+    with _get_conn_simple(TRACE_DB) as conn:
         _init_trace_tables(conn)
         conn.execute("""
             INSERT INTO agent_trace
@@ -89,11 +160,10 @@ def log_trace(trace_id, span_name, node_type, duration_ms,
               provider, model_name, model_params,
               _truncate(input_summary), _truncate(output_summary),
               error, duration_ms, status, extra))
-        conn.commit()
 
 
 # ═══════════════════════════════════════════════
-# 操作日志
+# 操作日志（全局）
 # ═══════════════════════════════════════════════
 
 def _init_oplog_tables(conn):
@@ -112,23 +182,20 @@ def _init_oplog_tables(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_op_trace ON operation_log(trace_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_op_user ON operation_log(user_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_op_session ON operation_log(session_id)")
-    conn.commit()
 
 
 def log_operation(trace_id, user_id, session_id, operation, detail=""):
-    """写入结构化操作日志。"""
     detail = _sanitize(detail)
-    with _get_conn(OPERATION_LOG_DB) as conn:
+    with _get_conn_simple(OPERATION_LOG_DB) as conn:
         _init_oplog_tables(conn)
         conn.execute(
             "INSERT INTO operation_log (trace_id, user_id, session_id, operation, detail) VALUES (?, ?, ?, ?, ?)",
             (trace_id, user_id, session_id, operation, detail),
         )
-        conn.commit()
 
 
 # ═══════════════════════════════════════════════
-# 聊天记录（SQLite）
+# 聊天记录（per-session messages.db）
 # ═══════════════════════════════════════════════
 
 def _init_chat_tables(conn):
@@ -146,7 +213,6 @@ def _init_chat_tables(conn):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 兼容旧表：增量添加新列
     for col, col_type in [
         ("msg_type", "TEXT DEFAULT 'chat'"),
         ("trace_id", "TEXT NOT NULL DEFAULT ''"),
@@ -159,15 +225,14 @@ def _init_chat_tables(conn):
             pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_trace ON chat_history(trace_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg_id ON chat_history(session_id, msg_id)")
-    conn.commit()
 
 
-def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", user_id="", timestamp="", msg_id=""):
-    """写入聊天记录。timestamp 为 ISO 格式字符串（如 '2026-06-15 23:11:10'），不传则使用当前时间。"""
+def add_chat_message(session_id, role, content, msg_type="chat",
+                     trace_id="", user_id="", timestamp="", msg_id=""):
     if role not in ("user", "assistant", "system"):
         return
-    with _get_conn(CHAT_DB) as conn:
+    db_path = get_session_messages_db(session_id)
+    with _get_conn(db_path) as conn:
         _init_chat_tables(conn)
         if timestamp:
             conn.execute(
@@ -179,27 +244,29 @@ def add_chat_message(session_id, role, content, msg_type="chat", trace_id="", us
                 "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trace_id, user_id, session_id, role, content, msg_type, msg_id),
             )
-        conn.commit()
 
 
 def get_chat_messages(session_id, limit=200, offset=0):
-    """读取聊天记录，按时间正序，支持分页。"""
-    with _get_conn(CHAT_DB, row_factory=True) as conn:
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    with _get_conn(db_path, row_factory=True) as conn:
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content, msg_type, msg_id, created_at FROM chat_history "
             "WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
-    return [{"role": r[0], "content": r[1], "msg_type": r[2], "msg_id": r[3], "created_at": r[4]} for r in rows]
+    return [{"role": r[0], "content": r[1], "msg_type": r[2],
+             "msg_id": r[3], "created_at": r[4]} for r in rows]
 
 
 def get_session_messages(session_id, limit=500):
-    """
-    获取用于构建 LLM 上下文的会话消息。
-    仅返回 msg_type='chat' 或 msg_type 为空的消息（排除思考追踪消息）。
-    """
-    with _get_conn(CHAT_DB, row_factory=True) as conn:
+    """获取用于 LLM 上下文的消息（仅 chat 类型）。"""
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    with _get_conn(db_path, row_factory=True) as conn:
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content FROM chat_history "
@@ -211,8 +278,11 @@ def get_session_messages(session_id, limit=500):
 
 
 def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
-    """内部使用：获取带 ID 的消息列表（用于压缩时定位删除边界）。"""
-    with _get_conn(CHAT_DB, row_factory=True) as conn:
+    """内部：获取带 ID 的消息（压缩用）。"""
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    with _get_conn(db_path, row_factory=True) as conn:
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT id, role, content FROM chat_history "
@@ -224,19 +294,22 @@ def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
 
 
 def delete_chat_messages_before(session_id, before_id):
-    """删除指定 ID 之前的聊天记录（压缩时使用）。"""
-    with _get_conn(CHAT_DB) as conn:
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return
+    with _get_conn(db_path) as conn:
         _init_chat_tables(conn)
         conn.execute(
             "DELETE FROM chat_history WHERE session_id = ? AND id < ?",
             (session_id, before_id),
         )
-        conn.commit()
 
 
 def count_chat_messages(session_id):
-    """统计会话聊天记录总数。"""
-    with _get_conn(CHAT_DB) as conn:
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return 0
+    with _get_conn(db_path) as conn:
         _init_chat_tables(conn)
         count = conn.execute(
             "SELECT COUNT(*) FROM chat_history WHERE session_id = ?", (session_id,)
@@ -245,8 +318,160 @@ def count_chat_messages(session_id):
 
 
 def delete_chat_session(session_id):
-    """删除指定会话的全部聊天记录。"""
-    with _get_conn(CHAT_DB) as conn:
-        _init_chat_tables(conn)
-        conn.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
-        conn.commit()
+    """删除会话的全部聊天记录 + summaries + 目录。"""
+    import shutil
+    from memory.config import get_session_dir
+    sess_dir = get_session_dir(session_id)
+    db_path = get_session_messages_db(session_id)
+    sum_db_path = get_session_summaries_db(session_id)
+
+    # 第一步：通过全局注册表关闭所有线程持有的相关连接
+    for path in [db_path, sum_db_path]:
+        with _global_conn_lock:
+            conns_to_close = _global_conns.pop(path, [])[:]
+        for conn in conns_to_close:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # 第二步：清理当前线程本地池中的残留
+    for path in [db_path, sum_db_path]:
+        if path in _tl_pool.conn_pool:
+            try:
+                _tl_pool.conn_pool[path].close()
+            except Exception:
+                pass
+            del _tl_pool.conn_pool[path]
+            if path in _tl_pool.access:
+                _tl_pool.access.remove(path)
+
+    # 第三步：删除目录
+    if os.path.exists(sess_dir):
+        shutil.rmtree(sess_dir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════
+# 压缩摘要（per-session summaries.db）
+# ═══════════════════════════════════════════════
+
+def _init_summary_tables(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            cover_turn_start INTEGER,
+            cover_turn_end INTEGER,
+            summary_text TEXT NOT NULL,
+            token_est INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, created_at)")
+
+
+def add_summary(session_id, summary_text, cover_turn_start=None,
+                cover_turn_end=None, token_est=0):
+    """写入一条压缩摘要到 per-session summaries.db。"""
+    db_path = get_session_summaries_db(session_id)
+    with _get_conn(db_path) as conn:
+        _init_summary_tables(conn)
+        conn.execute(
+            "INSERT INTO summaries (session_id, cover_turn_start, cover_turn_end, summary_text, token_est) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, cover_turn_start, cover_turn_end, summary_text, token_est),
+        )
+
+
+def get_latest_summary(session_id):
+    """获取最近一条摘要。"""
+    db_path = get_session_summaries_db(session_id)
+    if not os.path.exists(db_path):
+        return ""
+    with _get_conn(db_path, row_factory=True) as conn:
+        _init_summary_tables(conn)
+        row = conn.execute(
+            "SELECT summary_text FROM summaries WHERE session_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    return row[0] if row else ""
+
+
+def get_summaries(session_id, limit=5):
+    """获取最近 N 条摘要。"""
+    db_path = get_session_summaries_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    with _get_conn(db_path, row_factory=True) as conn:
+        _init_summary_tables(conn)
+        rows = conn.execute(
+            "SELECT summary_text, cover_turn_start, cover_turn_end, token_est "
+            "FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    return [{"text": r[0], "cover_start": r[1], "cover_end": r[2],
+             "token_est": r[3]} for r in rows]
+
+
+# ═══════════════════════════════════════════════
+# 旧数据迁移：chat_history.db → per-session
+# ═══════════════════════════════════════════════
+
+def migrate_old_chat_db():
+    """一次性：将旧 chat_history.db 的数据按 session_id 分拆到 per-session 目录。"""
+    from memory.config import OLD_CHAT_DB
+
+    if not os.path.exists(OLD_CHAT_DB):
+        return
+
+    conn = sqlite3.connect(OLD_CHAT_DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        # 获取所有不同的 session_id
+        rows = conn.execute(
+            "SELECT DISTINCT session_id FROM chat_history WHERE session_id IS NOT NULL"
+        ).fetchall()
+        session_ids = [r[0] for r in rows]
+
+        migrated = 0
+        for sid in session_ids:
+            msgs = conn.execute(
+                "SELECT trace_id, user_id, session_id, role, content, "
+                "msg_type, msg_id, created_at "
+                "FROM chat_history WHERE session_id = ? ORDER BY id",
+                (sid,),
+            ).fetchall()
+            if not msgs:
+                continue
+
+            db_path = get_session_messages_db(sid)
+            with _get_conn(db_path) as new_conn:
+                _init_chat_tables(new_conn)
+                for m in msgs:
+                    new_conn.execute(
+                        "INSERT INTO chat_history "
+                        "(trace_id, user_id, session_id, role, content, msg_type, msg_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (m["trace_id"], m["user_id"], m["session_id"],
+                         m["role"], m["content"],
+                         m["msg_type"] or "chat", m["msg_id"] or "",
+                         m["created_at"]),
+                    )
+            migrated += len(msgs)
+
+        conn.close()
+        if migrated > 0:
+            # 备份旧文件
+            backup = OLD_CHAT_DB + ".bak"
+            if not os.path.exists(backup):
+                os.rename(OLD_CHAT_DB, backup)
+            print(f"[Memory] 迁移完成：{len(session_ids)} 个会话，{migrated} 条消息 → per-session 目录")
+    except Exception as e:
+        print(f"[Memory] 旧数据迁移失败: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass

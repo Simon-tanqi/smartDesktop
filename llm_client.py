@@ -97,8 +97,25 @@ def save_config(backend, api_key=None, model="deepseek-chat", base_url="https://
 
 
 # ================== 通用 AI 调用接口 ==================
-# 运行时加载配置
-AI_CONFIG = load_config()
+# 惰性加载配置（不再作为模块级全局变量暴露解密后的 API Key）
+_config_cache = None
+
+def _load_config():
+    """内部惰性加载，调用方不直接访问。"""
+    global _config_cache
+    if _config_cache is None:
+        _config_cache = load_config()
+    return _config_cache
+
+def get_config():
+    """获取完整配置的浅拷贝（避免调用方意外修改缓存）。"""
+    return dict(_load_config())
+
+def get_api_key():
+    return _load_config().get("api_key", "")
+
+def get_base_url():
+    return _load_config().get("base_url", "https://api.deepseek.com")
 
 # ── 可配置的 LLM 参数 ──
 # 后续可从前端读取覆盖；当前默认值为 0.3（Agent 场景需要一定随机性）
@@ -113,13 +130,13 @@ def ai_concat(messages, model_name=None, provider=None, trace_id=""):
     model_name: 可选模型名，若不传则使用配置或默认值。
     trace_id: 可选追踪 ID，用于日志关联。
     """
-    backend = (provider or AI_CONFIG.get("backend", "ollama")).lower().strip()
+    backend = (provider or _load_config().get("backend", "ollama")).lower().strip()
 
     if backend == "ollama":
-        return _ollama_call(messages, model_name or AI_CONFIG.get("model", "deepseek-r1:7b"), trace_id=trace_id)
+        return _ollama_call(messages, model_name or _load_config().get("model", "deepseek-r1:7b"), trace_id=trace_id)
     else:
         # OpenAI 兼容 API（DeepSeek / 豆包 / 千问 等）
-        resolved_model = model_name or AI_CONFIG.get("model", "deepseek-chat")
+        resolved_model = model_name or _load_config().get("model", "deepseek-chat")
         # ── 模型名校验：过滤明显非 OpenAI 兼容模型名 ──
         if not resolved_model or "/" in resolved_model or "\\" in resolved_model:
             print(f"⚠️ 模型名异常 '{resolved_model}'，回退为 deepseek-chat")
@@ -128,8 +145,8 @@ def ai_concat(messages, model_name=None, provider=None, trace_id=""):
             print(f"⚠️ 模型名 '{resolved_model}' 疑似 Ollama 风格（含冒号），但后端为 {backend}，回退为 deepseek-chat")
             resolved_model = "deepseek-chat"
         return _deepseek_call(messages, resolved_model,
-                              AI_CONFIG.get("api_key", ""),
-                              AI_CONFIG.get("base_url", "https://api.deepseek.com"),
+                              _load_config().get("api_key", ""),
+                              _load_config().get("base_url", "https://api.deepseek.com"),
                               trace_id=trace_id)
 
 def _ollama_call(messages, model, trace_id=""):
@@ -179,7 +196,7 @@ def _ollama_call(messages, model, trace_id=""):
         return None
 
 
-def _ollama_call_stream(messages, model, trace_id=""):
+def _ollama_call_stream(messages, model, trace_id="", format=None):
     """Ollama 流式调用 — 逐步产出思考过程 chunk，最后产出完整结果"""
     url = "http://localhost:11434/api/chat"
     payload = {
@@ -187,8 +204,9 @@ def _ollama_call_stream(messages, model, trace_id=""):
         "messages": messages,
         "stream": True,
         "options": {"temperature": DEFAULT_TEMPERATURE},
-        "format": "json"
     }
+    if format:
+        payload["format"] = format
     t0 = time.perf_counter()
     try:
         response = requests.post(url, json=payload, stream=True, timeout=(30, 120))
