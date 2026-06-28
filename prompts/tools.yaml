@@ -1,0 +1,287 @@
+# ============================================================
+# MyAgent 工具声明式配置 - 唯一真相源
+# ============================================================
+
+always_inject:
+  - execute_command
+  - run_python
+  - write_file
+  - read_file
+  - scan_directory
+  - web_download
+  - search_files
+  - modify_registry
+  - get_project_summary
+
+tools:
+  scan_directory:
+    desc: 扫描目录第一层，返回 JSON 数组 [path必须已存在]
+
+  search_files:
+    desc: 按文件名关键词递归搜索文件（深度3层，跳过系统目录）。全盘深搜用 execute_command 的 Get-ChildItem -Recurse
+    params:
+      keyword: {type: str, desc: 文件名关键词}
+      search_path: {type: str, optional: true, desc: 搜索起始路径，默认用户目录及D/E/F盘}
+      file_extensions: {type: list, optional: true, desc: '扩展名过滤如[".pdf"]'}
+    note: max_results=5；无匹配返回空数组
+
+  read_file:
+    desc: 读取文件内容（可指定行范围），1-based
+    params:
+      file_path: {type: str, desc: 绝对路径}
+      start_line: {type: int, optional: true, desc: 起始行}
+      end_line: {type: int, optional: true, desc: 结束行}
+    note: 大文件(>200行)必须分页
+
+  write_file:
+    desc: 创建新文件，自动建父目录，已存在则重命名
+
+  execute_command:
+    desc: 执行Windows终端命令（PowerShell）。免确认列表(dir/copy/python/reg等)直接执行；列表外弹出确认
+    note: 禁止 rm -rf/format/shutdown。超时30s
+
+  run_python:
+    desc: 执行Python脚本（pandas+openpyxl+matplotlib+xlsxwriter 可用）
+    params:
+      code: {type: str, desc: 完整Python代码，用print()输出}
+      timeout: {type: int, default: 300}
+    note: 不可用input()
+
+  replace_in_file:
+    desc: 精确字符串替换，修改已有文件
+    params:
+      file_path: {type: str, desc: 文件绝对路径}
+      old_str: {type: str, desc: 要替换的原文本}
+      new_str: {type: str, desc: 新文本}
+    note: 默认唯一匹配
+
+  search_content:
+    desc: 按内容搜索代码文件，返回文件:行号
+    params:
+      keyword: {type: str, desc: 搜索关键词}
+      path: {type: str, desc: 搜索路径}
+      file_pattern: {type: str, optional: true, desc: 文件通配符如"*.py"}
+
+  get_workspace_path:
+    desc: 返回项目工作空间绝对路径
+    note: 无参数
+
+  get_project_summary:
+    desc: 返回项目结构概览（子目录+关键文件列表）
+    note: 无参数
+
+  web_search:
+    desc: 网页搜索，返回标题+链接+摘要列表
+    params: {query: {type: str, desc: 搜索关键词}}
+
+  fetch_webpage:
+    desc: 抓取网页正文（Markdown）
+    params: {url: {type: str, desc: 网页URL}}
+    note: 优先用移动端URL
+
+  fetch_multiple:
+    desc: 批量抓取网页
+    params: {urls: {type: list, desc: URL列表}}
+
+  get_weather:
+    desc: 查询天气，默认深圳
+    params: {city: {type: str, default: 深圳}}
+
+  web_download:
+    desc: 下载文件到本地（PDF/图片/音视频/Office），安全白名单过滤
+    params:
+      url: {type: str, desc: 文件直链}
+      output_dir: {type: str, optional: true, desc: 默认用户Downloads}
+
+  modify_registry:
+    desc: 安全修改注册表（仅HKCU）。参数 command — 完整 reg 命令字符串
+    note: add 前自动验证目标键是否存在
+
+  append_to_log:
+    desc: 追加文本到日志文件
+    params:
+      file_path: {type: str, desc: 日志文件路径}
+      content: {type: str, desc: 追加内容}
+
+  remember_user_info:
+    desc: 持久化存储用户信息
+    params:
+      key: {type: str, desc: 信息键}
+      value: {type: str, desc: 信息值}
+
+domains:
+  code_generate:
+    keywords:
+      - 代码
+      - 生成
+      - 写一个
+      - 编程
+      - 脚本
+      - 函数
+      - 类
+      - 程序
+      - 项目
+      - 模块
+      - 重构
+      - 实现
+      - 开发
+      - 前端
+      - 后端
+      - api
+      - 接口
+      - 算法
+      - 排序
+      - 爬虫
+      - 正则
+      - sql
+    tools:
+      - get_workspace_path
+      - search_content
+      - replace_in_file
+      - search_files
+      - get_project_summary
+
+  web_browse:
+    keywords:
+      - 搜索
+      - 查询
+      - 天气
+      - 新闻
+      - 网页
+      - 链接
+      - 上网
+      - 百度
+      - google
+      - 互联网
+      - 最新
+      - 实时
+      - 热点
+      - 汇率
+      - 股价
+      - 比赛
+      - 比分
+    tools:
+      - web_search
+      - fetch_webpage
+      - fetch_multiple
+      - get_weather
+      - web_download
+
+  system_config:
+    keywords:
+      - 注册表
+      - 安装软件
+      - 卸载
+      - 系统设置
+      - 壁纸
+      - 主题
+      - 配置
+      - 服务
+      - 进程
+      - 启动项
+      - 环境变量
+      - 驱动
+      - 任务管理器
+      - 控制面板
+      - 磁盘管理
+      - 设备管理器
+      - 文件资源管理器
+      - 资源管理器
+      - 显示秒
+      - 日期时间
+      - 右键菜单
+      - 任务栏
+      - 桌面图标
+    tools:
+      - modify_registry
+      - web_search
+      - fetch_webpage
+
+  user_memory:
+    keywords:
+      - 记住
+      - 我叫
+      - 我的名字
+      - 记忆
+      - 我的爱好
+      - 我的目标
+      - 我的信息
+      - 个人信息
+      - 记一下
+    tools: []
+
+  db_query:
+    keywords:
+      - 数据库
+      - sql
+      - 数据表
+      - 表结构
+      - 建表
+      - 字段
+      - 连接
+      - mongodb
+      - mysql
+    tools: []
+
+  data_excel:
+    keywords:
+      - excel
+      - 表格
+      - 数据清洗
+      - 透视
+      - 透视表
+      - 图表
+      - csv
+      - xlsx
+      - xls
+      - 数据分析
+      - 统计分析
+      - 数据可视化
+      - 合并表格
+      - 拆分表格
+      - 去重
+      - 筛选数据
+      - 排序数据
+      - 求和
+      - 平均值
+      - 制作报表
+    tools:
+      - run_python
+      - read_file
+      - write_file
+      - search_files
+      - web_download
+
+personas:
+  architect:
+    - 架构师
+    - 架构分析
+    - 系统设计
+    - 用架构师
+  code_review:
+    - 代码审查
+    - code review
+    - 审查代码
+    - 审查一下
+  product_manager:
+    - 产品经理
+    - 产品规划
+    - 需求分析
+    - 需求文档
+    - prd
+  debugger:
+    - 调试
+    - debug
+    - 排查bug
+    - 排查 bug
+    - 帮我调试
+  growth:
+    - 增长
+    - 用户获取
+    - 运营策略
+    - 增长方案
+  boss:
+    - 商业决策
+    - 老板模式
+    - 投入产出
+    - roi

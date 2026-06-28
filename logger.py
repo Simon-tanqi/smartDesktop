@@ -150,25 +150,34 @@ class StructuredLogger:
     def log_llm_call(self, trace_id: str, session_id: str, turn_index: int,
                      messages: list[dict], response: str,
                      model_name: str = "", provider: str = "",
-                     elapsed_ms: int = 0, token_estimate: int = 0):
+                     elapsed_ms: int = 0, token_estimate: int = 0,
+                     session_name: str = ""):
         """
         记录 LLM 调用：
         - 元信息（摘要）写入 JSON Lines 检索层
-        - 完整 messages + response 写入独立文件，按 trace_id 定位
+        - 仅保留当前轮 messages（system prompt + 当前用户消息 + 尾部 system 注入），
+          写入独立文件 `{session_name}_{session_id}_turn{N}.json`
         """
         date_str = datetime.now().strftime("%Y-%m-%d")
 
         # ── 完整内容另存 ──
         llm_dir = LOG_DIR / "llm_calls" / date_str
         llm_dir.mkdir(parents=True, exist_ok=True)
-        full_path = llm_dir / f"{trace_id}_turn{turn_index}.json"
+        safe_name = session_name.replace(" ", "_") if session_name else "untitled"
+        full_path = llm_dir / f"{safe_name}_{session_id}_turn{turn_index}.json"
 
-        prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        # 仅保留当前轮 messages：system prompt + 当前轮 user 消息 + 尾部 system 注入
+        filtered = [messages[0]]  # system prompt
+        user_idx = 2 * turn_index + 1
+        if user_idx < len(messages):
+            filtered.append(messages[user_idx])
+        if len(messages) > user_idx + 1:
+            filtered.extend(messages[user_idx + 1:])
+
+        prompt_chars = sum(len(str(m.get("content", ""))) for m in filtered)
         response_chars = len(response)
 
         with open(full_path, "w", encoding="utf-8") as f:
-            # Token优化：完整 messages 写入磁盘较耗 I/O（每轮数 KB）
-            # 仅当 LOG_FULL_LLM_MESSAGES=1 时全量保存；默认只保存摘要
             payload = {
                 "trace_id": trace_id,
                 "session_id": session_id,
@@ -177,13 +186,8 @@ class StructuredLogger:
                 "elapsed_ms": elapsed_ms,
                 "token_estimate": token_estimate,
                 "response": response,
+                "messages": filtered,
             }
-            if os.environ.get("LOG_FULL_LLM_MESSAGES") == "1":
-                payload["messages"] = messages
-            else:
-                payload["messages_count"] = len(messages)
-                payload["messages_keys"] = [m.get("role") for m in messages[:20]]
-                payload["messages_sample"] = messages[:2] if len(messages) >= 2 else messages
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
         # ── 元信息写入检索层 ──
@@ -194,13 +198,18 @@ class StructuredLogger:
                   prompt_chars=prompt_chars, response_chars=response_chars,
                   full_path=str(full_path))
 
-    def get_llm_call_file(self, trace_id: str, turn: int) -> str | None:
-        """根据 trace_id 和 turn 定位完整 LLM 调用文件。扫描最近 7 天的 llm_calls 目录。"""
+    def get_llm_call_file(self, session_id: str, turn: int) -> str | None:
+        """根据 session_id 和 turn 定位完整 LLM 调用文件。扫描最近 7 天的 llm_calls 目录。
+        文件名格式 `{session_name}_{session_id}_turn{N}.json`，用 glob 匹配 session_id 段。"""
         for days_ago in range(7):
             date_str = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-            candidate = LOG_DIR / "llm_calls" / date_str / f"{trace_id}_turn{turn}.json"
-            if candidate.exists():
-                return str(candidate)
+            llm_dir = LOG_DIR / "llm_calls" / date_str
+            if not llm_dir.exists():
+                continue
+            pattern = f"*_{session_id}_turn{turn}.json"
+            hits = list(llm_dir.glob(pattern))
+            if hits:
+                return str(hits[0])
         return None
 
     # ── 查询接口 ──

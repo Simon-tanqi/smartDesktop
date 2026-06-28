@@ -67,6 +67,19 @@
         
         #newChatBtn:hover { transform: scale(1.1); }
         
+        #settingsBtn {
+            background: transparent;
+            color: #95a5a6;
+            border: 1px solid #34495e;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        #settingsBtn:hover { color: white; border-color: #667eea; transform: rotate(45deg); }
+        
         .session-list {
             list-style: none;
             padding: 10px;
@@ -383,6 +396,69 @@
             border-radius: 25px;
             font-size: 16px;
             cursor: pointer;
+            transition: background 0.3s;
+        }
+        #sendButton.sending {
+            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+            animation: pulse-stop 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse-stop {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.5); }
+            50% { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0); }
+        }
+        
+        /* ── 文件上传组件 ── */
+        #uploadBtn {
+            padding: 12px 15px;
+            background: #f0f0f0;
+            color: #555;
+            border: 2px dashed #ccc;
+            border-radius: 25px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        #uploadBtn:hover { border-color: #667eea; color: #667eea; background: #f5f5ff; }
+        
+        .file-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding: 4px 0;
+        }
+        .file-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 10px;
+            background: #e8ecff;
+            border-radius: 12px;
+            font-size: 13px;
+            color: #333;
+            max-width: 200px;
+        }
+        .file-chip span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .file-chip .chip-remove {
+            cursor: pointer;
+            font-weight: bold;
+            color: #999;
+            font-size: 16px;
+            line-height: 1;
+        }
+        .file-chip .chip-remove:hover { color: #e74c3c; }
+        
+        .input-area.drag-over {
+            background: #f0f2ff;
+            border-radius: 16px;
+        }
+        .input-area.drag-over #messageInput,
+        .input-area.drag-over #uploadBtn {
+            border-color: #667eea;
         }
         .context-menu {
             display: none;
@@ -406,18 +482,295 @@
             background: #667eea;
             color: #fff;
         }
+
+        /* ── 设置面板 ── */
+        .settings-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+        }
+        .settings-overlay.open { display: flex; }
+        .settings-panel {
+            background: #1e293b;
+            color: #e2e8f0;
+            border-radius: 16px;
+            width: 680px;
+            max-height: 85vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            overflow: hidden;
+        }
+        .settings-header {
+            padding: 18px 24px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .settings-header h2 { margin: 0; font-size: 18px; color: #f1f5f9; }
+        .settings-close {
+            background: none; border: none; color: #94a3b8; font-size: 22px;
+            cursor: pointer; padding: 4px 8px; border-radius: 6px;
+        }
+        .settings-close:hover { background: #334155; color: white; }
+        .settings-body {
+            padding: 20px 24px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .settings-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #334155;
+            padding-bottom: 8px;
+        }
+        .settings-tab {
+            padding: 8px 16px;
+            border: none;
+            background: transparent;
+            color: #94a3b8;
+            cursor: pointer;
+            border-radius: 8px 8px 0 0;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .settings-tab:hover { color: #e2e8f0; background: #334155; }
+        .settings-tab.active { color: #60a5fa; background: #1e3a5f; border-bottom: 2px solid #60a5fa; }
+        .settings-tab.disabled { opacity: 0.4; cursor: not-allowed; }
+        .settings-section { display: none; }
+        .settings-section.active { display: block; }
+        .settings-section h3 {
+            margin: 0 0 16px 0;
+            font-size: 15px;
+            color: #cbd5e1;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #334155;
+        }
+        .model-card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: border-color 0.2s;
+        }
+        .model-card:hover { border-color: #60a5fa; }
+        .model-card.active { border-color: #22c55e; background: #0a1f0a; }
+        .model-card-info { flex: 1; }
+        .model-card-name { font-weight: 600; color: #f1f5f9; font-size: 14px; }
+        .model-card-detail { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+        .model-card-actions { display: flex; gap: 8px; align-items: center; }
+        .model-card-actions button {
+            padding: 5px 10px;
+            border-radius: 6px;
+            border: 1px solid #475569;
+            background: #1e293b;
+            color: #cbd5e1;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .model-card-actions button:hover { border-color: #60a5fa; color: #60a5fa; }
+        .model-card-actions button.danger:hover { border-color: #ef4444; color: #ef4444; }
+        .model-card-actions button.set-active { border-color: #22c55e; color: #22c55e; }
+        .btn-primary {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        .btn-primary:hover { background: #2563eb; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 5px;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 13px;
+            outline: none;
+        }
+        .form-group input:focus, .form-group select:focus {
+            border-color: #3b82f6;
+        }
+        .form-row { display: flex; gap: 12px; }
+        .form-row .form-group { flex: 1; }
+        .form-footer {
+            margin-top: 18px;
+            padding-top: 14px;
+            border-top: 1px solid #334155;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        .placeholder-text {
+            color: #64748b;
+            font-size: 13px;
+            text-align: center;
+            padding: 40px 0;
+        }
     </style>
 </head>
 <body>
+    <input type="file" id="fileInput" style="display:none" multiple>
     <div id="sessionContextMenu" class="context-menu">
         <div class="menu-item" data-action="rename">重命名</div>
+    </div>
+
+    <!-- 设置面板 -->
+    <div id="settingsOverlay" class="settings-overlay">
+        <div class="settings-panel">
+            <div class="settings-header">
+                <h2>&#9881; 系统配置</h2>
+                <button class="settings-close" id="settingsClose">&times;</button>
+            </div>
+            <div class="settings-body">
+                <div class="settings-tabs">
+                    <button class="settings-tab active" data-tab="models">模型配置</button>
+                    <button class="settings-tab" data-tab="profile">个人信息</button>
+                    <button class="settings-tab disabled" data-tab="workspace" title="开发中">工作区域</button>
+                    <button class="settings-tab disabled" data-tab="tools" title="开发中">自定义工具</button>
+                </div>
+
+                <!-- 模型配置 -->
+                <div id="tab-models" class="settings-section active">
+                    <h3>可用模型</h3>
+                    <div id="modelList"></div>
+                    <button class="btn-primary" id="addModelBtn" style="margin-top:12px">+ 添加模型</button>
+
+                    <div id="modelForm" style="display:none;margin-top:16px">
+                        <h3 id="modelFormTitle">添加模型</h3>
+                        <div class="form-group">
+                            <label>快速预设</label>
+                            <select id="mf_preset">
+                                <option value="">-- 手动填写 --</option>
+                                <option value="deepseek">DeepSeek</option>
+                                <option value="hunyuan">混元</option>
+                                <option value="qwen">通义千问</option>
+                                <option value="zhipu">智谱 GLM</option>
+                                <option value="doubao">豆包</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="ollama">Ollama 本地</option>
+                                <option value="custom">自定义</option>
+                            </select>
+                            <span id="presetWarning" style="display:none;color:#f59e0b;font-size:12px;margin-top:4px"></span>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>显示名称</label>
+                                <input type="text" id="mf_name" placeholder="如 DeepSeek V3">
+                            </div>
+                            <div class="form-group">
+                                <label>模型 ID</label>
+                                <input type="text" id="mf_model" placeholder="如 deepseek-chat">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>服务商</label>
+                                <select id="mf_provider">
+                                    <option value="deepseek">DeepSeek</option>
+                                    <option value="openai">OpenAI</option>
+                                    <option value="ollama">Ollama (本地)</option>
+                                    <option value="zhipu">智谱 (GLM)</option>
+                                    <option value="qwen">通义千问</option>
+                                    <option value="doubao">豆包</option>
+                                    <option value="custom">自定义</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>温度 (0-2)</label>
+                                <input type="number" id="mf_temperature" value="0.3" min="0" max="2" step="0.1">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>API Base URL</label>
+                            <input type="text" id="mf_base_url" placeholder="https://api.deepseek.com">
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>API Key</label>
+                                <input type="password" id="mf_api_key" placeholder="sk-...">
+                            </div>
+                            <div class="form-group" style="flex:0 0 100px;display:flex;align-items:flex-end">
+                                <label>&nbsp;</label>
+                                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:#94a3b8">
+                                    <input type="checkbox" id="mf_stream" checked> 流式
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-footer">
+                            <button class="settings-close" id="modelFormCancel" style="background:#334155;padding:8px 16px;border-radius:6px;border:none;color:#cbd5e1;cursor:pointer;font-size:13px">取消</button>
+                            <button class="btn-primary" id="modelFormSave">保存</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 个人信息 -->
+                <div id="tab-profile" class="settings-section">
+                    <h3>个人信息</h3>
+                    <div class="form-group">
+                        <label>称呼（如：老板）*</label>
+                        <input type="text" id="pf_nickname" placeholder="Agent 将以此称呼您">
+                    </div>
+                    <div class="form-group">
+                        <label>姓名</label>
+                        <input type="text" id="pf_name" placeholder="您的姓名（选填）">
+                    </div>
+                    <div class="form-group">
+                        <label>爱好</label>
+                        <input type="text" id="pf_hobbies" placeholder="如：编程、摄影、游戏（选填）">
+                    </div>
+                    <div class="form-group">
+                        <label>背景</label>
+                        <input type="text" id="pf_background" placeholder="如：全栈开发者、学生（选填）">
+                    </div>
+                    <div class="form-footer">
+                        <button class="btn-primary" id="profileSaveBtn">保存</button>
+                    </div>
+                </div>
+
+                <!-- 工作区域 (占位) -->
+                <div id="tab-workspace" class="settings-section">
+                    <div class="placeholder-text">工作区域配置 - 开发中</div>
+                </div>
+                <!-- 自定义工具 (占位) -->
+                <div id="tab-tools" class="settings-section">
+                    <div class="placeholder-text">自定义工具配置 - 开发中</div>
+                </div>
+            </div>
+        </div>
     </div>
     <div class="container">
         <!-- 1. 左侧：会话侧边栏 -->
         <div class="sidebar">
             <div class="sidebar-header">
                 <h2>对话历史</h2>
-                <button id="newChatBtn" title="新建对话">+</button>
+                <div style="display:flex;gap:6px">
+                    <button id="settingsBtn" title="配置">&#9881;</button>
+                    <button id="newChatBtn" title="新建对话">+</button>
+                </div>
             </div>
             <ul id="sessionList" class="session-list">
                 <!-- 会话列表将由 JS 动态生成 -->
@@ -466,9 +819,12 @@
                 
                 <!-- 输入框与发送按钮 -->
                 <div style="display: flex; gap: 10px;">
+                    <button id="uploadBtn" title="上传文件">📎 文件</button>
                     <input type="text" id="messageInput" placeholder="输入您的问题...">
                     <button id="sendButton">发送</button>
                 </div>
+                <!-- 已上传文件标签 -->
+                <div class="file-chips" id="fileChips"></div>
             </div>
         </div>
     </div>
@@ -486,6 +842,8 @@
 		let contextMenuTargetId = null;
 		// 问题6：自动滚动意图跟踪
 		let userScrolledUp = false;
+		// 文件上传：待发送附件列表
+		let pendingFiles = [];  // [{name, path}, ...]
 
 		// ============================
 		// 2. DOM 元素
@@ -912,23 +1270,97 @@
 			toolProgress.style.display = 'none';
 		}
 
+		// ============================
+		// 5.5 文件上传
+		// ============================
+		function renderFileChips() {
+			const container = document.getElementById('fileChips');
+			container.innerHTML = '';
+			pendingFiles.forEach((f, i) => {
+				const chip = document.createElement('span');
+				chip.className = 'file-chip';
+				chip.innerHTML = `<span title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
+					<span class="chip-remove" data-index="${i}">&times;</span>`;
+				container.appendChild(chip);
+			});
+			container.querySelectorAll('.chip-remove').forEach(el => {
+				el.addEventListener('click', (e) => {
+					const idx = parseInt(el.dataset.index);
+					pendingFiles.splice(idx, 1);
+					renderFileChips();
+				});
+			});
+		}
+
+		function escapeHtml(str) {
+			const d = document.createElement('div');
+			d.textContent = str;
+			return d.innerHTML;
+		}
+
+		async function uploadFiles(files) {
+			if (!currentSessionId) {
+				alert('请先选择或创建会话');
+				return;
+			}
+			for (const file of files) {
+				// 去重
+				if (pendingFiles.some(f => f.name === file.name && f.size === file.size)) continue;
+				const formData = new FormData();
+				formData.append('file', file);
+				formData.append('session_id', currentSessionId);
+				try {
+					const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+					const data = await resp.json();
+					if (data.success) {
+						pendingFiles.push({ name: data.file_name, path: data.file_path });
+					} else {
+						appendMessage('ai', `上传失败: ${data.message}`);
+					}
+				} catch (e) {
+					appendMessage('ai', `上传错误: ${e.message}`);
+				}
+			}
+			renderFileChips();
+		}
+
+		function removeAllFiles() {
+			pendingFiles = [];
+			renderFileChips();
+		}
+
 		async function sendMessage() {
 			const text = messageInput.value.trim();
-			if (!text || !currentSessionId || isSending) return;
+			if ((!text && pendingFiles.length === 0) || !currentSessionId || isSending) return;
 
-			// 立即清空输入框并禁用发送按钮（在任何可能抛异常的代码之前）
+			// 立即清空输入框，按钮切换为"停止"状态（允许点击中断）
 			isSending = true;
-			sendButton.disabled = true;
+			sendButton.textContent = '停止';
+			sendButton.classList.add('sending');
+			sendButton.disabled = false;
 			messageInput.value = '';
+			// 注入附件块
+			let finalMessage = text;
+			if (pendingFiles.length > 0) {
+				let attachBlock = '\n<attachments>';
+				for (const f of pendingFiles) {
+					attachBlock += `\n- [${f.name}](<${f.path}>)`;
+				}
+				attachBlock += '\n</attachments>';
+				finalMessage = text + attachBlock;
+			}
+			const sentFiles = [...pendingFiles];
+			pendingFiles = [];
+			renderFileChips();
 			// 问题4：捕获请求时的会话 ID，SSE 事件处理器全部用此值
 			const requestSessionId = currentSessionId;
 
 			try {
 			const userTimestamp = new Date().toISOString();
-			appendMessage('user', text, 'chat', userTimestamp);
+			appendMessage('user', finalMessage, 'chat', userTimestamp);
 			// 立即保存用户消息到本地缓存，避免流式过程中丢失
 			if (sessions[requestSessionId]) {
-				sessions[requestSessionId].messages.push({ sender: 'user', text: text, msgType: 'chat', timestamp: userTimestamp, msgId: generateUUID() });
+				sessions[requestSessionId].messages.push({ sender: 'user', text: finalMessage, msgType: 'chat', timestamp: userTimestamp, msgId: generateUUID() });
 			}
 
 			// 问题3：显示脉冲加载动画（替代纯文字 typing indicator）
@@ -962,8 +1394,15 @@
 			try {
 				const modelValue = modelSelect.value;
 				let modelChoice = null;
+				let modelId = null;
 				if (modelValue) {
-					try { modelChoice = JSON.parse(modelValue); } catch(e) {}
+					try {
+						const parsed = JSON.parse(modelValue);
+						modelChoice = { display: parsed.display };
+						modelId = parsed.id || null;
+					} catch(e) {
+						modelChoice = { display: modelValue };
+					}
 				}
 
 				// 问题4：每会话独立的 AbortController
@@ -972,9 +1411,10 @@
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
-						message: text,
+						message: finalMessage,
 						session_id: requestSessionId,
-						model_choice: modelChoice
+						model_choice: modelChoice,
+						model_id: modelId
 					}),
 					signal: sessionAbortControllers[requestSessionId].signal
 				});
@@ -1112,6 +1552,8 @@
 			// 问题4：清理该会话的 AbortController
 			delete sessionAbortControllers[requestSessionId];
 			isSending = false;
+			sendButton.textContent = '发送';
+			sendButton.classList.remove('sending');
 			sendButton.disabled = false;
 		}
 	}
@@ -1128,25 +1570,32 @@
 				modelSelect.innerHTML = '';
 				models.forEach(item => {
 					const option = document.createElement('option');
-					option.value = JSON.stringify(item);
+					option.value = JSON.stringify({ display: item.display, id: item.id || '' });
 					option.textContent = item.display || `${item.provider} - ${item.model}`;
 					modelSelect.appendChild(option);
 				});
 				// 问题5：优先读取 localStorage 中的模型选择，没有则回退到 DeepSeek
 				const savedModel = localStorage.getItem('selectedModel');
 				if (savedModel) {
-					const opt = Array.from(modelSelect.options).find(o => o.value === savedModel);
+					const opt = Array.from(modelSelect.options).find(o => {
+						try { return JSON.parse(o.value).display === savedModel; } catch(e) { return o.value === savedModel; }
+					});
 					if (opt) opt.selected = true;
 				}
-				if (!savedModel || !Array.from(modelSelect.options).some(o => o.value === savedModel && o.selected)) {
+				if (!savedModel || !modelSelect.value) {
 					const deepseekOpt = Array.from(modelSelect.options).find(opt => {
-						try { return JSON.parse(opt.value).provider === 'deepseek'; } catch(e) { return false; }
+						try { return JSON.parse(opt.value).display?.includes('DeepSeek'); } catch(e) { return false; }
 					});
 					if (deepseekOpt) deepseekOpt.selected = true;
 				}
 				// 问题5：选中变更时写入 localStorage（后台服务不重启就一直用此模型）
 				modelSelect.addEventListener('change', () => {
-					localStorage.setItem('selectedModel', modelSelect.value);
+					try {
+						const parsed = JSON.parse(modelSelect.value);
+						localStorage.setItem('selectedModel', parsed.display);
+					} catch(e) {
+						localStorage.setItem('selectedModel', modelSelect.value);
+					}
 				});
 			} catch (e) {
 				modelSelect.innerHTML = '<option value="">无法加载模型</option>';
@@ -1160,8 +1609,334 @@
 			}
 			// 事件绑定
 			newChatBtn.addEventListener('click', () => createNewSession());
-			sendButton.addEventListener('click', sendMessage);
+			sendButton.addEventListener('click', () => {
+				if (isSending) {
+					// 停止当前请求
+					const ctrl = sessionAbortControllers[currentSessionId];
+					if (ctrl) ctrl.abort();
+				} else {
+					sendMessage();
+				}
+			});
 			messageInput.addEventListener('keypress', (e) => e.key === 'Enter' && sendMessage());
+
+			// ── 文件上传事件 ──
+			const fileInput = document.getElementById('fileInput');
+			const uploadBtn = document.getElementById('uploadBtn');
+			const inputArea = document.querySelector('.input-area');
+
+			uploadBtn.addEventListener('click', () => fileInput.click());
+			fileInput.addEventListener('change', () => {
+				if (fileInput.files.length > 0) {
+					uploadFiles(fileInput.files);
+					fileInput.value = '';
+				}
+			});
+
+			// 拖拽上传
+			inputArea.addEventListener('dragover', (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				inputArea.classList.add('drag-over');
+			});
+			inputArea.addEventListener('dragleave', (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				inputArea.classList.remove('drag-over');
+			});
+			inputArea.addEventListener('drop', (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				inputArea.classList.remove('drag-over');
+				if (e.dataTransfer.files.length > 0) {
+					uploadFiles(e.dataTransfer.files);
+				}
+			});
+
+			// 剪贴板粘贴上传
+			document.addEventListener('paste', (e) => {
+				const items = e.clipboardData?.items;
+				if (!items) return;
+				const files = [];
+				for (const item of items) {
+					if (item.kind === 'file') {
+						files.push(item.getAsFile());
+					}
+				}
+				if (files.length > 0) {
+					e.preventDefault();
+					uploadFiles(files);
+				}
+			});
+
+			// ═══════════════════════════════════════════
+			// 设置面板 - 模型配置
+			// ═══════════════════════════════════════════
+			const settingsOverlay = document.getElementById('settingsOverlay');
+			const settingsBtn = document.getElementById('settingsBtn');
+			const settingsClose = document.getElementById('settingsClose');
+			const modelList = document.getElementById('modelList');
+			const modelForm = document.getElementById('modelForm');
+			const addModelBtn = document.getElementById('addModelBtn');
+			const modelFormCancel = document.getElementById('modelFormCancel');
+			const modelFormSave = document.getElementById('modelFormSave');
+			const modelFormTitle = document.getElementById('modelFormTitle');
+
+			let modelsConfig = { models: [], active_model_id: '' };
+			let editingModelIndex = -1;
+
+			function openSettings() {
+				settingsOverlay.classList.add('open');
+				loadModelsConfig();
+				loadUserProfile();
+			}
+			function closeSettings() {
+				settingsOverlay.classList.remove('open');
+				modelForm.style.display = 'none';
+			}
+
+			settingsBtn.addEventListener('click', openSettings);
+			settingsClose.addEventListener('click', closeSettings);
+			settingsOverlay.addEventListener('click', (e) => {
+				if (e.target === settingsOverlay) closeSettings();
+			});
+
+			// Tab 切换
+			document.querySelectorAll('.settings-tab').forEach(tab => {
+				tab.addEventListener('click', () => {
+					if (tab.classList.contains('disabled')) return;
+					document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
+					document.querySelectorAll('.settings-section').forEach(s => s.classList.remove('active'));
+					tab.classList.add('active');
+					const sec = document.getElementById('tab-' + tab.dataset.tab);
+					if (sec) sec.classList.add('active');
+				});
+			});
+
+			async function loadModelsConfig() {
+				try {
+					const res = await fetch('/api/config/models');
+					const data = await res.json();
+					if (data.success) {
+						modelsConfig = data;
+						renderModelList();
+					}
+				} catch (e) {
+					console.error('加载模型配置失败:', e);
+				}
+			}
+
+			function renderModelList() {
+				modelList.innerHTML = '';
+				if (!modelsConfig.models || modelsConfig.models.length === 0) {
+					modelList.innerHTML = '<div class="placeholder-text">暂无模型，点击下方添加</div>';
+					return;
+				}
+				modelsConfig.models.forEach((m, i) => {
+					const isActive = m.id === modelsConfig.active_model_id;
+					const card = document.createElement('div');
+					card.className = 'model-card' + (isActive ? ' active' : '');
+					card.innerHTML = `
+						<div class="model-card-info">
+							<div class="model-card-name">${m.name || m.model}${isActive ? ' &#10003;' : ''}</div>
+							<div class="model-card-detail">${m.provider} &middot; ${m.model} &middot; temp=${m.temperature || 0.3} &middot; ${m.base_url || ''}</div>
+						</div>
+						<div class="model-card-actions">
+							${!isActive ? `<button class="set-active" onclick="setActiveModel('${m.id}')">启用</button>` : '<span style="color:#22c55e;font-size:12px">当前使用</span>'}
+							<button onclick="editModel(${i})">编辑</button>
+							<button class="danger" onclick="deleteModel(${i})">删除</button>
+						</div>
+					`;
+					modelList.appendChild(card);
+				});
+			}
+
+			function showModelForm(model = null, index = -1) {
+				editingModelIndex = index;
+				modelFormTitle.textContent = model ? '编辑模型' : '添加模型';
+				document.getElementById('mf_name').value = model?.name || '';
+				document.getElementById('mf_model').value = model?.model || '';
+				document.getElementById('mf_provider').value = model?.provider || 'deepseek';
+				document.getElementById('mf_temperature').value = model?.temperature ?? 0.3;
+				document.getElementById('mf_base_url').value = model?.base_url || 'https://api.deepseek.com';
+				document.getElementById('mf_api_key').value = model?.api_key || '';
+				document.getElementById('mf_stream').checked = model?.stream !== false;
+				modelForm.style.display = 'block';
+			}
+
+			addModelBtn.addEventListener('click', () => showModelForm());
+			modelFormCancel.addEventListener('click', () => { modelForm.style.display = 'none'; editingModelIndex = -1; });
+
+			modelFormSave.addEventListener('click', async () => {
+				const name = document.getElementById('mf_name').value.trim();
+				const modelId = document.getElementById('mf_model').value.trim();
+				if (!name || !modelId) { alert('名称和模型 ID 不能为空'); return; }
+				const m = {
+					id: modelId,
+					name: name,
+					provider: document.getElementById('mf_provider').value,
+					model: modelId,
+					temperature: parseFloat(document.getElementById('mf_temperature').value) || 0.3,
+					base_url: document.getElementById('mf_base_url').value.trim(),
+					api_key: document.getElementById('mf_api_key').value.trim(),
+					stream: document.getElementById('mf_stream').checked
+				};
+				if (editingModelIndex >= 0) {
+					m.id = modelsConfig.models[editingModelIndex].id;
+					modelsConfig.models[editingModelIndex] = m;
+				} else {
+					modelsConfig.models.push(m);
+				}
+				await saveModelsConfig();
+				modelForm.style.display = 'none';
+				editingModelIndex = -1;
+			});
+
+			window.editModel = function(index) {
+				showModelForm(modelsConfig.models[index], index);
+			};
+
+			window.deleteModel = async function(index) {
+				if (!confirm('确定删除该模型？')) return;
+				modelsConfig.models.splice(index, 1);
+				if (modelsConfig.active_model_id === modelsConfig.models[index]?.id) {
+					modelsConfig.active_model_id = modelsConfig.models[0]?.id || '';
+				}
+				await saveModelsConfig();
+			};
+
+			window.setActiveModel = async function(id) {
+				modelsConfig.active_model_id = id;
+				await saveModelsConfig();
+			};
+
+			async function saveModelsConfig() {
+				try {
+					const res = await fetch('/api/config/models', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify(modelsConfig)
+					});
+					const data = await res.json();
+					if (data.success) {
+						renderModelList();
+						await refreshModelSelect();
+					} else {
+						alert('保存失败: ' + (data.message || ''));
+					}
+				} catch (e) {
+					alert('保存失败: ' + e.message);
+				}
+			}
+
+			async function refreshModelSelect() {
+				try {
+					const res = await fetch('/api/models');
+					const models = await res.json();
+					const savedModel = localStorage.getItem('selectedModel');
+					modelSelect.innerHTML = '';
+					models.forEach(m => {
+						const opt = document.createElement('option');
+						opt.value = JSON.stringify({ display: m.display, id: m.id || '' });
+						opt.textContent = m.display;
+						modelSelect.appendChild(opt);
+					});
+					if (savedModel) {
+						const opt = Array.from(modelSelect.options).find(o => {
+							try { return JSON.parse(o.value).display === savedModel; } catch(e) { return false; }
+						});
+						if (opt) opt.selected = true;
+					}
+				} catch (e) {
+					console.error('刷新模型列表失败:', e);
+				}
+			}
+
+			// ═══════════════════════════════════════════
+			// 个人信息
+			// ═══════════════════════════════════════════
+			async function loadUserProfile() {
+				try {
+					const res = await fetch('/api/config/user_profile');
+					const data = await res.json();
+					if (data.success && data.profile) {
+						document.getElementById('pf_nickname').value = data.profile.nickname || '';
+						document.getElementById('pf_name').value = data.profile.name || '';
+						document.getElementById('pf_hobbies').value = data.profile.hobbies || '';
+						document.getElementById('pf_background').value = data.profile.background || '';
+					}
+				} catch (e) { console.error('加载个人信息失败:', e); }
+			}
+
+			document.getElementById('profileSaveBtn').addEventListener('click', async () => {
+				const profile = {
+					nickname: document.getElementById('pf_nickname').value.trim(),
+					name: document.getElementById('pf_name').value.trim(),
+					hobbies: document.getElementById('pf_hobbies').value.trim(),
+					background: document.getElementById('pf_background').value.trim()
+				};
+				try {
+					const res = await fetch('/api/config/user_profile', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ profile })
+					});
+					const data = await res.json();
+					if (data.success) {
+						alert('个人信息已保存');
+					} else {
+						alert('保存失败: ' + (data.message || ''));
+					}
+				} catch (e) { alert('保存失败: ' + e.message); }
+			});
+
+			// 首次启动检测
+			try {
+				const res = await fetch('/api/config/first_run');
+				const data = await res.json();
+				if (data.first_run) {
+					setTimeout(() => {
+						document.querySelector('.settings-tab[data-tab="profile"]').click();
+						openSettings();
+					}, 500);
+				}
+			} catch (e) {}
+
+			// ═══════════════════════════════════════════
+			// 模型快速预设
+			// ═══════════════════════════════════════════
+			let presetsData = {};
+			async function loadPresets() {
+				try {
+					const res = await fetch('/api/config/model_presets');
+					const data = await res.json();
+					if (data.success) presetsData = data.presets;
+				} catch (e) { console.error('加载预设失败:', e); }
+			}
+			loadPresets();
+
+			document.getElementById('mf_preset').addEventListener('change', function() {
+				const key = this.value;
+				const preset = presetsData[key];
+				const warningEl = document.getElementById('presetWarning');
+				if (!preset) { warningEl.style.display = 'none'; return; }
+				document.getElementById('mf_provider').value = key;
+				document.getElementById('mf_base_url').value = preset.base_url || '';
+				document.getElementById('mf_temperature').value = preset.temperature || 0.7;
+				if (preset.warning) {
+					warningEl.textContent = preset.warning;
+					warningEl.style.display = 'block';
+				} else {
+					warningEl.style.display = 'none';
+				}
+				// 预设模型名
+				if (preset.models && preset.models.length > 0) {
+					document.getElementById('mf_model').value = preset.models[0];
+					document.getElementById('mf_name').value = preset.name + ' - ' + preset.models[0];
+				} else if (key === 'ollama') {
+					document.getElementById('mf_model').placeholder = '填写本地模型名，如 llama3';
+				}
+			});
 		});
 	</script>
 </body>

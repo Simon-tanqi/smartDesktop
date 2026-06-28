@@ -2,11 +2,16 @@
 import os
 import json
 import shutil
+import secrets
 from datetime import datetime
 import subprocess
 
 from . import register_tool, path_params
 from . import safe_exec
+
+# ── 确认令牌存储：阻止 LLM 自行加 confirmed=true 绕过确认 ──
+# token → (command, expiry_timestamp)
+_pending_confirmations: dict = {}
 
 SKIP_DIRS = {
     "Windows", "Program Files", "Program Files (x86)", "ProgramData",
@@ -86,19 +91,29 @@ def resolve_folder(parent_dir: str, target_name: str):
         return json.dumps({"success": False, "message": str(e)})
 
 
-# ── 命令白名单与危险拦截 ──
-ALLOWED_COMMANDS = {
-    "dir", "copy", "move", "del", "mkdir", "rmdir", "echo", "type",
-    "findstr", "where", "python", "pip", "git", "npm", "node",
-    "systeminfo", "wmic", "winget", "msiexec", "taskkill",
-}
-FORBIDDEN_PATTERNS = ["rm -rf /", "del /f /s", "format", "shutdown"]
+# ── 命令白名单已移除（2025-06-26）──
+# 原 ALLOWED_COMMANDS 硬拒绝已替换为「免确认列表 + 确认弹窗」两级机制：
+#   - 免确认列表内的命令直接执行（静默）
+#   - 列表外的命令弹出确认，用户看到完整命令后决定（类似 msiexec 确认流程）
+# 危险命令（reg delete 等）由 safe_exec 挑战短语兜底
+FORBIDDEN_PATTERNS = ["rm -rf /", "del /f /s", "format ", "shutdown"]  # "format " 带空格仅拦截 format 磁盘格式化命令，不影响 Format-Table/Format-List
 
-# 需要用户确认的命令模式（在白名单内但操作敏感）
-CONFIRM_REQUIRED_PATTERNS = [
-    "msiexec /x",          # 卸载 MSI 产品
-    "msiexec /uninstall",  # 卸载 MSI 产品
-]
+# 注册表写入命令：直接拒绝，引导 LLM 使用 modify_registry 工具
+REGISTRY_WRITE_COMMANDS = ["reg add", "reg delete", "reg import"]
+REGISTRY_WRITE_REDIRECT_MSG = (
+    "注册表写入操作已被 execute_command 拦截（安全限制）。\n"
+    "请改用 modify_registry 工具，调用格式: modify_registry(command='你的完整 reg add 命令')\n"
+    "示例: modify_registry(command='reg add \"HKCU\\\\Control Panel\\\\International\" /v sShortTime /t REG_SZ /d HH:mm:ss /f')\n"
+    "该工具内置自动验证和路径推荐机制，无需先用 reg query 检查。"
+)
+
+# 免确认程序列表：这些程序执行时不弹确认窗，直接透传执行
+SKIP_CONFIRM_PROGRAMS = {
+    "dir", "copy", "move", "del", "mkdir", "rmdir", "echo", "type",
+    "findstr", "where", "python", "pip",
+    "git", "npm", "node", "npx", "yarn",
+    "systeminfo", "wmic", "tasklist", "reg",  # reg query 只读安全；reg add/delete 由 REGISTRY_WRITE_COMMANDS 硬拦截
+}
 
 # ── 命令预检：低效/错误模式（代码层拦截，不靠 LLM 自觉）──
 # 命中后不执行命令，直接返回错误信息指引正确方向
@@ -141,61 +156,89 @@ def _log_confirmation(command: str, status: str, detail: str = ""):
 
 @register_tool
 def execute_command(command: str, working_dir: str = None, confirmed: bool = False,
-                    challenge_response: str = None, challenge_token: str = None) -> str:
+                    challenge_response: str = None, challenge_token: str = None,
+                    confirmation_token: str = None) -> str:
     """在终端执行一条命令。
+
+    安全机制（两级）：
+    1. 免确认列表检查：dir/copy/git/python 等常用命令直接执行；powershell/reg/winget 等
+       不在免确认列表的命令弹出确认，用户看到完整命令后决定。
+    2. safe_exec 四层防护：L0路径保护 + L1挑战短语 + L2危险检测 + L3 subprocess.run(shell=False)。
 
     command: 完整命令字符串。
     working_dir: 可选工作目录。
-    confirmed: 对于需要确认的命令（如 msiexec 卸载），首次调用设为 false，系统会返回确认需求；
-               用户确认后在第二轮调用中设为 true 执行。
+    confirmed: 收到 confirmation_required 后，用户回复"确认"时设为 true 重新调用。
     challenge_response: 危险操作授权文本（用户完整打出挑战短语后传入）。
     challenge_token: 挑战令牌（safe_exec 返回的临时凭证）。
     """
-    try:
-        # 仅提取第一个 token 做程序名白名单检查，不使用 shlex.split
-        # shlex 是 POSIX 解析器，会误处理 PowerShell 的反斜杠路径（\t→TAB 等）
-        stripped = command.lstrip()
-        if not stripped:
-            return json.dumps({"success": False, "message": "空命令"})
-        # 提取第一个 token（支持双引号/单引号包裹）
-        first_token = ""
+    # ── 命令确认检查：提取第一个可执行程序名，不在免确认列表则弹确认窗 ──
+    # 用户可在 UI 看到完整命令后决定是否执行
+    stripped = command.lstrip()
+    if not stripped:
+        return json.dumps({"success": False, "message": "空命令"})
+
+    # 提取第一个 token（支持双引号/单引号包裹）
+    first_token = ""
+    i = 0
+    if stripped[0] == '"':
+        i = 1
+        while i < len(stripped) and stripped[i] != '"':
+            i += 1
+        first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
+    elif stripped[0] == "'":
+        i = 1
+        while i < len(stripped) and stripped[i] != "'":
+            i += 1
+        first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
+    else:
         i = 0
-        if stripped[0] == '"':
-            i = 1
-            while i < len(stripped) and stripped[i] != '"':
-                i += 1
-            first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
-        elif stripped[0] == "'":
-            i = 1
-            while i < len(stripped) and stripped[i] != "'":
-                i += 1
-            first_token = stripped[1:i] if i < len(stripped) else stripped[1:]
+        while i < len(stripped) and stripped[i] not in (' ', '\t'):
+            i += 1
+        first_token = stripped[:i]
+
+    prog = os.path.basename(first_token).lower()
+    if prog and prog not in SKIP_CONFIRM_PROGRAMS:
+        # 清理过期令牌（5分钟有效期）
+        _now = datetime.now().timestamp()
+        _pending_confirmations.clear()  # 单令牌模式：每次只保留最新一个
+        if not confirmed:
+            # 生成一次性确认令牌，LLM 无法伪造
+            _token = secrets.token_hex(8)
+            _pending_confirmations[_token] = (command, _now + 300)
+            _log_confirmation(command, "CONFIRM_REQUIRED", f"程序 '{first_token}' 不在免确认列表 | token={_token}")
+            return json.dumps({
+                "confirmation_required": True,
+                "confirmation_token": _token,
+                "message": f"即将执行命令（程序 '{first_token}' 需要确认）:\n{command}\n\n请在界面点击确认以执行此命令。",
+                "command": command
+            }, ensure_ascii=False)
         else:
-            i = 0
-            while i < len(stripped) and stripped[i] not in (' ', '\t'):
-                i += 1
-            first_token = stripped[:i]
-        prog = os.path.basename(first_token).lower()
-    except Exception:
-        return json.dumps({"success": False, "message": "命令解析失败。"})
-    if prog not in ALLOWED_COMMANDS:
-        return json.dumps({"success": False, "message": f"安全限制：不允许执行程序 '{first_token}'。白名单: {list(ALLOWED_COMMANDS)}"})
+            # 验证令牌
+            if not confirmation_token or confirmation_token not in _pending_confirmations:
+                # 可能是 LLM 自行加 confirmed=true 绕过，拒绝
+                _log_confirmation(command, "BYPASS_BLOCKED", f"LLM 尝试绕过确认，无有效令牌")
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "message": f"确认已失效或无有效令牌。请重新发起命令以获取新的确认提示。",
+                }, ensure_ascii=False)
+            # 令牌有效，清理并放行
+            del _pending_confirmations[confirmation_token]
+            _log_confirmation(command, "CONFIRMED", f"令牌验证通过")
 
     cmd_lower = command.lower()
     for pattern in FORBIDDEN_PATTERNS:
         if pattern.lower() in cmd_lower:
             return json.dumps({"success": False, "message": f"安全限制：命令包含禁止模式 '{pattern}'"})
 
-    # 确认检查：敏感操作（msiexec 卸载等）
-    if not confirmed:
-        for pattern in CONFIRM_REQUIRED_PATTERNS:
-            if pattern.lower() in cmd_lower:
-                _log_confirmation(command, "CONFIRM_REQUIRED", f"命中确认模式: {pattern}")
-                return json.dumps({
-                    "confirmation_required": True,
-                    "message": f"该命令需要确认后才能执行（匹配模式: {pattern}）。请将命令展示给用户，等待用户回复'确认'后，使用 confirmed=true 重新调用。",
-                    "command": command
-                }, ensure_ascii=False)
+    # ── 注册表写入拦截：reg add/delete/import 直接拒绝，引导 LLM 用 modify_registry ──
+    for _rw_cmd in REGISTRY_WRITE_COMMANDS:
+        if _rw_cmd in cmd_lower:
+            _log_confirmation(command, "REGISTRY_BLOCKED", f"命中注册表写入命令: {_rw_cmd}")
+            return json.dumps({
+                "success": False,
+                "message": REGISTRY_WRITE_REDIRECT_MSG,
+            }, ensure_ascii=False)
 
     # ── 命令预检：拦截低效/错误模式 ──
     import re as _re
@@ -271,6 +314,26 @@ def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT) -> str:
     - 文件操作优先在 work_space 目录下进行"""
     if not code or not code.strip():
         return json.dumps({"success": False, "message": "代码不能为空"})
+
+    # ── 注册表操作扫描：拦截 Python 中的注册表写入代码，引导 LLM 用 modify_registry ──
+    code_lower = code.lower()
+    _reg_indicators = [
+        "import winreg", "from winreg",
+        "os.system(\"reg ", "os.system('reg ",
+        "subprocess.run([\"reg", "subprocess.run(['reg",
+        "subprocess.call([\"reg", "subprocess.call(['reg",
+        "subprocess.popen([\"reg", "subprocess.popen(['reg",
+        "reg add", "reg delete", "reg import",
+    ]
+    for _indicator in _reg_indicators:
+        if _indicator in code_lower:
+            return json.dumps({
+                "success": False,
+                "message": (
+                    "Python 代码中包含注册表写入操作（检测到关键字），已被 run_python 拦截。\n"
+                    "请改用专用工具 modify_registry 来修改注册表，该工具内置自动验证和路径推荐机制。"
+                ),
+            }, ensure_ascii=False)
 
     import sys
     import tempfile

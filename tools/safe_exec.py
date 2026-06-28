@@ -85,18 +85,18 @@ DANGER_CHALLENGE_PHRASE = "我知晓此操作为危险操作，我确认授权�
 # ═══════════════════════════════════════════════
 
 DANGER_PATTERNS = [
-    # (正则, 中文描述)
-    (r"\bdel\b",           "删除文件"),
-    (r"\brmdir\b",         "删除目录"),
-    (r"\bformat\b",        "格式化磁盘"),
-    (r"\brmtree\b",        "递归删除目录"),
-    (r"\bshutil\.rmtree",  "递归删除目录"),
-    (r"\bRemove-Item\b.*-Recurse",  "强制递归删除"),
-    (r"\breg\s+delete\b",  "删除注册表项"),
-    (r"\btaskkill\b",      "强制结束进程"),
-    (r"\bStop-Process\b",  "强制结束进程"),
-    (r"\bStop-Service\b",  "停止系统服务"),
-    (r"\bClear-RecycleBin\b", "清空回收站"),
+    # (正则, 中文描述, 挑战级别: "light"=口头确认即可 / "challenge"=需挑战短语)
+    (r"\bdel\b",           "删除文件",        "challenge"),
+    (r"\brmdir\b",         "删除目录",        "challenge"),
+    (r"\bformat\b",        "格式化磁盘",      "challenge"),
+    (r"\brmtree\b",        "递归删除目录",    "challenge"),
+    (r"\bshutil\.rmtree",  "递归删除目录",    "challenge"),
+    (r"\bRemove-Item\b.*-Recurse",  "强制递归删除",  "challenge"),
+    (r"\breg\s+delete\b",  "删除注册表项",    "challenge"),
+    (r"\bClear-RecycleBin\b", "清空回收站",   "challenge"),
+    (r"\btaskkill\b",      "强制结束进程",    "light"),
+    (r"\bStop-Process\b",  "强制结束进程",    "light"),
+    (r"\bStop-Service\b",  "停止系统服务",    "light"),
 ]
 
 # 这些模式始终拦截，不进入挑战流程（无确认可能）
@@ -166,11 +166,11 @@ def _check_always_blocked(command):
 
 
 def _check_danger(command):
-    """检查是否命中危险模式，返回 (is_dangerous, danger_desc)"""
-    for pattern, desc in DANGER_PATTERNS:
+    """检查是否命中危险模式，返回 (is_dangerous, danger_desc, challenge_level)"""
+    for pattern, desc, level in DANGER_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
-            return True, desc
-    return False, ""
+            return True, desc, level
+    return False, "", ""
 
 
 def is_dangerous(command):
@@ -178,7 +178,7 @@ def is_dangerous(command):
     blocked = _check_always_blocked(command)
     if blocked:
         return True
-    danger, _ = _check_danger(command)
+    danger, _, _ = _check_danger(command)
     return danger
 
 
@@ -207,13 +207,17 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
     # ── TTL 过期清理（入口处执行一次）──
     _evict_stale_challenges()
 
-    # ── 挑战验证流程 ──
+    # ── 挑战验证流程（分级）──
     if challenge_response is not None and challenge_token:
         pending = _pending_challenges.pop(challenge_token, None)
         if not pending:
             _log("WARN", f"无效挑战令牌: {challenge_token[:8]}...")
             return {"success": False, "message": "挑战令牌无效或已过期，请重新发起操作"}
-        if challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
+        if not challenge_response or not challenge_response.strip():
+            _log("WARN", "挑战短语为空")
+            return {"success": False, "message": "授权文本为空，操作已取消"}
+        # 挑战级操作仍需匹配挑战短语
+        if pending.get("level") == "challenge" and challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
             _log("WARN", f"挑战短语不匹配: '{challenge_response[:40]}...'")
             return {"success": False, "message": "授权文本不匹配，操作已取消"}
         # 验证通过，恢复原始命令继续执行
@@ -232,27 +236,41 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"路径保护拦截 ({protected_hit}): {script[:120]}")
         return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
-    # ── 危险检测 → 发起挑战 ──
-    is_danger, danger_desc = _check_danger(script)
+    # ── 危险检测 → 发起挑战（分级提示）──
+    is_danger, danger_desc, danger_level = _check_danger(script)
     if is_danger:
         token = secrets.token_hex(16)
         _pending_challenges[token] = {
             "command": script,
             "desc": danger_desc,
+            "level": danger_level,
             "timestamp": datetime.now().isoformat(),
         }
-        _log("CHALLENGE", f"发起挑战: {danger_desc} | token={token[:8]}...")
-        return {
-            "challenge_required": True,
-            "challenge_token": token,
-            "danger_type": danger_desc,
-            "challenge_phrase": DANGER_CHALLENGE_PHRASE,
-            "message": (
-                f"检测到危险操作: {danger_desc}\n\n"
-                f"请完整输入以下授权文字以继续:\n"
-                f"「{DANGER_CHALLENGE_PHRASE}」"
-            ),
-        }
+        if danger_level == "challenge":
+            _log("CHALLENGE", f"发起挑战(挑战级): {danger_desc} | token={token[:8]}...")
+            return {
+                "challenge_required": True,
+                "challenge_token": token,
+                "danger_type": danger_desc,
+                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "message": (
+                    f"检测到危险操作: {danger_desc}\n\n"
+                    f"请完整输入以下授权文字以继续:\n"
+                    f"「{DANGER_CHALLENGE_PHRASE}」"
+                ),
+            }
+        else:
+            _log("CHALLENGE", f"发起挑战(轻量级): {danger_desc} | token={token[:8]}...")
+            return {
+                "challenge_required": True,
+                "challenge_token": token,
+                "danger_type": danger_desc,
+                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "message": (
+                    f"检测到操作: {danger_desc}\n\n"
+                    f"回复「确认」或「OK」即可执行，回复「取消」放弃。"
+                ),
+            }
 
     # ── 执行：subprocess.run(list, shell=False) ──
     cmd_list = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
@@ -296,13 +314,16 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
     # ── TTL 过期清理（入口处执行一次）──
     _evict_stale_challenges()
 
-    # ── 挑战验证 + 永久拦截 + 危险检测 ──
+    # ── 挑战验证（分级）──
     if challenge_response is not None and challenge_token:
         pending = _pending_challenges.pop(challenge_token, None)
         if not pending:
             _log("WARN", f"无效挑战令牌: {challenge_token[:8]}...")
             return {"success": False, "message": "挑战令牌无效或已过期"}
-        if challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
+        if not challenge_response or not challenge_response.strip():
+            return {"success": False, "message": "授权文本为空，操作已取消"}
+        # 挑战级操作仍需匹配挑战短语
+        if pending.get("level") == "challenge" and challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
             return {"success": False, "message": "授权文本不匹配，操作已取消"}
         command_list = pending.get("cmd_list", command_list)
         cmd_str = " ".join(command_list)
@@ -319,26 +340,40 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"路径保护拦截 ({protected_hit}): {cmd_str[:120]}")
         return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
-    is_danger, danger_desc = _check_danger(cmd_str)
+    is_danger, danger_desc, danger_level = _check_danger(cmd_str)
     if is_danger:
         token = secrets.token_hex(16)
         _pending_challenges[token] = {
             "command": cmd_str,
             "cmd_list": command_list,
             "desc": danger_desc,
+            "level": danger_level,
         }
-        _log("CHALLENGE", f"发起挑战: {danger_desc}")
-        return {
-            "challenge_required": True,
-            "challenge_token": token,
-            "danger_type": danger_desc,
-            "challenge_phrase": DANGER_CHALLENGE_PHRASE,
-            "message": (
-                f"检测到危险操作: {danger_desc}\n\n"
-                f"请完整输入以下授权文字以继续:\n"
-                f"「{DANGER_CHALLENGE_PHRASE}」"
-            ),
-        }
+        if danger_level == "challenge":
+            _log("CHALLENGE", f"发起挑战(挑战级): {danger_desc}")
+            return {
+                "challenge_required": True,
+                "challenge_token": token,
+                "danger_type": danger_desc,
+                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "message": (
+                    f"检测到危险操作: {danger_desc}\n\n"
+                    f"请完整输入以下授权文字以继续:\n"
+                    f"「{DANGER_CHALLENGE_PHRASE}」"
+                ),
+            }
+        else:
+            _log("CHALLENGE", f"发起挑战(轻量级): {danger_desc}")
+            return {
+                "challenge_required": True,
+                "challenge_token": token,
+                "danger_type": danger_desc,
+                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "message": (
+                    f"检测到操作: {danger_desc}\n\n"
+                    f"回复「确认」或「OK」即可执行，回复「取消」放弃。"
+                ),
+            }
 
     # ── 执行 ──
     try:

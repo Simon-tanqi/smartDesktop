@@ -1,6 +1,7 @@
 """注册表操作工具：安全的注册表读写（仅限 HKCU + 白名单路径）"""
 import json
 import os
+import re
 from datetime import datetime
 
 from . import register_tool
@@ -13,6 +14,7 @@ ALLOWED_PATH_PREFIXES = [
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
     r"Software\Microsoft\Windows\CurrentVersion\Explorer",
     r"Control Panel\Desktop",
+    r"Control Panel\International",
     r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
 ]
@@ -50,7 +52,84 @@ def _log_operation(operation: str, command: str, result: str):
         f.write(entry)
 
 
-def _validate_registry_command(command: str) -> dict:
+def _auto_verify_before_add(command: str) -> dict | None:
+    """reg add 前自动验证目标键是否存在，不存在则搜索父路径返回候选项。
+
+    返回 None 表示验证通过（键存在或无需验证），直接放行。
+    返回 dict 表示验证失败，包含候选项信息，应直接 return 给 LLM。
+    """
+    parts = command.strip().split()
+    # 提取路径和值名
+    path = None
+    value_name = None
+    in_quotes = False
+    quote_char = None
+    path_done = False
+    for i, p in enumerate(parts):
+        if i >= 2:
+            # 处理引号包裹的路径（可能跨多个 token），仅第一次
+            if not path_done and p.startswith('"') and not in_quotes:
+                in_quotes = True
+                quote_char = '"'
+                path = p[1:]
+                continue
+            if in_quotes:
+                path += " " + p
+                if p.endswith(quote_char):
+                    path = path[:-1]  # 去掉末尾引号
+                    in_quotes = False
+                    quote_char = None
+                    path_done = True
+                continue
+            if p.lower() == "/v" and i + 1 < len(parts):
+                value_name = parts[i + 1]
+            elif not p.startswith("/") and not p.startswith("-") and path is None:
+                path = p
+                path_done = True
+
+    if not path:
+        return None
+
+    # 先 query 目标键
+    query_cmd = ["reg", "query", path]
+    if value_name:
+        query_cmd += ["/v", value_name]
+    result = safe_exec.run_cmd(query_cmd, timeout=10)
+
+    if result.get("success") and result.get("output"):
+        return None  # 键存在，放行
+
+    # 键不存在，自动搜索父路径下所有值
+    search_result = safe_exec.run_cmd(["reg", "query", path], timeout=10)
+
+    # 即使 reg query path（不带 /v）也失败，尝试搜索
+    candidates = []
+    if search_result.get("success") and search_result.get("output"):
+        output = search_result["output"]
+        # 解析 reg query 输出，提取值名和类型
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("HKEY"):
+                continue
+            # 格式: "    value_name    REG_DWORD    0x1"
+            m = re.match(r"^\s*(\S+)\s+(REG_\S+)\s+(.*)", line)
+            if m:
+                candidates.append({
+                    "value_name": m.group(1),
+                    "type": m.group(2),
+                    "data": m.group(3).strip()
+                })
+
+    return {
+        "success": False,
+        "auto_verified": True,
+        "message": (
+            f"目标键值 '{value_name or '(默认)'}' 在 '{path}' 中不存在。\n"
+            f"以下为该路径下实际存在的键值（共 {len(candidates)} 个），请从中选择正确目标："
+        ),
+        "existing_values": candidates,
+        "query_path": path
+    }
     """校验注册表命令是否安全"""
     parts = command.strip().split()
     if len(parts) < 2:
@@ -65,14 +144,27 @@ def _validate_registry_command(command: str) -> dict:
     if operation not in ALLOWED_OPERATIONS:
         return {"valid": False, "message": f"不允许的操作: {operation}，仅允许 query / add"}
 
-    # 提取注册表路径
+    # 提取注册表路径（处理引号包裹含空格的路径）
     path = None
+    in_quotes = False
+    quote_char = None
+    path_done = False
     for i, p in enumerate(parts):
         if i >= 2:
-            if p.startswith("/") or p.startswith("-"):
+            if not path_done and p.startswith('"') and not in_quotes:
+                in_quotes = True
+                quote_char = '"'
+                path = p[1:]
+                continue
+            if in_quotes:
+                path += " " + p
+                if p.endswith(quote_char):
+                    path = path[:-1]
+                    path_done = True
+                    break
                 continue
             if not p.startswith("/") and not p.startswith("-"):
-                path = p.strip('"')
+                path = p
                 break
 
     if not path:
@@ -119,13 +211,14 @@ def _validate_registry_command(command: str) -> dict:
 
 @register_tool
 def modify_registry(command: str) -> str:
-    """安全地执行注册表查询或修改。
-    command: 完整的 reg 命令字符串。
-    仅允许 HKCU 根键下白名单路径的 query 和 add 操作。
+    """安全执行注册表查询或修改。
+    只有一个参数 command: str —— 完整的 reg 命令字符串。不支持 action/path/name/type/data 等拆分参数。
+
+    仅允许 HKCU 根键下白名单路径的 query 和 add 操作(add 前自动验证目标键是否存在)。
 
     示例:
-      reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" /v ShowSecondsInSystemClock
-      reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" /v ShowSecondsInSystemClock /t REG_DWORD /d 1 /f
+      modify_registry(command='reg add "HKCU\\Control Panel\\International" /v sShortTime /t REG_SZ /d HH:mm:ss /f')
+      modify_registry(command='reg add "HKCU\\Software\\...\\Advanced" /v ShowSecondsInSystemClock /t REG_DWORD /d 1 /f')
     """
     validation = _validate_registry_command(command)
     operation_tag = command.strip().split()[1].lower() if len(command.strip().split()) >= 2 else "unknown"
@@ -140,6 +233,13 @@ def modify_registry(command: str) -> str:
             "allowed_operations": list(ALLOWED_OPERATIONS),
             "allowed_paths": ALLOWED_PATH_PREFIXES
         }, ensure_ascii=False)
+
+    # ── reg add 自动验证：键不存在时阻断并返回同路径下真实键值列表 ──
+    if operation_tag == "add":
+        verify_result = _auto_verify_before_add(command)
+        if verify_result is not None:
+            _log_operation(f"VERIFY_FAILED (add)", command, verify_result["message"])
+            return json.dumps(verify_result, ensure_ascii=False)
 
     # 安全执行：shell=False，命令拆为 list
     cmd_list = [p.strip('"') if p.startswith('"') and p.endswith('"') else p for p in command.strip().split()]

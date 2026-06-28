@@ -162,6 +162,9 @@ def list_sessions():
     db = load_sessions_db()
     sessions = []
     for sid, data in db.items():
+        # 过滤测试/调试 session，防止污染前端会话列表
+        if sid.startswith(("test", "diag", "debug")):
+            continue
         sessions.append({
             "id": sid,
             "title": data.get("title", sid),
@@ -216,7 +219,9 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
 
     def _is_tool_call(content):
         content = content.strip()
-        return content.startswith('{"tool_call"') or content.startswith('{"type":"tool"')
+        return ('"tool_name"' in content[:200] or
+                content.startswith('{"tool_call"') or
+                content.startswith('{"type":"tool"'))
 
     current_bigrams = _bigrams(current_user_msg)
     if not current_bigrams:
@@ -267,6 +272,21 @@ def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOK
                 "role": "system",
                 "content": "【注意】用户重复了之前提问。历史工具调用结果已保留，已完成部分可直接引用，但失败/遗漏部分需重新执行。"
             })
+
+    # 清理连续同角色消息：保留每个 user 段的最后一条，丢弃中间的纯 user 段
+    # 防止失败请求累积导致全是 user 消息
+    if messages:
+        cleaned = [messages[0]]
+        for m in messages[1:]:
+            prev = cleaned[-1]
+            if prev["role"] == m["role"] == "user":
+                # 保留最后一条 user，替换前一条
+                cleaned[-1] = m
+            elif prev["role"] == m["role"] == "assistant":
+                cleaned[-1]["content"] = prev["content"] + "\n" + m["content"]
+            else:
+                cleaned.append(m)
+        messages = cleaned
 
     # 注入 per-session 压缩摘要
     latest = get_latest_summary(session_id)

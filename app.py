@@ -1,3 +1,5 @@
+import re as _re
+
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -10,9 +12,56 @@ from memory import (get_relevant_memory, log_session_turn, get_session_messages,
 from memory.session import ensure_session_titles, create_session
 from utils.error_mapper import translate_error
 from logger import get_logger
+from backend.upload_api import upload_bp, cleanup_session_uploads
+
+
+# ── 附件标记常量 ──
+_ATTACHMENT_START = "<attachments>"
+_ATTACHMENT_END = "</attachments>"
+
+
+def _extract_attachments(user_message: str):
+    """从用户消息末尾提取 <attachments> 块，返回 (clean_message, file_list)。
+
+    file_list: [(file_name, absolute_path), ...]
+    """
+    start = user_message.find(_ATTACHMENT_START)
+    end = user_message.find(_ATTACHMENT_END)
+    if start == -1 or end == -1 or end <= start:
+        return user_message, []
+
+    file_list = []
+    block = user_message[start + len(_ATTACHMENT_START):end]
+    for line in block.strip().split("\n"):
+        line = line.strip()
+        # 支持 `- [文件名](<路径>)` 和 `[文件名](<路径>)` 两种格式
+        m = _re.search(r"\[(.+?)\]\(<(.+?)>\)", line)
+        if m:
+            file_list.append((m.group(1), m.group(2)))
+
+    clean = (user_message[:start] + user_message[end + len(_ATTACHMENT_END):]).strip()
+    return clean, file_list
+
+
+def _inject_attachment_context(user_message: str, file_list: list):
+    """将上传文件信息注入到 user_message 末尾，供 LLM 感知。
+
+    格式：
+    <attachments>
+    - [文件名](绝对路径)
+    </attachments>
+    """
+    if not file_list:
+        return user_message
+    lines = ["", _ATTACHMENT_START]
+    for name, path in file_list:
+        lines.append(f"- [{name}]({path})")
+    lines.append(_ATTACHMENT_END)
+    return user_message + "\n".join(lines)
 
 
 app = Flask(__name__,template_folder='web',static_folder='web/static')
+app.register_blueprint(upload_bp)
 
 # ── CORS ──
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
@@ -27,7 +76,7 @@ limiter = Limiter(
 
 # ── 工具执行线程池单例（避免每次工具调用重复新建/销毁）──
 import atexit
-_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tool-")
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False)
 
 # ---------- 工作空间配置 ----------
@@ -36,18 +85,23 @@ workspace_path = os.path.dirname(os.path.abspath(__file__))
 available_models = get_available_models()
 default_model = available_models[0] if available_models else {"provider": "ollama", "model": "deepseek-r1:7b", "display": "本地 Ollama"} #默认使用本地模型
 
-def get_model_choice(display_name=None):
+def get_model_choice(display_name=None, model_id=None):
+    """根据 display_name 或 model_id 查找模型配置"""
     for m in available_models:
+        if model_id and m.get("id") == model_id:
+            return m
         if m["display"] == display_name:
             return m
     return default_model
 
-def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id="", streaming=True):
+def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id="", streaming=True, session_name=""):
     """ReAct 循环：按 streaming 参数选择产出方式。
     streaming=True：逐步产出 SSE 事件，前端实时展示思考过程。
     streaming=False：内部收集所有步骤后一次性返回（预留，后续前端加设置项）。"""
     provider = model_choice["provider"]
     model_name = model_choice["model"]
+    _temperature = model_choice.get("temperature", 0.3)
+    _base_url = model_choice.get("base_url", "https://api.deepseek.com")
 
     # ── 模型名校验：使用白名单强制拦截异常值 ──
     _known_models = [m["model"] for m in get_available_models()]
@@ -83,7 +137,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             trace_id=trace_id, session_id=session_id, turn_index=idx,
             messages=messages, response=response,
             model_name=actual_model, provider=actual_provider,
-            elapsed_ms=elapsed,
+            elapsed_ms=elapsed, session_name=session_name,
         )
         return result
 
@@ -97,7 +151,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             stream_gen = _ollama_call_stream(messages, _default_model, trace_id=trace_id)
         else:
             stream_gen = _deepseek_call_stream(messages, _default_model,
-                get_api_key(), get_base_url(),
+                get_api_key(), _base_url,
                 trace_id=trace_id)
 
         full_content = ""
@@ -126,7 +180,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             trace_id=trace_id, session_id=session_id, turn_index=idx,
             messages=messages, response=full_content,
             model_name=_default_model, provider=_default_provider,
-            elapsed_ms=elapsed,
+            elapsed_ms=elapsed, session_name=session_name,
         )
         yield {"content": full_content, "reasoning_content": full_reasoning}
 
@@ -252,7 +306,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
 
     def _try_inject_skill():
         """基础工具失败后按需注入域技能 prompt（每域仅注入一次）"""
-        skill_domains = ["file_manage", "system_config"]
+        skill_domains = ["system_config"]
         for domain in domains:
             if domain in skill_domains and domain not in _skills_injected:
                 skill = get_skill_prompt(domain)
@@ -266,12 +320,15 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         RETRY_DELAYS = [0.5, 1.0, 2.0]
         last_exception = None
         for attempt in range(3):
+            future = None
             try:
                 future = _TOOL_EXECUTOR.submit(
                     TOOL_REGISTRY[tool_name]["function"], **arguments
                 )
                 return future.result(timeout=timeout)
             except FutureTimeout:
+                if future:
+                    future.cancel()  # 防止僵尸线程永久占用 worker
                 raise TimeoutError(f"工具 {tool_name} 执行超时 ({timeout}s) 且不重试")
             except Exception as e:
                 if not _is_retryable(e):
@@ -331,7 +388,12 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
             if short_think not in existing_thinks:
                 collected_steps.append({"step": short_think, "status": "思考"})
 
-        ai_content = parse_ai_json(raw_content)
+        # DeepSeek 推理模型可能把 JSON 放在 reasoning_content 而非 content 中。
+        # 当 content 为空/仅空格时，从 reasoning_content 中解析。
+        parse_source = raw_content
+        if not raw_content.strip() and final_reasoning:
+            parse_source = final_reasoning
+        ai_content = parse_ai_json(parse_source)
 
         # 提取 _thinking 字段作为思考过程展示
         if ai_content and isinstance(ai_content, dict) and "_thinking" in ai_content:
@@ -371,7 +433,13 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
         # 纯文本回退（最多 3 次渐进式重试）
         if not ai_content or not isinstance(ai_content, dict) or "tool_name" not in ai_content:
             fallback = raw_content
+            # 剥离 <think> 标签，防止 DeepSeek-R1 等模型的思考内容泄露到最终回复
+            if isinstance(fallback, str):
+                fallback_clean = _re.sub(r'<think>.*?</think>', '', fallback, flags=_re.DOTALL).strip()
+                fallback = fallback_clean if fallback_clean else ""
             if domains == ["general_chat"]:
+                if not fallback or not fallback.strip():
+                    fallback = "抱歉，当前模型未返回有效内容。请尝试重新描述你的需求，或换个角度提问。"
                 yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 _save_ai_reply(fallback)
                 return
@@ -384,6 +452,9 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                 messages.append({"role": "system", "content": RETRY_PROMPTS[retry_count]})
                 retry_count += 1
                 continue
+            # 兜底：LLM 仍返回空白，生成有意义错误信息而非前端哑火
+            if not fallback or not fallback.strip():
+                fallback = "抱歉，当前模型未返回有效内容。请尝试重新描述你的需求，或换个角度提问。"
             yield emit("final", text=fallback, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             _save_ai_reply(fallback)
             return
@@ -529,6 +600,7 @@ def run_agent(user_message, model_choice, session_id=None, trace_id="", user_id=
                     else:
                         collected_steps.append({"step": f"执行 {tool_name}", "status": "完成", "detail": result_str[:200]})
                         yield emit("step", text=f"执行 {tool_name}", status="完成")
+                        _consecutive_same_tool = 0  # 成功执行后重置计数器：避免回路护板误杀合法的连续查询
                     log_trace(trace_id, f"tool.{tool_name}", "tool", elapsed_t,
                               session_id=session_id, status="error" if _is_tool_error else "success",
                               input_summary=str(arguments)[:200],
@@ -695,6 +767,7 @@ def get_models():
 @app.route('/api/sessions/<session_id>', methods=['DELETE'])
 def delete_session_route(session_id):
     try:
+        cleanup_session_uploads(session_id)
         delete_session(session_id)
         return jsonify({"success": True})
     except Exception as e:
@@ -748,16 +821,31 @@ def api_chat():
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
 
+        # 从消息末尾提取附件块，解析文件列表，再注回消息体供 LLM 感知
+        cleaned_msg, attachments = _extract_attachments(user_input)
+        user_input = _inject_attachment_context(cleaned_msg, attachments)
+
         # 存储用户消息到记忆（含事实提取、压缩检查、SQLite 写入）
         append_session_message(session_id, "user", user_input, skip_compress=False,
                                trace_id=trace_id, user_id=user_id)
 
         model_choice = data.get("model_choice")
-        if not model_choice or not isinstance(model_choice, dict):
+        # 前端可能只传 { "display": "..." }，缺少 provider/model 等必要字段，
+        # 此时必须走 get_model_choice 补齐完整配置
+        if (not model_choice or not isinstance(model_choice, dict)
+                or "provider" not in model_choice or "model" not in model_choice):
             model_display = data.get("model", None)
-            model_choice = get_model_choice(model_display)
+            model_id = data.get("model_id", None)
+            model_choice = get_model_choice(model_display, model_id)
 
         print(f"[DIAG /chat] session={session_id} model_choice={model_choice} msg_len={len(user_input)}", flush=True)
+
+        # 查找会话名称用于日志文件名
+        session_name = ""
+        for s in list_sessions():
+            if s["id"] == session_id:
+                session_name = s.get("title", "")
+                break
 
         return Response(
             stream_with_context(run_agent(
@@ -766,7 +854,8 @@ def api_chat():
                 session_id=session_id,
                 trace_id=trace_id,
                 user_id=user_id,
-                streaming=True
+                streaming=True,
+                session_name=session_name,
             )),
             mimetype='text/event-stream',
             headers={
@@ -835,12 +924,12 @@ def api_logs_available_dates():
 
 @app.route('/api/logs/llm_call')
 def api_logs_llm_call():
-    trace_id = request.args.get("trace_id", "")
+    session_id = request.args.get("session_id", "")
     turn = int(request.args.get("turn", 0))
-    if not trace_id:
-        return jsonify({"success": False, "message": "缺少 trace_id"}), 400
+    if not session_id:
+        return jsonify({"success": False, "message": "缺少 session_id"}), 400
     lg = get_logger()
-    file_path = lg.get_llm_call_file(trace_id, turn)
+    file_path = lg.get_llm_call_file(session_id, turn)
     if file_path and os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             return jsonify({"success": True, "data": json.load(f)})
@@ -855,6 +944,104 @@ def api_rename_session(session_id):
         return jsonify({"success": False, "message": "名称不能为空"}), 400
     ok = rename_session(session_id, new_title)
     return jsonify({"success": ok, "message": "已修改" if ok else "会话不存在"})
+
+
+# ---------- 模型配置 API ----------
+MODELS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")
+USER_PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_profile.json")
+
+MODEL_PRESETS = {
+    "deepseek":     {"name": "DeepSeek", "base_url": "https://api.deepseek.com",         "temperature": 0.7, "models": ["deepseek-chat", "deepseek-reasoner"]},
+    "hunyuan":      {"name": "混元",      "base_url": "https://api.hunyuan.cloud.tencent.com/v1", "temperature": 0.7, "models": ["hunyuan-turbos-latest", "hunyuan-lite"]},
+    "qwen":         {"name": "通义千问",   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "temperature": 0.7, "models": ["qwen-turbo", "qwen-plus", "qwen-max"]},
+    "zhipu":        {"name": "智谱GLM",   "base_url": "https://open.bigmodel.cn/api/paas/v4", "temperature": 0.7, "models": ["glm-4-flash", "glm-4-plus"]},
+    "doubao":       {"name": "豆包",      "base_url": "https://ark.cn-beijing.volces.com/api/v3", "temperature": 0.7, "models": ["doubao-lite-128k", "doubao-pro-256k"]},
+    "openai":       {"name": "OpenAI",    "base_url": "https://api.openai.com/v1",          "temperature": 0.7, "models": ["gpt-4o", "gpt-4o-mini"]},
+    "ollama":       {"name": "Ollama 本地","base_url": "http://localhost:11434/v1",          "temperature": 0.7, "models": [], "warning": "本地模型功能可能受模型能力影响，效果远不如云端大模型"},
+    "custom":       {"name": "自定义",     "base_url": "",                                   "temperature": 0.7, "models": []},
+}
+
+
+def _load_models_config():
+    if os.path.exists(MODELS_CONFIG_PATH):
+        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"models": [], "active_model_id": ""}
+
+
+def _save_models_config(config):
+    with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def _load_user_profile():
+    if os.path.exists(USER_PROFILE_PATH):
+        with open(USER_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_user_profile(profile):
+    with open(USER_PROFILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+
+@app.route('/api/config/models', methods=['GET'])
+def api_get_models_config():
+    return jsonify({"success": True, **_load_models_config()})
+
+
+@app.route('/api/config/models', methods=['POST'])
+def api_save_models_config():
+    try:
+        data = request.json
+        if not data or "models" not in data:
+            return jsonify({"success": False, "message": "缺少 models 字段"}), 400
+        _save_models_config(data)
+        return jsonify({"success": True, "message": "配置已保存"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/config/models/active', methods=['POST'])
+def api_set_active_model():
+    try:
+        data = request.json
+        model_id = data.get("model_id", "")
+        config = _load_models_config()
+        config["active_model_id"] = model_id
+        _save_models_config(config)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ---------- 用户信息与首次启动 API ----------
+@app.route('/api/config/user_profile', methods=['GET'])
+def api_get_user_profile():
+    return jsonify({"success": True, "profile": _load_user_profile()})
+
+
+@app.route('/api/config/user_profile', methods=['POST'])
+def api_save_user_profile():
+    try:
+        data = request.json
+        if not data or "profile" not in data:
+            return jsonify({"success": False, "message": "缺少 profile 字段"}), 400
+        _save_user_profile(data["profile"])
+        return jsonify({"success": True, "message": "个人信息已保存"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/config/first_run', methods=['GET'])
+def api_check_first_run():
+    return jsonify({"first_run": not os.path.exists(USER_PROFILE_PATH)})
+
+
+@app.route('/api/config/model_presets', methods=['GET'])
+def api_get_model_presets():
+    return jsonify({"success": True, "presets": MODEL_PRESETS})
 
 
 # ---------- 启动 ----------
