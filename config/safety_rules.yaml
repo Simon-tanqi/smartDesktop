@@ -1,0 +1,251 @@
+# ═══════════════════════════════════════════════════
+# 安全规则配置 — 唯一数据源
+# 修改此文件后约 2 秒内自动生效，无需重启服务
+# ═══════════════════════════════════════════════════
+
+# ── safe_exec: 路径硬拦截（L0） ──
+safe_exec:
+  # 删除类命令识别
+  delete_command_patterns:
+    - \bdel\b
+    - \brmdir\b
+    - \brd\b
+    - \bRemove-Item\b
+    - \brm\b
+    - \brmtree\b
+    - \bshutil\.rmtree
+    - \bClear-RecycleBin\b
+
+  # 受保护路径模式：命中任一即拒绝执行
+  protected_path_patterns:
+    # 系统核心目录
+    - pattern: "(?i)[A-Z]:\\Windows\\"
+      desc: "Windows 系统目录"
+    - pattern: "(?i)[A-Z]:\\Program Files\\"
+      desc: "Program Files 目录"
+    - pattern: "(?i)[A-Z]:\\Program Files \\(x86\\)\\"
+      desc: "Program Files (x86) 目录"
+    - pattern: "(?i)[A-Z]:\\ProgramData\\"
+      desc: "ProgramData 目录"
+    # 聊天记录数据库
+    - pattern: "(?i)WeChat Files\\.+?\\Msg[\\\\.]"
+      desc: "微信聊天记录数据库"
+    - pattern: "(?i)Tencent Files\\.+?\\Msg[0-9]"
+      desc: "QQ 聊天记录数据库"
+    - pattern: "(?i)DingTalk\\.+?\\db[\\\\.]"
+      desc: "钉钉聊天记录数据库"
+    # 安全凭据
+    - pattern: "(?i)\\\\.ssh\\"
+      desc: "SSH 密钥目录"
+    - pattern: "(?i)\\\\.aws\\"
+      desc: "AWS 凭据目录"
+    - pattern: "(?i)\\\\.kube\\"
+      desc: "Kubernetes 配置目录"
+    - pattern: "(?i)\\\\.env$"
+      desc: "环境变量配置文件"
+    - pattern: "(?i)\\\\.git\\"
+      desc: "Git 仓库数据"
+
+  # 挑战短语
+  danger_challenge_phrase: "我知晓此操作为危险操作，我确认授权给Agent执行此危险操作"
+
+  # 危险模式定义（仅保留高风险操作；taskkill 等已由 execute_command 确认层处理）
+  danger_patterns:
+    - pattern: \bdel\b
+      desc: "删除文件"
+      level: challenge
+    - pattern: \brmdir\b
+      desc: "删除目录"
+      level: challenge
+    - pattern: \bformat\b
+      desc: "格式化磁盘"
+      level: challenge
+    - pattern: \brmtree\b
+      desc: "递归删除目录"
+      level: challenge
+    - pattern: \bshutil\.rmtree
+      desc: "递归删除目录"
+      level: challenge
+    - pattern: \bRemove-Item\b.*-Recurse
+      desc: "强制递归删除"
+      level: challenge
+    - pattern: \breg\s+delete\b
+      desc: "删除注册表项"
+      level: challenge
+    - pattern: \bClear-RecycleBin\b
+      desc: "清空回收站"
+      level: challenge
+
+  # 这些模式始终拦截，不进入确认流程（Layer 1 硬拦截）
+  always_blocked:
+    - \bformat\s+\w:\b
+    - \bdel\s+/[fF]\s+/[sS]
+    - \brm\s+-rf\s+/
+    - \bdiskpart\s+clean\b
+    - \bshutdown\s+/[sSrR]\s+/t\s+0\b
+    - \breg\s+delete\s+.*HKLM\b
+    - \breg\s+delete\s+.*HKEY_LOCAL_MACHINE\b
+    - \brmdir\s+/[sS]\s+C:\\
+
+# ── file_tools: 文件操作安全集合 ──
+file_tools:
+  # 扫描时跳过目录
+  skip_dirs:
+    - Windows
+    - Program Files
+    - Program Files (x86)
+    - ProgramData
+    - $RECYCLE.BIN
+    - System Volume Information
+    - Recovery
+    - node_modules
+    - __pycache__
+    - .git
+    - .vscode
+    - .idea
+    - AppData
+    - Local Settings
+    - Application Data
+    - Temp
+
+  # 强制禁止模式
+  forbidden_patterns:
+    - "rm -rf /"
+    - "del /f /s"
+    - "format "
+    - shutdown
+
+  # 注册表写入命令（已废弃，注册表操作统一走确认弹窗）
+  registry_write_commands: []
+
+  # 免确认程序列表（读操作 / 低风险工具）
+  skip_confirm_programs:
+    - dir
+    - copy
+    - move
+    - del
+    - mkdir
+    - rmdir
+    - echo
+    - type
+    - findstr
+    - where
+    - python
+    - pip
+    - git
+    - npm
+    - node
+    - npx
+    - yarn
+    - systeminfo
+    - wmic
+    - tasklist
+    - powershell
+    - winget
+    - Get-ItemProperty
+    - Get-ChildItem
+    - Get-Process
+    - Get-Service
+    - Get-WmiObject
+    - Get-CimInstance
+    - Get-Content
+
+  # 命令反模式
+  command_anti_patterns:
+    - pattern: "dir\\s+\\S+\\s+/[sb].*\\|.*findstr"
+      message: "dir /s /b 只输出文件名（不含大小/日期/权限）。如果要按文件属性（大小/日期/内容等）过滤，dir 做不到。请改用 python os.walk + 条件判断，在扫描时直接过滤。"
+    - pattern: "dir\\s+\\S+\\s+/[sb].*\\s*>\\s*\\S+[Tt]emp"
+      message: "dir 递归全量输出并重定向到临时文件可能极其缓慢。如果最终目标是过滤，请在源头用 python os.walk 加条件判断，不要先生成全量列表再过滤。"
+
+# ── search_tools: 搜索工具安全集合 ──
+search_tools:
+  # 扫描时跳过目录（与 file_tools 共用，此处独立维护以支持差异化）
+  skip_dirs:
+    - Windows
+    - Program Files
+    - Program Files (x86)
+    - ProgramData
+    - $RECYCLE.BIN
+    - System Volume Information
+    - Recovery
+    - node_modules
+    - __pycache__
+    - .git
+    - .vscode
+    - .idea
+    - AppData
+    - Local Settings
+    - Application Data
+    - Temp
+
+  # 可下载扩展名（web_search 结果自动识别）
+  downloadable_exts:
+    - .pdf
+    - .png
+    - .jpg
+    - .jpeg
+    - .gif
+    - .zip
+    - .mp4
+    - .mp3
+    - .docx
+    - .xlsx
+    - .pptx
+
+# ── registry_tools: 注册表操作白名单 ──
+registry_tools:
+  allowed_root_keys:
+    - HKCU
+    - HKEY_CURRENT_USER
+
+  allowed_path_prefixes:
+    - Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+    - Software\Microsoft\Windows\CurrentVersion\Explorer
+    - Control Panel\Desktop
+    - Control Panel\International
+    - Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+    - Software\Microsoft\Windows\CurrentVersion\Explorer\Accent
+
+  allowed_operations:
+    - query
+    - add
+
+  forbidden_values:
+    - disableregistrytools
+    - notaskmgr
+    - norun
+    - noclose
+    - disablecmd
+    - disabletaskmgr
+    - nofolderoptions
+    - disablechangepassword
+    - nolock
+    - disableremote
+
+  forbidden_operations:
+    - delete
+    - import
+    - export
+    - save
+    - restore
+    - copy
+    - load
+    - unload
+    - compare
+    - flags
+
+# ── web_download: 下载安全扩展名 ──
+web_download:
+  # 需用户确认的可执行扩展名
+  risky_extensions:
+    - .exe
+    - .msi
+    - .bat
+    - .cmd
+    - .com
+    - .scr
+    - .ps1
+    - .vbs
+    - .dll
+    - .sys
+    - .reg

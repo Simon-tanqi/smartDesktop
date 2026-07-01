@@ -1,6 +1,6 @@
 # api.py —— 使用本地 ai_reply 模块，不再单独调用外部 API
 import sys, os, json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 
 # ---------- 1. 路径设置（确保能导入 agent 包） ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12,6 +12,10 @@ if AGENT_DIR not in sys.path:
 from ai_reply import ai_concat, get_available_models, load_config
 
 app = Flask(__name__)
+
+# 截图静态文件目录
+SCREENSHOTS_DIR = os.path.join(os.path.dirname(BASE_DIR), 'workspace', 'screenshots')
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 # ---------- 2. 工具函数：将内部响应转为 OpenAI 格式 ----------
 def to_openai_format(internal_response):
@@ -79,6 +83,11 @@ def list_models():
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok", "service": "local-agent-proxy"})
+
+# ---------- 6. 截图静态文件服务 ----------
+@app.route("/screenshots/<path:filename>")
+def serve_screenshot(filename):
+    return send_from_directory(SCREENSHOTS_DIR, filename)
 
 if __name__ == "__main__":
     port = 5000

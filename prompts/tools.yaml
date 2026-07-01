@@ -12,6 +12,7 @@ always_inject:
   - search_files
   - modify_registry
   - get_project_summary
+  - take_screenshot
 
 tools:
   scan_directory:
@@ -38,14 +39,14 @@ tools:
 
   execute_command:
     desc: 执行Windows终端命令（PowerShell）。免确认列表(dir/copy/python/reg等)直接执行；列表外弹出确认
-    note: 禁止 rm -rf/format/shutdown。超时30s
+    note: 禁止 rm -rf/format/shutdown。超时30s。适合简单的单行命令；涉及多步管道、文本解析、复杂筛选时优先用 run_python
 
   run_python:
-    desc: 执行Python脚本（pandas+openpyxl+matplotlib+xlsxwriter 可用）
+    desc: 执行Python脚本（pandas+openpyxl+matplotlib+xlsxwriter+winreg+wmi 可用）
     params:
       code: {type: str, desc: 完整Python代码，用print()输出}
       timeout: {type: int, default: 300}
-    note: 不可用input()
+    note: 不可用input()。适合注册表/WMI遍历、复杂文本解析、数据处理、结构化输出等任务
 
   replace_in_file:
     desc: 精确字符串替换，修改已有文件
@@ -75,9 +76,11 @@ tools:
     params: {query: {type: str, desc: 搜索关键词}}
 
   fetch_webpage:
-    desc: 抓取网页正文（Markdown）
-    params: {url: {type: str, desc: 网页URL}}
-    note: 优先用移动端URL
+    desc: 抓取网页正文。render_js=True 使用无头浏览器渲染 JS 页面（Vue/React/SPA），并自动提取下载链接（.exe/.msi 等）
+    params:
+      url: {type: str, desc: 网页URL}
+      render_js: {type: bool, optional: true, desc: 是否用浏览器渲染JS页面(默认false)}
+    note: 遇到 JS 渲染页面(SPA/Vue/React)或下载页时用 render_js=True；普通静态页面用默认即可
 
   fetch_multiple:
     desc: 批量抓取网页
@@ -88,7 +91,7 @@ tools:
     params: {city: {type: str, default: 深圳}}
 
   web_download:
-    desc: 下载文件到本地（PDF/图片/音视频/Office），安全白名单过滤
+    desc: 从 URL 下载任意类型文件到本地。可执行文件（.exe/.msi 等）下载前会弹出风险确认卡片；其他类型直接下载。
     params:
       url: {type: str, desc: 文件直链}
       output_dir: {type: str, optional: true, desc: 默认用户Downloads}
@@ -96,6 +99,15 @@ tools:
   modify_registry:
     desc: 安全修改注册表（仅HKCU）。参数 command — 完整 reg 命令字符串
     note: add 前自动验证目标键是否存在
+
+  take_screenshot:
+    desc: 截取屏幕并保存为 PNG 文件，返回文件路径。不传区域参数时截取全屏；传 left,top,right,bottom 时截取指定区域
+    params:
+      left: {type: int, optional: true, desc: 区域左边界像素}
+      top: {type: int, optional: true, desc: 区域上边界像素}
+      right: {type: int, optional: true, desc: 区域右边界像素}
+      bottom: {type: int, optional: true, desc: 区域下边界像素}
+    note: 依赖 Pillow 库，截图保存至 workspace/screenshots/。**必须将返回结果中的 Markdown 图片链接（![截图](url)）原样呈现在回复中，不得省略或改写。**
 
   append_to_log:
     desc: 追加文本到日志文件
@@ -143,6 +155,9 @@ domains:
 
   web_browse:
     keywords:
+      - 下载
+      - 下载文件
+      - 下载软件
       - 搜索
       - 查询
       - 天气
@@ -192,10 +207,36 @@ domains:
       - 右键菜单
       - 任务栏
       - 桌面图标
+      - 截图
+      - 屏幕截图
+      - 截屏
+      - 截个图
+      - 音量
+      - 麦克风
+      - 扬声器
+      - 喇叭
+      - 耳机
+      - 声音
+      - 静音
+      - 调大
+      - 调小
+      - 音频
+      - 录音
+      - wifi
+      - 网络
+      - 联网
+      - 断网
+      - 无线
+      - 蓝牙
+      - bluetooth
+      - 宽带
     tools:
       - modify_registry
       - web_search
       - fetch_webpage
+      - take_screenshot
+      - run_python
+      - execute_command
 
   user_memory:
     keywords:

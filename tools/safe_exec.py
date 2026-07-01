@@ -9,6 +9,8 @@
 
 设计原则：不限制用户权限，不创建受限账户。通过确认机制阻止模型写出危险代码，
 同时保证 pip install / 软件安装等正常操作不受影响。
+
+安全集合数据源：config/safety_rules.yaml（修改后自动热加载，无需重启）
 """
 import subprocess
 import re
@@ -17,94 +19,24 @@ import json
 import os
 from datetime import datetime
 
+from config.config_loader import get_safety_config
+
 
 # ═══════════════════════════════════════════════
-# 路径硬拦截（L0）
+# 命令规范化：自动修正 LLM 常见的参数幻觉错误
+# 每一条必须是高置信度模式，宁可漏修不可误伤正确命令
 # ═══════════════════════════════════════════════
 
-# 删除类命令识别
-_DELETE_COMMAND_PATTERNS = [
-    r"\bdel\b", r"\brmdir\b", r"\brd\b", r"\bRemove-Item\b",
-    r"\brm\b", r"\brmtree\b", r"\bshutil\.rmtree",
-    r"\bClear-RecycleBin\b",
+_COMMAND_NORMALIZATIONS = [
+    # taskkill /F /m  →  taskkill /F /IM（LLM 常把 /IM 幻觉为 /m）
+    (r'\btaskkill\s+(/F\s+)/m\b',  r'taskkill \1/IM'),
 ]
 
-# 受保护路径模式：命中任一即拒绝执行
-# 匹配逻辑基于命令字符串中子串检测，不依赖路径解析
-_PROTECTED_PATH_PATTERNS = [
-    # 系统核心目录
-    (r"(?i)[A-Z]:\\Windows\\",                 "Windows 系统目录"),
-    (r"(?i)[A-Z]:\\Program Files\\",           "Program Files 目录"),
-    (r"(?i)[A-Z]:\\Program Files \(x86\)\\",   "Program Files (x86) 目录"),
-    (r"(?i)[A-Z]:\\ProgramData\\",             "ProgramData 目录"),
-
-    # 聊天记录数据库
-    (r"(?i)WeChat Files\\.+?\\Msg[\\\.]",      "微信聊天记录数据库"),
-    (r"(?i)Tencent Files\\.+?\\Msg[0-9]",      "QQ 聊天记录数据库"),
-    (r"(?i)DingTalk\\.+?\\db[\\\.]",           "钉钉聊天记录数据库"),
-
-    # 安全凭据
-    (r"(?i)\\\.ssh\\",                          "SSH 密钥目录"),
-    (r"(?i)\\\.aws\\",                          "AWS 凭据目录"),
-    (r"(?i)\\\.kube\\",                         "Kubernetes 配置目录"),
-    (r"(?i)\\\.env$",                           "环境变量配置文件"),
-    (r"(?i)\\\.git\\",                          "Git 仓库数据"),
-]
-
-
-def _is_delete_command(command: str) -> bool:
-    """判断命令是否为删除类操作"""
-    for pattern in _DELETE_COMMAND_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            return True
-    return False
-
-
-def _check_protected_paths(command: str) -> str | None:
-    """
-    检查删除类命令是否触碰受保护路径。
-    返回被拦截的路径描述，或 None（通过检查）。
-    """
-    if not _is_delete_command(command):
-        return None
-    for pattern, desc in _PROTECTED_PATH_PATTERNS:
-        if re.search(pattern, command):
-            return desc
-    return None
-
-
-# ═══════════════════════════════════════════════
-# 挑战短语
-# ═══════════════════════════════════════════════
-
-DANGER_CHALLENGE_PHRASE = "我知晓此操作为危险操作，我确认授权给Agent执行此危险操作"
-
-
-# ═══════════════════════════════════════════════
-# 危险模式定义
-# ═══════════════════════════════════════════════
-
-DANGER_PATTERNS = [
-    # (正则, 中文描述, 挑战级别: "light"=口头确认即可 / "challenge"=需挑战短语)
-    (r"\bdel\b",           "删除文件",        "challenge"),
-    (r"\brmdir\b",         "删除目录",        "challenge"),
-    (r"\bformat\b",        "格式化磁盘",      "challenge"),
-    (r"\brmtree\b",        "递归删除目录",    "challenge"),
-    (r"\bshutil\.rmtree",  "递归删除目录",    "challenge"),
-    (r"\bRemove-Item\b.*-Recurse",  "强制递归删除",  "challenge"),
-    (r"\breg\s+delete\b",  "删除注册表项",    "challenge"),
-    (r"\bClear-RecycleBin\b", "清空回收站",   "challenge"),
-    (r"\btaskkill\b",      "强制结束进程",    "light"),
-    (r"\bStop-Process\b",  "强制结束进程",    "light"),
-    (r"\bStop-Service\b",  "停止系统服务",    "light"),
-]
-
-# 这些模式始终拦截，不进入挑战流程（无确认可能）
-ALWAYS_BLOCKED = [
-    r"\bformat\s+\w:\b",        # 格式化盘符
-    r"\bdel\s+/[fF]\s+/[sS]",   # del /f /s (递归强制删除)
-    r"\brm\s+-rf\s+/",          # rm -rf / (删除根目录)
-]
+def _normalize_command(script: str) -> str:
+    """对命令做无害的已知错误模式修正，返回修正后的命令。"""
+    for pattern, replacement in _COMMAND_NORMALIZATIONS:
+        script = re.sub(pattern, replacement, script, flags=re.IGNORECASE)
+    return script
 
 
 # ═══════════════════════════════════════════════
@@ -129,7 +61,7 @@ def _evict_stale_challenges():
             except ValueError:
                 stale.append(token)
         else:
-            stale.append(token)  # 无时间戳的记录也视为异常，一并清理
+            stale.append(token)
     for token in stale:
         _pending_challenges.pop(token, None)
         _log("EVICT", f"过期挑战令牌清理: {token[:8]}...")
@@ -154,12 +86,34 @@ def _log(level, message):
 
 
 # ═══════════════════════════════════════════════
-# 命令安全检查
+# 命令安全检查（数据源：config/safety_rules.yaml）
 # ═══════════════════════════════════════════════
+
+def _is_delete_command(command: str) -> bool:
+    """判断命令是否为删除类操作"""
+    patterns = get_safety_config().delete_command_patterns
+    for pattern in patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            return True
+    return False
+
+
+def _check_protected_paths(command: str) -> str | None:
+    """
+    检查删除类命令是否触碰受保护路径。
+    返回被拦截的路径描述，或 None（通过检查）。
+    """
+    if not _is_delete_command(command):
+        return None
+    for pattern, desc in get_safety_config().protected_path_patterns:
+        if re.search(pattern, command):
+            return desc
+    return None
+
 
 def _check_always_blocked(command):
     """检查是否命中永久拦截规则，返回被拦截的模式或 None"""
-    for pattern in ALWAYS_BLOCKED:
+    for pattern in get_safety_config().always_blocked:
         if re.search(pattern, command, re.IGNORECASE):
             return pattern
     return None
@@ -167,10 +121,15 @@ def _check_always_blocked(command):
 
 def _check_danger(command):
     """检查是否命中危险模式，返回 (is_dangerous, danger_desc, challenge_level)"""
-    for pattern, desc, level in DANGER_PATTERNS:
+    for pattern, desc, level in get_safety_config().danger_patterns:
         if re.search(pattern, command, re.IGNORECASE):
             return True, desc, level
     return False, "", ""
+
+
+def _get_challenge_phrase() -> str:
+    """获取当前挑战短语（从热加载配置实时读取）"""
+    return get_safety_config().danger_challenge_phrase
 
 
 def is_dangerous(command):
@@ -207,6 +166,12 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
     # ── TTL 过期清理（入口处执行一次）──
     _evict_stale_challenges()
 
+    # ── 命令规范化：修正 LLM 幻觉产生的语法错误（如 taskkill /m → /IM）──
+    script = _normalize_command(script)
+
+    challenge_phrase = _get_challenge_phrase()
+    challenge_verified = False  # 标记 challenge 是否已通过验证
+
     # ── 挑战验证流程（分级）──
     if challenge_response is not None and challenge_token:
         pending = _pending_challenges.pop(challenge_token, None)
@@ -217,14 +182,15 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
             _log("WARN", "挑战短语为空")
             return {"success": False, "message": "授权文本为空，操作已取消"}
         # 挑战级操作仍需匹配挑战短语
-        if pending.get("level") == "challenge" and challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
+        if pending.get("level") == "challenge" and challenge_response.strip() != challenge_phrase:
             _log("WARN", f"挑战短语不匹配: '{challenge_response[:40]}...'")
             return {"success": False, "message": "授权文本不匹配，操作已取消"}
         # 验证通过，恢复原始命令继续执行
         script = pending["command"]
+        challenge_verified = True  # 标记已通过验证，跳过后续 danger 重复检查
         _log("AUTH", f"用户授权执行: {pending['desc']} | cmd={script[:120]}")
 
-    # ── 永久拦截 ──
+    # ── 永久拦截（Layer 1：始终生效，即使是已验证的 challenge 也要再查）──
     blocked_pattern = _check_always_blocked(script)
     if blocked_pattern:
         _log("BLOCK", f"永久拦截 (匹配: {blocked_pattern}): {script[:120]}")
@@ -236,8 +202,11 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"路径保护拦截 ({protected_hit}): {script[:120]}")
         return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
-    # ── 危险检测 → 发起挑战（分级提示）──
-    is_danger, danger_desc, danger_level = _check_danger(script)
+    # ── 危险检测 → 发起挑战（分级提示）。已验证过的 challenge 跳过重复检查 ──
+    if not challenge_verified:
+        is_danger, danger_desc, danger_level = _check_danger(script)
+    else:
+        is_danger = False
     if is_danger:
         token = secrets.token_hex(16)
         _pending_challenges[token] = {
@@ -252,11 +221,11 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
                 "challenge_required": True,
                 "challenge_token": token,
                 "danger_type": danger_desc,
-                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "challenge_phrase": challenge_phrase,
                 "message": (
                     f"检测到危险操作: {danger_desc}\n\n"
                     f"请完整输入以下授权文字以继续:\n"
-                    f"「{DANGER_CHALLENGE_PHRASE}」"
+                    f"「{challenge_phrase}」"
                 ),
             }
         else:
@@ -265,7 +234,7 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
                 "challenge_required": True,
                 "challenge_token": token,
                 "danger_type": danger_desc,
-                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "challenge_phrase": challenge_phrase,
                 "message": (
                     f"检测到操作: {danger_desc}\n\n"
                     f"回复「确认」或「OK」即可执行，回复「取消」放弃。"
@@ -314,6 +283,9 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
     # ── TTL 过期清理（入口处执行一次）──
     _evict_stale_challenges()
 
+    challenge_phrase = _get_challenge_phrase()
+    challenge_verified = False
+
     # ── 挑战验证（分级）──
     if challenge_response is not None and challenge_token:
         pending = _pending_challenges.pop(challenge_token, None)
@@ -323,10 +295,11 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
         if not challenge_response or not challenge_response.strip():
             return {"success": False, "message": "授权文本为空，操作已取消"}
         # 挑战级操作仍需匹配挑战短语
-        if pending.get("level") == "challenge" and challenge_response.strip() != DANGER_CHALLENGE_PHRASE:
+        if pending.get("level") == "challenge" and challenge_response.strip() != challenge_phrase:
             return {"success": False, "message": "授权文本不匹配，操作已取消"}
         command_list = pending.get("cmd_list", command_list)
         cmd_str = " ".join(command_list)
+        challenge_verified = True
         _log("AUTH", f"用户授权执行: {pending['desc']}")
 
     blocked = _check_always_blocked(cmd_str)
@@ -340,7 +313,10 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"路径保护拦截 ({protected_hit}): {cmd_str[:120]}")
         return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
-    is_danger, danger_desc, danger_level = _check_danger(cmd_str)
+    if not challenge_verified:
+        is_danger, danger_desc, danger_level = _check_danger(cmd_str)
+    else:
+        is_danger = False
     if is_danger:
         token = secrets.token_hex(16)
         _pending_challenges[token] = {
@@ -355,11 +331,11 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
                 "challenge_required": True,
                 "challenge_token": token,
                 "danger_type": danger_desc,
-                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "challenge_phrase": challenge_phrase,
                 "message": (
                     f"检测到危险操作: {danger_desc}\n\n"
                     f"请完整输入以下授权文字以继续:\n"
-                    f"「{DANGER_CHALLENGE_PHRASE}」"
+                    f"「{challenge_phrase}」"
                 ),
             }
         else:
@@ -368,7 +344,7 @@ def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
                 "challenge_required": True,
                 "challenge_token": token,
                 "danger_type": danger_desc,
-                "challenge_phrase": DANGER_CHALLENGE_PHRASE,
+                "challenge_phrase": challenge_phrase,
                 "message": (
                     f"检测到操作: {danger_desc}\n\n"
                     f"回复「确认」或「OK」即可执行，回复「取消」放弃。"

@@ -2,20 +2,110 @@
 import os
 import re
 import json
+import asyncio
 
 import requests
 
 from . import register_tool, path_params
+from config.config_loader import get_safety_config
+
+# Playwright 懒加载 —— 仅在 render_js=True 时导入
+_playwright_available = None  # None=未检测
+
+
+def _get_playwright():
+    """获取 Playwright 实例，优先使用系统 Chrome/Edge"""
+    global _playwright_available
+    if _playwright_available is not None:
+        return _playwright_available
+    
+    try:
+        from playwright.sync_api import sync_playwright
+        _playwright_available = sync_playwright
+    except ImportError:
+        _playwright_available = False
+    return _playwright_available
+
+
+def _find_browser_executable():
+    """查找系统已安装的 Chrome 或 Edge"""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _render_with_playwright(url: str, timeout: int = 20) -> dict:
+    """使用 Playwright 渲染 JS 页面，返回 {text, links, title, url}"""
+    pw = _get_playwright()
+    if not pw:
+        return {"error": "Playwright 不可用（未安装或浏览器未就绪）"}
+    
+    browser_path = _find_browser_executable()
+    if not browser_path:
+        return {"error": "未找到系统 Chrome/Edge 浏览器"}
+    
+    try:
+        with pw() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                executable_path=browser_path,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            
+            # 等待额外 2 秒以确保动态内容加载
+            page.wait_for_timeout(2000)
+            
+            title = page.title()
+            text = page.inner_text("body")
+            
+            # 提取所有链接
+            links = page.evaluate("""() => {
+                const allLinks = Array.from(document.querySelectorAll('a[href]'));
+                return allLinks.map(a => ({
+                    text: (a.innerText || '').trim().substring(0, 80),
+                    href: a.href
+                }));
+            }""")
+            
+            # 筛选下载链接（.exe/.msi/.zip/.dmg/.apk）
+            download_exts = {'.exe', '.msi', '.zip', '.dmg', '.apk', '.7z', '.rar', '.tar.gz'}
+            download_links = [
+                link for link in links
+                if any(link.get("href", "").lower().endswith(ext) for ext in download_exts)
+            ]
+            
+            browser.close()
+            
+            result = {
+                "title": title or url,
+                "url": page.url,
+                "text": text[:5000],
+                "links_count": len(links),
+            }
+            if download_links:
+                result["download_links"] = download_links[:10]
+            
+            return result
+    except Exception as e:
+        error_msg = str(e)[:200]
+        if "Target page, context or browser has been closed" in error_msg:
+            return {"error": "页面渲染超时或浏览器崩溃"}
+        return {"error": f"渲染失败: {error_msg}"}
 
 # LLM 提取回退：仅在正则解析失败时按需导入
 _LLM_EXTRACTION_AVAILABLE = None  # None=未检测, True/False=缓存结果
-
-SKIP_DIRS = {
-    "Windows", "Program Files", "Program Files (x86)", "ProgramData",
-    "$RECYCLE.BIN", "System Volume Information", "Recovery",
-    "node_modules", "__pycache__", ".git", ".vscode", ".idea",
-    "AppData", "Local Settings", "Application Data", "Temp"
-}
 
 
 @register_tool
@@ -35,7 +125,7 @@ def search_files(keyword: str, search_path: str = None, file_extensions: list = 
         if not os.path.exists(base):
             continue
         for root, dirs, files in os.walk(base, topdown=True, onerror=lambda e: None):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS]
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in get_safety_config().search_skip_dirs]
             depth = root[len(base):].count(os.sep)
             if depth > 3:
                 continue
@@ -177,10 +267,37 @@ def web_search(query: str, max_results: int = 10):
 
 
 @register_tool
-def fetch_webpage(url: str, max_length: int = 3000):
+def fetch_webpage(url: str, max_length: int = 3000, render_js: bool = False):
     """抓取指定 URL 的网页正文（去除 HTML 标签）。适合在搜索后深入阅读某个页面。
     自动尝试桌面 UA → 移动端 UA → 移动端子域名(m.) 三级回退。
-    若 URL 指向可下载文件（PDF/图片/音视频等），自动路由到 web_download 工具。"""
+    若 URL 指向可下载文件（PDF/图片/音视频等），自动路由到 web_download 工具。
+    
+    render_js=True 时使用系统 Chrome/Edge 无头浏览器渲染 JS 页面，
+    可正确处理 SPA/Vue/React 等动态站点，同时自动提取页面中的下载链接。"""
+    
+    # ── JS 渲染模式 ──
+    if render_js:
+        rendered = _render_with_playwright(url)
+        if "error" in rendered:
+            # 渲染失败时回退到普通抓取
+            pass
+        else:
+            result = {
+                "success": True,
+                "url": rendered["url"],
+                "title": rendered["title"],
+                "text": rendered["text"][:max_length],
+                "_rendered_by": "playwright",
+            }
+            if rendered.get("download_links"):
+                dl_desc = []
+                for dl in rendered["download_links"][:5]:
+                    dl_desc.append(f"- {dl['text'] or '(无文字)'} → {dl['href']}")
+                result["text"] += "\n\n--- 页面中找到的下载链接 ---\n" + "\n".join(dl_desc)
+                result["download_urls"] = [d["href"] for d in rendered["download_links"][:5]]
+            if len(rendered.get("text", "")) > max_length:
+                result["text"] = result["text"][:max_length] + "\n… [内容截断]"
+            return json.dumps(result, ensure_ascii=False)
     raw = None
     resp_url = url
     errors = []
@@ -227,8 +344,7 @@ def fetch_webpage(url: str, max_length: int = 3000):
     # 对常见文件扩展名做路由
     parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(resp_url)
     path_lower = parsed.path.lower()
-    downloadable_exts = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".mp4", ".mp3", ".docx", ".xlsx", ".pptx"}
-    if any(path_lower.endswith(ext) for ext in downloadable_exts):
+    if any(path_lower.endswith(ext) for ext in get_safety_config().downloadable_exts):
         from .web_download import web_download
         result = web_download(url)
         data = json.loads(result)

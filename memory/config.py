@@ -115,6 +115,10 @@ SUMMARY_MODEL           = COMPRESS_MODEL_CONFIG.get('model_name', 'deepseek-r1:7
 MAX_SUMMARY_LENGTH      = MAX_SUMMARY_CHARS
 DEFAULT_KEEP_ROUNDS     = RECENT_TURNS_KEEP  # 已废弃，保留兼容
 
+# 召回过滤：当前用户消息与会话历史的 bigram Jaccard 加权相似度阈值
+# 低于此阈值时，判定话题已切换，丢弃全部历史上下文（仅保留压缩摘要）
+RECALL_RELEVANCE_THRESHOLD = 0.1
+
 # ═══════════════════════════════════════════════
 # 长期记忆目录（DATA_DIR 下）
 # ═══════════════════════════════════════════════

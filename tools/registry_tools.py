@@ -6,28 +6,11 @@ from datetime import datetime
 
 from . import register_tool
 from . import safe_exec
+from config.config_loader import get_safety_config
 
 # ── 注册表二级白名单 ──
-ALLOWED_ROOT_KEYS = {"HKCU", "HKEY_CURRENT_USER"}
-
-ALLOWED_PATH_PREFIXES = [
-    r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
-    r"Software\Microsoft\Windows\CurrentVersion\Explorer",
-    r"Control Panel\Desktop",
-    r"Control Panel\International",
-    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-    r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
-]
-
-ALLOWED_OPERATIONS = {"query", "add"}
-
-FORBIDDEN_VALUES = {
-    "disableregistrytools", "notaskmgr", "norun", "noclose",
-    "disablecmd", "disabletaskmgr", "nofolderoptions",
-    "disablechangepassword", "nolock", "disableremote"
-}
-
-FORBIDDEN_OPERATIONS = {"delete", "import", "export", "save", "restore", "copy", "load", "unload", "compare", "flags"}
+# 安全集合（ALLOWED_ROOT_KEYS / ALLOWED_PATH_PREFIXES / ALLOWED_OPERATIONS / FORBIDDEN_VALUES / FORBIDDEN_OPERATIONS）
+# 统一托管到 config/safety_rules.yaml
 
 
 def _get_log_path() -> str:
@@ -57,7 +40,15 @@ def _auto_verify_before_add(command: str) -> dict | None:
 
     返回 None 表示验证通过（键存在或无需验证），直接放行。
     返回 dict 表示验证失败，包含候选项信息，应直接 return 给 LLM。
+    任何异常均返回 None（跳过验证，信任用户操作直接执行 reg 命令）。
     """
+    try:
+        return _auto_verify_before_add_impl(command)
+    except Exception:
+        return None
+
+
+def _auto_verify_before_add_impl(command: str) -> dict | None:
     parts = command.strip().split()
     # 提取路径和值名
     path = None
@@ -82,7 +73,7 @@ def _auto_verify_before_add(command: str) -> dict | None:
                     path_done = True
                 continue
             if p.lower() == "/v" and i + 1 < len(parts):
-                value_name = parts[i + 1]
+                value_name = parts[i + 1].strip('"')  # 去除可能包裹的引号（如 "{GUID}"）
             elif not p.startswith("/") and not p.startswith("-") and path is None:
                 path = p
                 path_done = True
@@ -130,6 +121,9 @@ def _auto_verify_before_add(command: str) -> dict | None:
         "existing_values": candidates,
         "query_path": path
     }
+
+
+def _validate_registry_command(command: str):
     """校验注册表命令是否安全"""
     parts = command.strip().split()
     if len(parts) < 2:
@@ -138,10 +132,11 @@ def _auto_verify_before_add(command: str) -> dict | None:
     if parts[0].lower() != "reg":
         return {"valid": False, "message": "不是 reg 命令"}
 
+    cfg = get_safety_config()
     operation = parts[1].lower()
-    if operation in FORBIDDEN_OPERATIONS:
+    if operation in cfg.registry_forbidden_operations:
         return {"valid": False, "message": f"禁止的操作: {operation}，仅允许 query / add"}
-    if operation not in ALLOWED_OPERATIONS:
+    if operation not in cfg.registry_allowed_operations:
         return {"valid": False, "message": f"不允许的操作: {operation}，仅允许 query / add"}
 
     # 提取注册表路径（处理引号包裹含空格的路径）
@@ -173,13 +168,13 @@ def _auto_verify_before_add(command: str) -> dict | None:
     root_key = path.split("\\")[0].upper()
     if root_key == "HKCU":
         root_key = "HKEY_CURRENT_USER"
-    if root_key not in ALLOWED_ROOT_KEYS:
+    if root_key not in cfg.registry_allowed_root_keys:
         return {"valid": False, "message": f"禁止的根键: {root_key}，仅允许 HKCU (当前用户)"}
 
     # 检查路径前缀
     path_without_root = "\\".join(path.split("\\")[1:])
     allowed = False
-    for prefix in ALLOWED_PATH_PREFIXES:
+    for prefix in cfg.registry_allowed_path_prefixes:
         if path_without_root.lower().startswith(prefix.lower()):
             allowed = True
             break
@@ -187,7 +182,7 @@ def _auto_verify_before_add(command: str) -> dict | None:
         return {
             "valid": False,
             "message": f"注册表路径不在白名单中",
-            "allowed_paths": ALLOWED_PATH_PREFIXES
+            "allowed_paths": cfg.registry_allowed_path_prefixes
         }
 
     # add 操作：检查值名和类型
@@ -200,7 +195,7 @@ def _auto_verify_before_add(command: str) -> dict | None:
             if p.lower() == "/t" and i + 1 < len(parts):
                 value_type = parts[i + 1].upper()
 
-        if value_name and value_name in FORBIDDEN_VALUES:
+        if value_name and value_name in cfg.registry_forbidden_values:
             return {"valid": False, "message": f"禁止修改的安全策略值名: {value_name}"}
 
         if value_type and value_type not in ("REG_DWORD", "REG_SZ", "REG_QWORD"):
@@ -223,6 +218,7 @@ def modify_registry(command: str) -> str:
     validation = _validate_registry_command(command)
     operation_tag = command.strip().split()[1].lower() if len(command.strip().split()) >= 2 else "unknown"
 
+    cfg = get_safety_config()
     if not validation["valid"]:
         fail_msg = validation["message"]
         _log_operation(f"BLOCKED ({operation_tag})", command, fail_msg)
@@ -230,8 +226,9 @@ def modify_registry(command: str) -> str:
             "success": False,
             "blocked": True,
             "message": f"注册表安全校验失败: {fail_msg}",
-            "allowed_operations": list(ALLOWED_OPERATIONS),
-            "allowed_paths": ALLOWED_PATH_PREFIXES
+            "fallback": "此操作无法自动完成，请直接告知用户手动操作步骤，不要再尝试 execute_command / run_python 等其他工具。",
+            "allowed_operations": list(cfg.registry_allowed_operations),
+            "allowed_paths": cfg.registry_allowed_path_prefixes
         }, ensure_ascii=False)
 
     # ── reg add 自动验证：键不存在时阻断并返回同路径下真实键值列表 ──

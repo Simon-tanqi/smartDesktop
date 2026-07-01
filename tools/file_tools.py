@@ -8,16 +8,59 @@ import subprocess
 
 from . import register_tool, path_params
 from . import safe_exec
+from config.config_loader import get_safety_config
+from config.settings import MAX_OUTPUT_CHARS
 
 # ── 确认令牌存储：阻止 LLM 自行加 confirmed=true 绕过确认 ──
 # token → (command, expiry_timestamp)
 _pending_confirmations: dict = {}
 
-SKIP_DIRS = {
-    "Windows", "Program Files", "Program Files (x86)", "ProgramData",
-    "$RECYCLE.BIN", "System Volume Information", "Recovery",
-    "node_modules", "__pycache__", ".git", ".vscode", ".idea",
-    "AppData", "Local Settings", "Application Data", "Temp"
+# ── 只读命令白名单：这些命令/program 不触发确认，直接执行 ──
+# 包括：打开应用、信息查询、文件读取等无副作用操作
+READONLY_PATTERNS: set = {
+    # 应用启动（只读打开，无副作用）
+    "explorer", "notepad", "calc", "mspaint", "charmap",
+    # PowerShell 查询 cmdlet
+    "get-childitem", "get-itemproperty", "get-process", "get-service",
+    "get-content", "get-wmiobject", "get-ciminstance", "get-item",
+    "get-date", "get-location", "get-history", "get-command",
+    "get-module", "get-variable", "get-alias", "get-psdrive",
+    "get-psprovider", "get-host", "get-culture", "get-uiculture",
+    # CMD 查询 / 输出命令
+    "dir", "cat", "type", "echo", "where", "findstr",
+    "select-string", "write-host", "write-output",
+    # 系统信息查询
+    "whoami", "hostname", "systeminfo", "tasklist",
+    "net", "ipconfig", "ping", "tracert", "nslookup",
+    # 文件比较 / 校验
+    "fc", "comp", "certutil",
+    # Python 只读类（python 本身已在 skip_confirm_programs，此处防遗漏）
+    # Git 只读类
+    # 其他只读工具
+    "wmic",
+}
+
+# ── 低风险注册表操作关键词：用户偏好类（桌面图标/任务栏/资源管理器外观）直接放行 ──
+# 命中且路径在 HKCU 下的操作不触发确认弹窗
+LOW_RISK_REGISTRY_PATTERNS = {
+    # 桌面图标显隐（纯UI偏好，零风险）
+    "HideDesktopIcons",
+    "ShowDesktopIcons",
+    # 任务栏设置
+    "ShowSecondsInSystemClock",
+    "TaskbarSi",
+    "TaskbarDa",
+    "TaskbarGlomLevel",
+    "EnableAutoTray",
+    # 文件资源管理器偏好
+    "ShowStatusBar",
+    "ShowPreviewHandlers",
+    "Hidden",
+    "HideFileExt",
+    "ShowSuperHidden",
+    # 开始菜单/搜索
+    "Start_Show",
+    "DisableSearchBoxSuggestions",
 }
 
 
@@ -96,41 +139,7 @@ def resolve_folder(parent_dir: str, target_name: str):
 #   - 免确认列表内的命令直接执行（静默）
 #   - 列表外的命令弹出确认，用户看到完整命令后决定（类似 msiexec 确认流程）
 # 危险命令（reg delete 等）由 safe_exec 挑战短语兜底
-FORBIDDEN_PATTERNS = ["rm -rf /", "del /f /s", "format ", "shutdown"]  # "format " 带空格仅拦截 format 磁盘格式化命令，不影响 Format-Table/Format-List
-
-# 注册表写入命令：直接拒绝，引导 LLM 使用 modify_registry 工具
-REGISTRY_WRITE_COMMANDS = ["reg add", "reg delete", "reg import"]
-REGISTRY_WRITE_REDIRECT_MSG = (
-    "注册表写入操作已被 execute_command 拦截（安全限制）。\n"
-    "请改用 modify_registry 工具，调用格式: modify_registry(command='你的完整 reg add 命令')\n"
-    "示例: modify_registry(command='reg add \"HKCU\\\\Control Panel\\\\International\" /v sShortTime /t REG_SZ /d HH:mm:ss /f')\n"
-    "该工具内置自动验证和路径推荐机制，无需先用 reg query 检查。"
-)
-
-# 免确认程序列表：这些程序执行时不弹确认窗，直接透传执行
-SKIP_CONFIRM_PROGRAMS = {
-    "dir", "copy", "move", "del", "mkdir", "rmdir", "echo", "type",
-    "findstr", "where", "python", "pip",
-    "git", "npm", "node", "npx", "yarn",
-    "systeminfo", "wmic", "tasklist", "reg",  # reg query 只读安全；reg add/delete 由 REGISTRY_WRITE_COMMANDS 硬拦截
-}
-
-# ── 命令预检：低效/错误模式（代码层拦截，不靠 LLM 自觉）──
-# 命中后不执行命令，直接返回错误信息指引正确方向
-COMMAND_ANTI_PATTERNS = [
-    # dir /s 全量输出后试图用 findstr 按文件属性过滤 → 方向性错误
-    (r"dir\s+\S+\s+/[sb].*\|.*findstr",
-     "dir /s /b 只输出文件名（不含大小/日期/权限）。"
-     "如果要按文件属性（大小/日期/内容等）过滤，dir 做不到。请改用 python os.walk + 条件判断，在扫描时直接过滤。"),
-    # dir 递归全量重定向到临时文件 → 可能极慢且无意义
-    (r"dir\s+\S+\s+/[sb].*\s*>\s*\S+[Tt]emp",
-     "dir 递归全量输出并重定向到临时文件可能极其缓慢。"
-     "如果最终目标是过滤，请在源头用 python os.walk 加条件判断，不要先生成全量列表再过滤。"),
-]
-
-# ── 输出截断阈值 ──
-MAX_OUTPUT_CHARS = 2000
-
+# 安全集合（FORBIDDEN_PATTERNS / REGISTRY_WRITE_COMMANDS / SKIP_CONFIRM_PROGRAMS / COMMAND_ANTI_PATTERNS）统一托管到 config/safety_rules.yaml
 
 def _get_confirm_log_path() -> str:
     """获取确认日志文件路径"""
@@ -157,7 +166,7 @@ def _log_confirmation(command: str, status: str, detail: str = ""):
 @register_tool
 def execute_command(command: str, working_dir: str = None, confirmed: bool = False,
                     challenge_response: str = None, challenge_token: str = None,
-                    confirmation_token: str = None) -> str:
+                    confirmation_token: str = None, **kwargs) -> str:
     """在终端执行一条命令。
 
     安全机制（两级）：
@@ -176,6 +185,8 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
     stripped = command.lstrip()
     if not stripped:
         return json.dumps({"success": False, "message": "空命令"})
+
+    _confirmed_note = ""  # 所有代码路径统一初始化，避免 UnboundLocalError
 
     # 提取第一个 token（支持双引号/单引号包裹）
     first_token = ""
@@ -197,12 +208,26 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
         first_token = stripped[:i]
 
     prog = os.path.basename(first_token).lower()
-    if prog and prog not in SKIP_CONFIRM_PROGRAMS:
-        # 清理过期令牌（5分钟有效期）
+
+    # ── 只读命令白名单优先放行：匹配则跳过所有确认流程 ──
+    if prog and prog in READONLY_PATTERNS:
+        pass  # 只读命令直接执行，不弹确认
+    elif first_token.lower() in READONLY_PATTERNS:
+        pass  # 完整 token 命中（如 "Get-ChildItem"）
+    elif any(kw in command for kw in LOW_RISK_REGISTRY_PATTERNS) and "hkcu" in command.lower():
+        pass  # 用户偏好类注册表操作（HKCU 路径），直接放行
+    elif challenge_response or challenge_token:
+        pass  # safe_exec 挑战回调：用户已在 execute_command 确认过，不重复弹窗
+    elif prog and prog not in get_safety_config().skip_confirm_programs:
         _now = datetime.now().timestamp()
-        _pending_confirmations.clear()  # 单令牌模式：每次只保留最新一个
+        # 清理过期令牌（过期时间 300s + 10s 宽松缓冲）
+        _expired = [t for t, (_, exp) in _pending_confirmations.items() if _now > exp + 10]
+        for _t in _expired:
+            _pending_confirmations.pop(_t, None)
+        # 过期令牌清理
         if not confirmed:
             # 生成一次性确认令牌，LLM 无法伪造
+            _pending_confirmations.clear()  # 单令牌模式：每次只保留最新一个
             _token = secrets.token_hex(8)
             _pending_confirmations[_token] = (command, _now + 300)
             _log_confirmation(command, "CONFIRM_REQUIRED", f"程序 '{first_token}' 不在免确认列表 | token={_token}")
@@ -213,36 +238,44 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
                 "command": command
             }, ensure_ascii=False)
         else:
-            # 验证令牌
+            # 验证令牌：存在性 + 过期时间（含 10s 缓冲）
             if not confirmation_token or confirmation_token not in _pending_confirmations:
-                # 可能是 LLM 自行加 confirmed=true 绕过，拒绝
-                _log_confirmation(command, "BYPASS_BLOCKED", f"LLM 尝试绕过确认，无有效令牌")
+                # 可能是 LLM 自行加 confirmed=true 绕过，或令牌已过期/已使用，拒绝
+                _log_confirmation(command, "BYPASS_BLOCKED", f"LLM 尝试绕过确认或令牌已失效，无有效令牌")
                 return json.dumps({
                     "success": False,
                     "confirmation_required": True,
                     "message": f"确认已失效或无有效令牌。请重新发起命令以获取新的确认提示。",
                 }, ensure_ascii=False)
+            _stored_cmd, _expiry = _pending_confirmations[confirmation_token]
+            if _now > _expiry + 10:
+                # 过期超过 10 秒缓冲，拒绝
+                _pending_confirmations.pop(confirmation_token, None)
+                _log_confirmation(command, "TOKEN_EXPIRED", f"令牌已过期 (expiry={_expiry:.0f}, now={_now:.0f}, diff={_now - _expiry:.0f}s)")
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "message": f"确认已过期（{(_now - _expiry):.0f}秒前）。请重新发起命令以获取新的确认提示。",
+                }, ensure_ascii=False)
             # 令牌有效，清理并放行
             del _pending_confirmations[confirmation_token]
-            _log_confirmation(command, "CONFIRMED", f"令牌验证通过")
+            _log_confirmation(command, "CONFIRMED", f"令牌验证通过 (剩余 {(_expiry - _now):.0f}s)")
+            # 确认回调上下文：告知 LLM 命令已由用户确认执行，禁止重复发起
+            _confirmed_note = (
+                f"【系统指令】以下命令已由用户确认并执行：\n"
+                f"  {_stored_cmd}\n"
+                f"请基于执行结果继续完成原始任务。严禁再次调用 execute_command 执行相同或等效的命令。"
+            )
+
 
     cmd_lower = command.lower()
-    for pattern in FORBIDDEN_PATTERNS:
+    for pattern in get_safety_config().forbidden_patterns:
         if pattern.lower() in cmd_lower:
             return json.dumps({"success": False, "message": f"安全限制：命令包含禁止模式 '{pattern}'"})
 
-    # ── 注册表写入拦截：reg add/delete/import 直接拒绝，引导 LLM 用 modify_registry ──
-    for _rw_cmd in REGISTRY_WRITE_COMMANDS:
-        if _rw_cmd in cmd_lower:
-            _log_confirmation(command, "REGISTRY_BLOCKED", f"命中注册表写入命令: {_rw_cmd}")
-            return json.dumps({
-                "success": False,
-                "message": REGISTRY_WRITE_REDIRECT_MSG,
-            }, ensure_ascii=False)
-
     # ── 命令预检：拦截低效/错误模式 ──
     import re as _re
-    for _pat, _msg in COMMAND_ANTI_PATTERNS:
+    for _pat, _msg in get_safety_config().command_anti_patterns:
         if _re.search(_pat, command):
             _log_confirmation(command, "ANTI_PATTERN_BLOCKED", f"命中模式: {_pat}")
             return json.dumps({
@@ -261,6 +294,8 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
 
     if result.get("challenge_required"):
         _log_confirmation(command, "CHALLENGE", result.get("danger_type", ""))
+        if _confirmed_note:
+            result["_confirmation_context"] = _confirmed_note
         return json.dumps(result, ensure_ascii=False)
 
     if result.get("success"):
@@ -280,10 +315,15 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
             "output": display,
             "output_total_chars": output_len,
             "truncated": truncated,
+            **({"_confirmation_context": _confirmed_note} if _confirmed_note else {}),
         }, ensure_ascii=False)
 
     _log_confirmation(command, "FAILED", result.get("message", ""))
-    return json.dumps({"success": False, "message": result.get("message", "")}, ensure_ascii=False)
+    return json.dumps({
+        "success": False,
+        "message": result.get("message", ""),
+        **({"_confirmation_context": _confirmed_note} if _confirmed_note else {}),
+    }, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════
@@ -294,8 +334,56 @@ PYTHON_OUTPUT_MAX_CHARS = 8000
 PYTHON_TIMEOUT_DEFAULT = 300
 
 
+# ── 工业级鲁棒性：自动注入标准库导入，消除 NameError 类低级错误 ──
+_PY_RUN_PRELUDE = (
+    "import sys, os, json, traceback, subprocess, pathlib, shutil, importlib, re\n"
+)
+
+
+def _parse_traceback_info(stderr_text: str) -> dict:
+    """从 stderr 中解析 traceback，提取结构化错误信息。"""
+    lines = stderr_text.split('\n')
+    exc_type = ""
+    exc_msg = ""
+    last_frames = []
+    in_tb = False
+
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped.startswith('Traceback (most recent call last):'):
+            in_tb = True
+            continue
+        if in_tb and stripped.startswith('  File '):
+            last_frames.append(stripped.strip())
+            continue
+        if in_tb and stripped and not stripped.startswith(' '):
+            exc_type = stripped
+            exc_msg = stripped
+            break
+
+    # 压缩帧信息：只保留最后 3 帧，去除工作目录前缀
+    relevant_frames = last_frames[-3:] if last_frames else []
+    short_frames = []
+    for f in relevant_frames:
+        # 去掉冗长的路径前缀
+        if ', line ' in f:
+            parts = f.split(', line ', 1)
+            fname = os.path.basename(parts[0].replace('  File "', '').rstrip('"'))
+            short_frames.append(f'  File "{fname}", line {parts[1]}')
+        else:
+            short_frames.append(f)
+
+    return {
+        "exception_type": exc_type.split(':')[0] if ':' in exc_type else exc_type,
+        "exception_message": exc_msg,
+        "last_frames": short_frames,
+    }
+
+
 @register_tool(timeout=320)
-def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT) -> str:
+
+
+def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT, **kwargs) -> str:
     """直接执行 Python 代码并返回输出结果。适用于复杂文件遍历、数据处理等命令行难以胜任的任务。
 
     code: 完整的 Python 代码字符串（不是文件路径）。可以用 print() 输出结果，结果会被自动捕获返回。
@@ -331,14 +419,16 @@ def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT) -> str:
                 "success": False,
                 "message": (
                     "Python 代码中包含注册表写入操作（检测到关键字），已被 run_python 拦截。\n"
-                    "请改用专用工具 modify_registry 来修改注册表，该工具内置自动验证和路径推荐机制。"
+                    "请改用专用工具 modify_registry 来修改注册表，该工具内置自动验证和路径推荐机制。\n"
+                    "如果 modify_registry 也失败：直接告知用户手动操作步骤，不要再尝试 execute_command 或其他工具。"
                 ),
             }, ensure_ascii=False)
 
     import sys
     import tempfile
 
-    code = code.strip()
+    # ── 工业级鲁棒性：自动注入标准库前导，消除 NameError ──
+    code = _PY_RUN_PRELUDE + code.strip()
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
@@ -361,10 +451,41 @@ def run_python(code: str, timeout: int = PYTHON_TIMEOUT_DEFAULT) -> str:
         stderr = result.stderr.strip()
 
         if result.returncode != 0:
+            # ── 结构化错误：解析 traceback，注入错误分类和修复线索 ──
+            tb_info = _parse_traceback_info(stderr) if stderr else {}
             error_msg = stderr if stderr else f"脚本退出码: {result.returncode}"
+
+            exc_type = tb_info.get("exception_type", "")
+            frames = tb_info.get("last_frames", [])
+
+            # 错误分类映射
+            ERROR_CATEGORIES = {
+                "ModuleNotFoundError": ("dependency", "缺失依赖包，请执行 pip install <包名>"),
+                "ImportError": ("dependency", "导入失败，检查包名是否正确或是否需要 pip install"),
+                "NameError": ("logic", "变量/函数未定义，检查是否缺少 import 或拼写错误"),
+                "TypeError": ("logic", "类型错误，检查函数参数类型是否匹配 API 要求"),
+                "AttributeError": ("logic", "对象不存在该属性/方法，检查 API 调用方式是否正确"),
+                "FileNotFoundError": ("io", "文件路径不存在，请先确认路径"),
+                "PermissionError": ("io", "权限不足，可能需要管理员权限"),
+                "ValueError": ("logic", "值错误，检查传入参数值是否合法"),
+                "KeyError": ("logic", "键不存在，检查字典/配置中是否包含该键"),
+                "IndexError": ("logic", "索引越界，检查列表/序列长度"),
+                "SyntaxError": ("syntax", "代码语法错误，检查引号/括号/缩进"),
+                "IndentationError": ("syntax", "缩进错误，检查代码块缩进是否一致"),
+            }
+
+            category, fix_hint = ERROR_CATEGORIES.get(
+                exc_type, ("unknown", "未知错误类型，请仔细阅读错误信息")
+            )
+
             return json.dumps({
                 "success": False,
-                "message": f"Python 执行失败:\n{error_msg}",
+                "error_category": category,
+                "error_fix_hint": fix_hint,
+                "exception_type": exc_type,
+                "exception_message": tb_info.get("exception_message", ""),
+                "last_frames": frames,
+                "message": f"Python 执行失败 [{exc_type}]:\n{error_msg}",
                 "stdout": stdout[:2000] if stdout else "",
             }, ensure_ascii=False)
 

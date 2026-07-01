@@ -1,11 +1,11 @@
 """
-结构化日志模块 — JSON Lines 格式，按天轮转，保留 30 天。
+结构化日志模块 — JSON Lines 格式，按天轮转，永久保留。
 
 特性：
 - 分级：DEBUG / INFO / WARNING / ERROR
 - 每条日志一个 JSON 对象，一行写入
 - 按天切分文件：logs/agent_YYYY-MM-DD.jsonl
-- 自动清理超过 30 天的旧日志
+- 日志总大小超 500MB 时启动弹窗提醒（不再自动删除旧日志）
 - 内存缓冲 + 批量刷盘，减少 I/O
 - 线程安全
 """
@@ -19,7 +19,6 @@ from pathlib import Path
 
 # ── 配置 ──
 LOG_DIR = Path(__file__).parent / "logs"
-RETENTION_DAYS = 30
 FLUSH_INTERVAL = 5          # 秒，缓冲刷盘间隔
 MAX_BUFFER_SIZE = 50        # 条，缓冲条数达此值立即刷盘
 
@@ -53,20 +52,6 @@ class StructuredLogger:
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self._current_date:
             self._open_file(today)
-            # 清理旧日志
-            self._cleanup()
-
-    def _cleanup(self):
-        """删除超过保留天数的日志文件及索引"""
-        cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
-        for f in list(LOG_DIR.glob("agent_*.jsonl")) + list(LOG_DIR.glob("agent_*.idx")):
-            try:
-                date_part = f.stem.replace("agent_", "")
-                file_date = datetime.strptime(date_part, "%Y-%m-%d")
-                if file_date < cutoff:
-                    f.unlink()
-            except (ValueError, OSError):
-                pass
 
     def _flush(self):
         """缓冲刷盘，同时写入 byte-offset 索引以加速后续查询"""
@@ -151,65 +136,129 @@ class StructuredLogger:
                      messages: list[dict], response: str,
                      model_name: str = "", provider: str = "",
                      elapsed_ms: int = 0, token_estimate: int = 0,
-                     session_name: str = ""):
+                     session_name: str = "", reasoning: str = ""):
         """
-        记录 LLM 调用：
-        - 元信息（摘要）写入 JSON Lines 检索层
-        - 仅保留当前轮 messages（system prompt + 当前用户消息 + 尾部 system 注入），
-          写入独立文件 `{session_name}_{session_id}_turn{N}.json`
+        记录 LLM 调用：每个 turn 自包含完整信息。
+
+        文件路径：llm_calls/{date}/{session_id}/{session_id}_{session_name}_turn{turn_index}.json
+        内容结构：
+        - system_prompt: 完整 system prompt 文本
+        - user_input: 本轮用户输入
+        - ai_thinking: AI 思考过程（推理模型的 reasoning_content）
+        - ai_tool_calls: AI 工具调用（从 response JSON 解析 tool_name + arguments）
+        - ai_reply: AI 最终回复文本（final_message 或纯文本回退）
+        - 元信息：model, elapsed_ms, token_estimate, timestamp
         """
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-        # ── 完整内容另存 ──
-        llm_dir = LOG_DIR / "llm_calls" / date_str
-        llm_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = session_name.replace(" ", "_") if session_name else "untitled"
-        full_path = llm_dir / f"{safe_name}_{session_id}_turn{turn_index}.json"
+        # ── 为兼容文件系统，session_name 做安全处理 ──
+        safe_name = session_name.strip() if session_name else "untitled"
+        # 替换文件系统非法字符
+        for ch in r'<>:"/\|?*':
+            safe_name = safe_name.replace(ch, '_')
+        if not safe_name:
+            safe_name = "untitled"
 
-        # 仅保留当前轮 messages：system prompt + 当前轮 user 消息 + 尾部 system 注入
-        filtered = [messages[0]]  # system prompt
-        user_idx = 2 * turn_index + 1
-        if user_idx < len(messages):
-            filtered.append(messages[user_idx])
-        if len(messages) > user_idx + 1:
-            filtered.extend(messages[user_idx + 1:])
+        filename = f"{session_id}_{safe_name}_turn{turn_index}.json"
 
-        prompt_chars = sum(len(str(m.get("content", ""))) for m in filtered)
-        response_chars = len(response)
+        # ── session 目录 ──
+        session_dir = LOG_DIR / "llm_calls" / date_str / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(full_path, "w", encoding="utf-8") as f:
-            payload = {
-                "trace_id": trace_id,
-                "session_id": session_id,
-                "turn": turn_index,
-                "model": f"{provider}/{model_name}",
-                "elapsed_ms": elapsed_ms,
-                "token_estimate": token_estimate,
-                "response": response,
-                "messages": filtered,
-            }
+        # ── 1. 提取 system_prompt（messages 首条 system 角色消息的完整 content）──
+        sys_prompt_text = ""
+        for m in messages:
+            if m.get("role") == "system":
+                sys_prompt_text = str(m.get("content", ""))
+                break
+        if not sys_prompt_text and messages:
+            sys_prompt_text = str(messages[0].get("content", ""))
+
+        # ── 2. 提取 user_input（最后一个非工具返回的 user 消息）──
+        user_input = ""
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "user":
+                content = str(messages[i].get("content", ""))
+                if not (content.startswith("工具 ") or content.startswith("❌ 工具 ")):
+                    user_input = content
+                    break
+
+        # ── 3. 解析 response 判断类型 ──
+        ai_tool_calls = []
+        ai_reply = ""
+        try:
+            parsed = json.loads(response) if isinstance(response, str) else response
+            if isinstance(parsed, dict):
+                if "tool_name" in parsed or "tool_call" in parsed:
+                    tool_name = parsed.get("tool_name") or parsed.get("tool_call", "")
+                    ai_tool_calls = [{
+                        "tool": tool_name,
+                        "arguments": parsed.get("arguments", {})
+                    }]
+                elif "final_message" in parsed:
+                    ai_reply = parsed["final_message"]
+                elif "progress" in parsed:
+                    ai_reply = parsed["progress"]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            # 非 JSON 响应，视为纯文本回复
+            ai_reply = response.strip() if response else ""
+
+        # ── 4. 写入 turn 文件 ──
+        turn_path = session_dir / filename
+        payload = {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "session_name": safe_name,
+            "turn": turn_index,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "system_prompt": sys_prompt_text,
+            "user_input": user_input,
+            "ai_thinking": reasoning.strip() if reasoning else "",
+            "ai_tool_calls": ai_tool_calls,
+            "ai_reply": ai_reply,
+            "model": f"{provider}/{model_name}",
+            "elapsed_ms": elapsed_ms,
+            "token_estimate": token_estimate,
+        }
+        with open(turn_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
-        # ── 元信息写入检索层 ──
+        # ── 5. 元信息写入检索层 ──
+        prompt_chars = len(sys_prompt_text) + len(user_input)
+        response_chars = len(response)
         self.info("LLM调用",
                   trace_id=trace_id, session_id=session_id,
                   turn=turn_index, model=f"{provider}/{model_name}",
                   elapsed_ms=elapsed_ms, tokens=token_estimate,
                   prompt_chars=prompt_chars, response_chars=response_chars,
-                  full_path=str(full_path))
+                  full_path=str(turn_path))
 
-    def get_llm_call_file(self, session_id: str, turn: int) -> str | None:
-        """根据 session_id 和 turn 定位完整 LLM 调用文件。扫描最近 7 天的 llm_calls 目录。
-        文件名格式 `{session_name}_{session_id}_turn{N}.json`，用 glob 匹配 session_id 段。"""
+    def get_llm_call_file(self, session_id: str, turn: int, session_name: str = "") -> str | None:
+        """根据 session_id、turn 和可选的 session_name 定位 LLM 调用文件。
+        扫描最近 7 天的 llm_calls 目录。
+        
+        文件路径：`llm_calls/{date}/{session_id}/{session_id}_{session_name}_turn{turn}.json`
+        若不传 session_name，扫描目录下所有文件按前缀匹配。
+        """
         for days_ago in range(7):
             date_str = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-            llm_dir = LOG_DIR / "llm_calls" / date_str
-            if not llm_dir.exists():
+            base_dir = LOG_DIR / "llm_calls" / date_str / session_id
+            if not base_dir.exists():
                 continue
-            pattern = f"*_{session_id}_turn{turn}.json"
-            hits = list(llm_dir.glob(pattern))
-            if hits:
-                return str(hits[0])
+            if session_name:
+                safe_name = session_name.strip()
+                for ch in r'<>:"/\|?*':
+                    safe_name = safe_name.replace(ch, '_')
+                candidate = base_dir / f"{session_id}_{safe_name}_turn{turn}.json"
+                if candidate.exists():
+                    return str(candidate)
+            else:
+                # 无 session_name 时扫描匹配前缀
+                prefix = f"{session_id}_"
+                suffix = f"_turn{turn}.json"
+                for f in base_dir.iterdir():
+                    if f.name.startswith(prefix) and f.name.endswith(suffix):
+                        return str(f)
         return None
 
     # ── 查询接口 ──

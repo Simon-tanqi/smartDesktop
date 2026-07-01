@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Agent 聊天界面 (多会话版)</title>
+    <title>Tank_桌面前端</title>
     <style>
         /* --- 基础样式 --- */
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -349,6 +349,52 @@
             0%   { transform: translateX(-100%); }
             50%  { transform: translateX(250%); }
             100% { transform: translateX(-100%); }
+        }
+
+        /* ── 命令确认卡片 ── */
+        .confirm-card {
+            padding: 14px 16px; margin-bottom: 10px;
+            background: #fff8e1; border: 1px solid #ffc107;
+            border-radius: 8px; animation: fadeIn 0.25s ease;
+            max-width: 100%;
+        }
+        .confirm-card .confirm-header {
+            font-size: 13px; color: #e65100; font-weight: 600;
+            margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+        }
+        .confirm-card .confirm-cmd {
+            font-family: 'Consolas',monospace; font-size: 12px;
+            background: #fff; border: 1px solid #ffe082;
+            border-radius: 4px; padding: 8px 10px; margin-bottom: 10px;
+            word-break: break-all; color: #333; max-height: 80px; overflow-y: auto;
+        }
+        .confirm-card .confirm-actions {
+            display: flex; gap: 10px; justify-content: flex-end;
+        }
+        .confirm-card .confirm-actions button {
+            padding: 6px 18px; border-radius: 5px; border: none;
+            font-size: 13px; cursor: pointer; font-weight: 500;
+            transition: background 0.15s;
+        }
+        .confirm-card .btn-confirm-ok {
+            background: #667eea; color: #fff;
+        }
+        .confirm-card .btn-confirm-ok:hover { background: #5a6fd6; }
+        .confirm-card .btn-confirm-cancel {
+            background: #e0e0e0; color: #555;
+        }
+        .confirm-card .btn-confirm-cancel:hover { background: #ccc; }
+        .confirm-card .confirm-details {
+            margin: 8px 0; font-size: 12px;
+        }
+        .confirm-card .confirm-detail-row {
+            display: flex; padding: 3px 0; border-bottom: 1px solid #444;
+        }
+        .confirm-card .confirm-detail-key {
+            color: #999; min-width: 70px; flex-shrink: 0;
+        }
+        .confirm-card .confirm-detail-val {
+            color: #eee; word-break: break-all;
         }
 
         /* 可操作错误气泡 */
@@ -782,7 +828,7 @@
         <div class="main-content">
             <div class="header">
                 <h1>🤖 AI Agent</h1>
-                <p>智能对话助手 - 支持多会话记忆</p>
+                <p>Tank_桌面前端</p>
             </div>
             
             <div class="chat-area" id="chatArea">
@@ -978,8 +1024,16 @@
 		}
 
 		function renderMarkdown(text) {
-			let html = escapeHtml(text);
+			// 先提取图片语法，用占位符保护，避免被 escapeHtml 破坏
+			const images = [];
+			let processed = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
+				images.push(`<img src="${url}" alt="${alt}" style="max-width:100%;border-radius:8px;margin:8px 0">`);
+				return `\uE000IMG_${images.length - 1}\uE000`;
+			});
+			let html = escapeHtml(processed);
 			html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+			// 还原图片（U+E000 是 Unicode 私用区，escapeHtml 不处理）
+			html = html.replace(/\uE000IMG_(\d+)\uE000/g, (match, idx) => images[idx]);
 			return html;
 		}
 
@@ -1477,6 +1531,60 @@
 										toolProgress.style.display = 'block';
 									}
 									autoScrollToBottom();
+									break;
+								case 'confirm':
+									// 通用确认卡片：标题 + 详情（命令/下载等均可）
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
+									resetToolProgress();
+									{
+										const card = document.createElement('div');
+										card.className = 'confirm-card';
+										card.id = 'confirm-' + data.confirmation_token;
+										const title = data.title || '⚠ 操作需要确认';
+										const isDownload = data.tool_name === 'web_download';
+										const btnText = isDownload ? '确认下载' : '确认执行';
+										let bodyHtml = '';
+										if (data.details && Object.keys(data.details).length > 0) {
+											bodyHtml = '<div class="confirm-details">';
+											for (const [key, val] of Object.entries(data.details)) {
+												bodyHtml += `<div class="confirm-detail-row"><span class="confirm-detail-key">${escapeHtml(key)}</span><span class="confirm-detail-val">${escapeHtml(String(val))}</span></div>`;
+											}
+											bodyHtml += '</div>';
+										} else if (data.command) {
+											bodyHtml = `<div class="confirm-cmd">${escapeHtml(data.command)}</div>`;
+										}
+										card.innerHTML = `
+											<div class="confirm-header">${escapeHtml(title)}</div>
+											${bodyHtml}
+											<div class="confirm-actions">
+												<button class="btn-confirm-ok" data-action="confirm">${btnText}</button>
+												<button class="btn-confirm-cancel" data-action="cancel">取消</button>
+											</div>
+										`;
+										chatContainer.insertBefore(card, typingIndicator);
+										autoScrollToBottom();
+										const token = data.confirmation_token;
+										card.querySelector('.btn-confirm-ok').addEventListener('click', async () => {
+											card.querySelector('.confirm-actions').innerHTML = '<span style="color:#888;font-size:12px">正在执行...</span>';
+											await fetch('/api/confirm', {
+												method: 'POST',
+												headers: { 'Content-Type': 'application/json' },
+												body: JSON.stringify({ confirmation_token: token, confirmed: true })
+											});
+											card.remove();
+										});
+										card.querySelector('.btn-confirm-cancel').addEventListener('click', async () => {
+											card.querySelector('.confirm-actions').innerHTML = '<span style="color:#c62828;font-size:12px">已取消</span>';
+											setTimeout(() => card.remove(), 1500);
+											await fetch('/api/confirm', {
+												method: 'POST',
+												headers: { 'Content-Type': 'application/json' },
+												body: JSON.stringify({ confirmation_token: token, confirmed: false })
+											});
+										});
+									}
 									break;
 								case 'final':
 									clearTimeout(slowTimer);

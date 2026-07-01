@@ -404,7 +404,7 @@ def parse_ai_json(content):
             for line in lines:
                 try:
                     obj = repair_loads(line)
-                    if isinstance(obj, dict) and ("tool_name" in obj or "final_message" in obj or "progress" in obj):
+                    if isinstance(obj, dict) and ("tool_name" in obj or "tool_call" in obj or "final_message" in obj or "progress" in obj):
                         return obj
                 except Exception:
                     continue

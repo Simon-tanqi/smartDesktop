@@ -1,0 +1,40 @@
+{
+  "固化记录": {
+    "帮我打开资源管理器": {
+      "query_hash": "0f2b0818a25e",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我列出我电脑D,E,F三个盘中文件大小大于1G的文件": {
+      "query_hash": "713510a1f303",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把我电脑的回收站图标放出来": {
+      "query_hash": "0fbcc5b9bcae",
+      "success_count": 5,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "确认": {
+      "query_hash": "36f33adaf094",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    }
+  }
+}

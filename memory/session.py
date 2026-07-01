@@ -252,7 +252,58 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
     return sorted(set(exclude_indices), reverse=True)
 
 
-def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
+def _calculate_session_relevance(current_user_msg, messages, threshold=0.1):
+    """计算当前用户消息与会话历史的加权 bigram Jaccard 相似度。
+
+    对每条历史用户消息计算 bigram 交集/并集，按时间线性加权（越近权重越高，
+    范围 0.5-1.0），最终加权平均分低于 threshold 时判定话题已切换。
+
+    返回 (is_relevant: bool, avg_score: float)
+    """
+    if not current_user_msg or not messages:
+        return True, 1.0
+
+    def _bigrams(text):
+        chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
+        if len(chinese) < 2:
+            return set()
+        return {chinese[i:i+2] for i in range(len(chinese)-1)}
+
+    current_bigrams = _bigrams(current_user_msg)
+    if not current_bigrams:
+        return True, 1.0  # 无法提取中文 bigram，保留上下文
+
+    user_messages = [(i, m) for i, m in enumerate(messages) if m.get("role") == "user"]
+    if not user_messages:
+        return True, 1.0
+
+    total_weight = 0.0
+    weighted_score = 0.0
+    n = len(user_messages)
+
+    for idx, (pos, msg) in enumerate(user_messages):
+        hist_bigrams = _bigrams(msg.get("content", ""))
+        if not hist_bigrams:
+            continue
+        intersection = len(current_bigrams & hist_bigrams)
+        union = len(current_bigrams | hist_bigrams)
+        if union == 0:
+            continue
+        score = intersection / union
+
+        # 越近权重越高：0.5 → 1.0 线性递增
+        recency_weight = 0.5 + 0.5 * (idx / max(n - 1, 1))
+        weighted_score += score * recency_weight
+        total_weight += recency_weight
+
+    if total_weight == 0:
+        return False, 0.0
+
+    avg_score = weighted_score / total_weight
+    return avg_score >= threshold, avg_score
+
+
+def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
     """构建 LLM 上下文消息列表。"""
     messages = get_session_messages(session_id, limit=limit)
 
@@ -263,15 +314,24 @@ def build_context_messages(session_id, limit=500, summary_max_tokens=SUMMARY_TOK
             break
 
     if last_user_msg:
-        exclude_indices = _detect_repeated_query(messages, last_user_msg)
-        if exclude_indices:
-            for idx in exclude_indices:
-                if idx < len(messages):
-                    del messages[idx]
-            messages.append({
-                "role": "system",
-                "content": "【注意】用户重复了之前提问。历史工具调用结果已保留，已完成部分可直接引用，但失败/遗漏部分需重新执行。"
-            })
+        # ── 召回过滤：话题相关性检测 ──
+        from memory.config import RECALL_RELEVANCE_THRESHOLD
+        is_relevant, relevance_score = _calculate_session_relevance(
+            last_user_msg, messages, threshold=RECALL_RELEVANCE_THRESHOLD
+        )
+        if not is_relevant:
+            # 话题已切换，丢弃全部历史上下文，仅保留压缩摘要
+            messages = []
+        else:
+            exclude_indices = _detect_repeated_query(messages, last_user_msg)
+            if exclude_indices:
+                for idx in exclude_indices:
+                    if idx < len(messages):
+                        del messages[idx]
+                messages.append({
+                    "role": "system",
+                    "content": "【注意】用户重复了之前提问。历史工具调用结果已保留，已完成部分可直接引用，但失败/遗漏部分需重新执行。"
+                })
 
     # 清理连续同角色消息：保留每个 user 段的最后一条，丢弃中间的纯 user 段
     # 防止失败请求累积导致全是 user 消息

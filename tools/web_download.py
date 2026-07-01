@@ -3,38 +3,16 @@ import os
 import re
 import json
 import time
+import uuid
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 
 import requests
 
 from . import register_tool
+from config.config_loader import get_safety_config
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-
-# 安全文件类型白名单
-SAFE_EXTENSIONS = {
-    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico",
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv",
-    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma",
-    ".json", ".csv", ".xml", ".yaml", ".yml",
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".txt", ".log", ".md",
-}
-
-# 明确禁止的扩展名（即使在白名单中也拒绝）
-BLOCKED_EXTENSIONS = {".exe", ".bat", ".cmd", ".sh", ".msi", ".scr", ".ps1", ".vbs", ".com", ".dll", ".sys"}
-
-# 可信域名：这些域名的 .exe/.msi 允许下载（知名软件官方分发渠道）
-TRUSTED_DOMAINS = {
-    "codebuddy.cn", "download.codebuddy.cn", "copilot.tencent.com",
-    "tencent.com", "qq.com",
-    "microsoft.com", "visualstudio.com", "github.com",
-    "apple.com",
-    "google.com", "googleapis.com",
-    "mozilla.org", "adobe.com", "oracle.com",
-}
 
 
 def _extract_filename(url: str, content_disposition: str = None) -> str:
@@ -56,27 +34,6 @@ def _extract_filename(url: str, content_disposition: str = None) -> str:
     return "download"
 
 
-def _validate_extension(filename: str, url: str = "") -> tuple[bool, str]:
-    """校验文件扩展名是否安全。返回 (允许, 扩展名)。
-    可信域名的 .exe/.msi 文件放行。
-    """
-    ext = os.path.splitext(filename)[1].lower()
-    # 可信域名放行 .exe/.msi
-    if ext in BLOCKED_EXTENSIONS:
-        if url:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            # 去掉端口
-            domain = domain.split(":")[0]
-            # 检查是否匹配可信域名（含子域名）
-            if any(domain == td or domain.endswith("." + td) for td in TRUSTED_DOMAINS):
-                return True, ext
-        return False, ext
-    if ext not in SAFE_EXTENSIONS:
-        return False, ext
-    return True, ext
-
-
 def _probe_url(url: str) -> dict:
     """HEAD 探测 URL 的 Content-Type、Content-Length 和 Content-Disposition"""
     try:
@@ -93,19 +50,16 @@ def _probe_url(url: str) -> dict:
 
 
 @register_tool(timeout=120)
-def web_download(url: str, output_dir: str = None):
+def web_download(url: str, output_dir: str = None, confirmed: bool = False, confirmation_token: str = ""):
     """
-    从 URL 下载文件到本地。支持 PDF、图片、音视频、Office 文档等常见格式。
+    从 URL 下载文件到本地。除可执行文件需要用户确认外，无文件类型限制。
 
     - url: 要下载的文件直链 URL
     - output_dir: 保存目录，默认下载到用户的 Downloads 文件夹
+    - confirmed: 内部标志，LLM 勿传
+    - confirmation_token: 内部标志，LLM 勿传
 
-    特性：
-    1. HEAD 探测 Content-Type 和文件大小
-    2. 流式下载，支持大文件
-    3. 自动从 URL / Content-Disposition 提取文件名
-    4. 安全类型白名单，拒绝可执行文件
-    5. 下载进度通过 SSE progress 事件上报
+    可执行文件（.exe/.msi/.bat 等）下载前会弹出确认卡片让用户判断来源是否可信。
     """
     # 确定输出目录
     if output_dir:
@@ -124,30 +78,41 @@ def web_download(url: str, output_dir: str = None):
     content_disposition = probe.get("content_disposition", "")
     final_url = probe.get("final_url", url)
 
-    # 提取并校验文件名
+    # 提取文件名
     filename = _extract_filename(final_url, content_disposition)
-    allowed, ext = _validate_extension(filename, url)
-    if not allowed:
-        reason = "文件类型被拦截" if ext in BLOCKED_EXTENSIONS else f"不在白名单中 (.{ext})"
-        return json.dumps({
-            "success": False,
-            "error": f"{reason}",
-            "filename": filename,
-            "extension": ext,
-            "content_type": content_type,
-            "hint": "支持的类型: " + ", ".join(sorted(SAFE_EXTENSIONS))
-        }, ensure_ascii=False)
+    ext = os.path.splitext(filename)[1].lower()
 
     # 预估文件大小
     file_size = int(content_length_str) if content_length_str and content_length_str.isdigit() else None
     size_display = f"{file_size / 1024 / 1024:.1f} MB" if file_size else "未知大小"
 
+    # 可执行文件：未确认时返回确认请求
+    if ext in get_safety_config().risky_extensions:
+        if not confirmed:
+            token = uuid.uuid4().hex
+            return json.dumps({
+                "confirmation_required": True,
+                "confirmation_token": token,
+                "title": "下载可执行文件确认",
+                "message": f"即将下载 {filename}（{size_display}）",
+                "details": {
+                    "文件名": filename,
+                    "类型": f"{ext} 可执行文件",
+                    "来源URL": final_url,
+                    "大小": size_display,
+                    "风险提示": "可执行文件可能包含恶意代码，请确认来源可信后再下载",
+                },
+                "url": url,
+                "output_dir": output_dir,
+            }, ensure_ascii=False)
+        # confirmed=True 时继续下载，不做二次校验
+
     # 去重：如果文件已存在，加序号
     save_path = dl_dir / filename
     counter = 1
-    stem, ext = os.path.splitext(filename)
+    stem, file_ext = os.path.splitext(filename)
     while save_path.exists():
-        save_path = dl_dir / f"{stem} ({counter}){ext}"
+        save_path = dl_dir / f"{stem} ({counter}){file_ext}"
         counter += 1
 
     # 流式下载
@@ -159,7 +124,6 @@ def web_download(url: str, output_dir: str = None):
         with requests.get(url, stream=True, headers={"User-Agent": USER_AGENT}, timeout=300, allow_redirects=True) as resp:
             resp.raise_for_status()
 
-            # 再次校验实际 Content-Type
             actual_ct = resp.headers.get("Content-Type", "")
             actual_cl = resp.headers.get("Content-Length", "")
             if actual_cl and actual_cl.isdigit():

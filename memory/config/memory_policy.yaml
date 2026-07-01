@@ -11,8 +11,8 @@ compression:
 
   # Token 预算：反向累加确定切割点
   token_budget:
-    soft_threshold: 30000     # 软阈值：超过后异步触发压缩
-    hard_threshold: 50000     # 硬阈值：必须压缩
+    soft_threshold: 6000      # 软阈值：超过后异步触发压缩
+    hard_threshold: 10000     # 硬阈值：必须压缩
     target_tokens: 15000      # 压缩后保留近 N token 原文
 
   # 保留最近 N 轮完整对话（不压缩）
