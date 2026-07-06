@@ -29,19 +29,22 @@ class _ThreadLocalPool(threading.local):
 
     def __del__(self):
         """线程终止时关闭所有连接并从全局注册表移除。"""
-        for path, conn in list(self.conn_pool.items()):
-            try:
-                conn.close()
-            except Exception:
-                pass
-            try:
-                with _global_conn_lock:
-                    if path in _global_conns and conn in _global_conns[path]:
-                        _global_conns[path].remove(conn)
-            except Exception:
-                pass  # 解释器关闭时锁可能已失效
-        self.conn_pool.clear()
-        self.access.clear()
+        try:
+            for path, conn in list(self.conn_pool.items()):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    with _global_conn_lock:
+                        if path in _global_conns and conn in _global_conns[path]:
+                            _global_conns[path].remove(conn)
+                except Exception:
+                    pass  # 解释器关闭时锁可能已失效
+            self.conn_pool.clear()
+            self.access.clear()
+        except Exception:
+            pass  # 防止线程终止时对象已被销毁导致的异常
 
 _tl_pool = _ThreadLocalPool()
 
@@ -52,45 +55,103 @@ _global_conns = {}  # db_path -> list of sqlite3.Connection
 
 @contextmanager
 def _get_conn(db_path, row_factory=False):
-    """获取 SQLite 连接。线程本地 LRU 池，避免跨线程共享。"""
+    """获取 SQLite 连接。线程本地 LRU 池，避免跨线程共享。
+    
+    增强版本：包含连接健康检查和重试机制
+    """
     conn = None
+    orig_row_factory = None
     pool = _tl_pool.conn_pool
     access = _tl_pool.access
-    try:
-        if db_path in pool:
-            conn = pool[db_path]
-            access.remove(db_path)
-        else:
-            if len(pool) >= _MAX_CONNS_PER_THREAD:
-                oldest = access.pop(0)
-                oldest_conn = pool[oldest]
-                oldest_conn.close()
-                del pool[oldest]
-                # 从全局注册表移除被驱逐的连接
+    
+    # 连接重试机制
+    for attempt in range(3):
+        try:
+            # 检查现有连接的健康状态
+            if db_path in pool:
+                conn = pool[db_path]
+                try:
+                    # 测试连接是否仍然有效
+                    conn.execute("SELECT 1").fetchone()
+                    access.remove(db_path)
+                except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+                    # 连接已损坏，需要重建
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    del pool[db_path]
+                    if db_path in access:
+                        access.remove(db_path)
+                    # 从全局注册表移除损坏的连接
+                    with _global_conn_lock:
+                        if db_path in _global_conns and conn in _global_conns[db_path]:
+                            _global_conns[db_path].remove(conn)
+                    conn = None
+            
+            # 创建新连接
+            if conn is None:
+                if len(pool) >= _MAX_CONNS_PER_THREAD:
+                    oldest = access.pop(0)
+                    oldest_conn = pool[oldest]
+                    try:
+                        oldest_conn.close()
+                    except:
+                        pass
+                    del pool[oldest]
+                    # 从全局注册表移除被驱逐的连接
+                    with _global_conn_lock:
+                        if oldest in _global_conns and oldest_conn in _global_conns[oldest]:
+                            _global_conns[oldest].remove(oldest_conn)
+                
+                conn = sqlite3.connect(db_path, check_same_thread=True, timeout=10)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                pool[db_path] = conn
+                # 注册到全局表，以便跨线程关闭
                 with _global_conn_lock:
-                    if oldest in _global_conns and oldest_conn in _global_conns[oldest]:
-                        _global_conns[oldest].remove(oldest_conn)
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            pool[db_path] = conn
-            # 注册到全局表，以便跨线程关闭
-            with _global_conn_lock:
-                _global_conns.setdefault(db_path, []).append(conn)
-        access.append(db_path)
-        orig_row_factory = conn.row_factory
-        if row_factory:
-            conn.row_factory = sqlite3.Row
+                    _global_conns.setdefault(db_path, []).append(conn)
+            
+            access.append(db_path)
+            orig_row_factory = conn.row_factory
+            if row_factory:
+                conn.row_factory = sqlite3.Row
+            
+            # 连接准备就绪，跳出重试循环
+            break
+            
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            if attempt < 2:  # 不是最后一次尝试
+                # 短暂延迟后重试
+                import time
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            else:
+                # 所有重试都失败，重新抛出异常
+                raise
+    
+    try:
         yield conn
     finally:
         if conn:
-            if row_factory:
-                conn.row_factory = orig_row_factory
-            conn.commit()
+            try:
+                if row_factory and orig_row_factory is not None:
+                    conn.row_factory = orig_row_factory
+                conn.commit()
+            except Exception:
+                # 如果commit失败，尝试rollback
+                try:
+                    conn.rollback()
+                except:
+                    pass
 
 
 @contextmanager
 def _get_conn_simple(db_path, row_factory=False):
     """简单连接：每次创建关闭，用于低频操作（trace / oplog）。"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     if row_factory:
         conn.row_factory = sqlite3.Row
     try:
@@ -218,6 +279,7 @@ def _init_chat_tables(conn):
         ("trace_id", "TEXT NOT NULL DEFAULT ''"),
         ("user_id", "TEXT NOT NULL DEFAULT ''"),
         ("msg_id", "TEXT DEFAULT ''"),
+        ("is_temporary", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE chat_history ADD COLUMN {col} {col_type}")
@@ -228,7 +290,8 @@ def _init_chat_tables(conn):
 
 
 def add_chat_message(session_id, role, content, msg_type="chat",
-                     trace_id="", user_id="", timestamp="", msg_id=""):
+                     trace_id="", user_id="", timestamp="", msg_id="",
+                     is_temporary=False):
     if role not in ("user", "assistant", "system"):
         return
     db_path = get_session_messages_db(session_id)
@@ -236,13 +299,13 @@ def add_chat_message(session_id, role, content, msg_type="chat",
         _init_chat_tables(conn)
         if timestamp:
             conn.execute(
-                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type, msg_id, timestamp),
+                "INSERT OR IGNORE INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, is_temporary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (trace_id, user_id, session_id, role, content, msg_type, msg_id, int(is_temporary), timestamp),
             )
         else:
             conn.execute(
-                "INSERT INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type, msg_id),
+                "INSERT OR IGNORE INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, is_temporary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (trace_id, user_id, session_id, role, content, msg_type, msg_id, int(is_temporary)),
             )
 
 
@@ -253,12 +316,12 @@ def get_chat_messages(session_id, limit=200, offset=0):
     with _get_conn(db_path, row_factory=True) as conn:
         _init_chat_tables(conn)
         rows = conn.execute(
-            "SELECT role, content, msg_type, msg_id, created_at FROM chat_history "
+            "SELECT role, content, msg_type, msg_id, is_temporary, created_at FROM chat_history "
             "WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
     return [{"role": r[0], "content": r[1], "msg_type": r[2],
-             "msg_id": r[3], "created_at": r[4]} for r in rows]
+             "msg_id": r[3], "is_temporary": bool(r[4]), "created_at": r[5]} for r in rows]
 
 
 def get_session_messages(session_id, limit=500):
@@ -270,11 +333,27 @@ def get_session_messages(session_id, limit=500):
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content FROM chat_history "
-            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type IS NULL OR msg_type = '') "
+            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type IS NULL OR msg_type = '') AND is_temporary = 0 "
             "ORDER BY id ASC LIMIT ?",
             (session_id, limit),
         ).fetchall()
     return [{"role": r[0], "content": r[1]} for r in rows]
+
+
+def get_full_session_messages(session_id, limit=500):
+    """获取完整的会话消息（包含工具调用和结果）。"""
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    with _get_conn(db_path, row_factory=True) as conn:
+        _init_chat_tables(conn)
+        rows = conn.execute(
+            "SELECT role, content, msg_type FROM chat_history "
+            "WHERE session_id = ? AND is_temporary = 0 "
+            "ORDER BY id ASC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    return [{"role": r[0], "content": r[1], "msg_type": r[2] or "chat"} for r in rows]
 
 
 def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):

@@ -3,50 +3,62 @@
 # ============================================================
 
 always_inject:
-  - execute_command
-  - run_python
-  - write_file
   - read_file
   - scan_directory
-  - web_download
   - search_files
-  - modify_registry
+  - search_content
+  - get_workspace_path
   - get_project_summary
-  - take_screenshot
+  - replace_in_file
+  - ask_user_clarification
+  - load_domain_skills
 
 tools:
-  scan_directory:
-    desc: 扫描目录第一层，返回 JSON 数组 [path必须已存在]
-
-  search_files:
-    desc: 按文件名关键词递归搜索文件（深度3层，跳过系统目录）。全盘深搜用 execute_command 的 Get-ChildItem -Recurse
-    params:
-      keyword: {type: str, desc: 文件名关键词}
-      search_path: {type: str, optional: true, desc: 搜索起始路径，默认用户目录及D/E/F盘}
-      file_extensions: {type: list, optional: true, desc: '扩展名过滤如[".pdf"]'}
-    note: max_results=5；无匹配返回空数组
-
   read_file:
     desc: 读取文件内容（可指定行范围），1-based
     params:
       file_path: {type: str, desc: 绝对路径}
       start_line: {type: int, optional: true, desc: 起始行}
       end_line: {type: int, optional: true, desc: 结束行}
-    note: 大文件(>200行)必须分页
+    note: 大文件可分页读取
+    tier: 1
+    tags: [filesystem, general]
 
-  write_file:
-    desc: 创建新文件，自动建父目录，已存在则重命名
+  scan_directory:
+    desc: 扫描目录第一层，返回 JSON 数组 [path必须已存在]
+    tier: 1
+    tags: [filesystem, general]
 
-  execute_command:
-    desc: 执行Windows终端命令（PowerShell）。免确认列表(dir/copy/python/reg等)直接执行；列表外弹出确认
-    note: 禁止 rm -rf/format/shutdown。超时30s。适合简单的单行命令；涉及多步管道、文本解析、复杂筛选时优先用 run_python
-
-  run_python:
-    desc: 执行Python脚本（pandas+openpyxl+matplotlib+xlsxwriter+winreg+wmi 可用）
+  search_files:
+    desc: 按文件名关键词递归搜索文件（深度3层，跳过系统目录）
     params:
-      code: {type: str, desc: 完整Python代码，用print()输出}
-      timeout: {type: int, default: 300}
-    note: 不可用input()。适合注册表/WMI遍历、复杂文本解析、数据处理、结构化输出等任务
+      keyword: {type: str, desc: 文件名关键词}
+      search_path: {type: str, optional: true, desc: 搜索起始路径，默认用户目录及D/E/F盘}
+      file_extensions: {type: list, optional: true, desc: '扩展名过滤如[".pdf"]'}
+    note: max_results=5
+    tier: 1
+    tags: [filesystem, search, general]
+
+  search_content:
+    desc: 按内容搜索代码文件，返回文件:行号
+    params:
+      keyword: {type: str, desc: 搜索关键词}
+      path: {type: str, desc: 搜索路径}
+      file_pattern: {type: str, optional: true, desc: 文件通配符如"*.py"}
+    tier: 1
+    tags: [code, search, general]
+
+  get_workspace_path:
+    desc: 返回项目工作空间绝对路径
+    note: 无参数
+    tier: 1
+    tags: [utility, general]
+
+  get_project_summary:
+    desc: 返回项目结构概览（子目录+关键文件列表）
+    note: 无参数
+    tier: 1
+    tags: [utility, project, general]
 
   replace_in_file:
     desc: 精确字符串替换，修改已有文件
@@ -55,50 +67,203 @@ tools:
       old_str: {type: str, desc: 要替换的原文本}
       new_str: {type: str, desc: 新文本}
     note: 默认唯一匹配
+    tier: 1
+    tags: [code, edit, general]
 
-  search_content:
-    desc: 按内容搜索代码文件，返回文件:行号
+  ask_user_clarification:
+    desc: 向用户提问获取更多信息或确认操作
     params:
-      keyword: {type: str, desc: 搜索关键词}
-      path: {type: str, desc: 搜索路径}
-      file_pattern: {type: str, optional: true, desc: 文件通配符如"*.py"}
+      question: {type: str, desc: 要问用户的问题}
+      options: {type: list, optional: true, desc: 可选答案列表}
+    tier: 1
+    tags: [utility, clarification]
 
-  get_workspace_path:
-    desc: 返回项目工作空间绝对路径
-    note: 无参数
+  load_domain_skills:
+    desc: 当用户需求超出基础文件读写/搜索能力时，加载指定的进阶技能域。加载成功后，下一轮对话你将获得该域的全部新工具。
+    params:
+      domain: {type: str, enum: ["code_dev", "web_browse", "system_basic", "system_high_risk", "excel_analyze", "office_word", "office_ppt", "gui_automation"], desc: "技能域名称。选择最匹配用户当前需求的一个。"}
+      reason: {type: str, desc: "简要说明加载原因"}
+      session_id: {type: str, optional: true, desc: "会话ID，用于跟踪已加载的域"}
+    tier: 1
+    tags: [utility, skill_loader]
 
-  get_project_summary:
-    desc: 返回项目结构概览（子目录+关键文件列表）
-    note: 无参数
+# ==================== GUI自动化工具 ====================
+  gui_click:
+    desc: 执行鼠标点击操作
+    params:
+      x: {type: int, desc: "X坐标"}
+      y: {type: int, desc: "Y坐标"}
+      button: {type: str, optional: true, desc: "鼠标按钮(left/right/middle)", default: "left"}
+      clicks: {type: int, optional: true, desc: "点击次数(1=单击,2=双击)", default: 1}
+    tier: 2
+    tags: [gui, mouse, automation]
+    domains: [gui_automation]
+
+  gui_move:
+    desc: 移动鼠标到指定位置
+    params:
+      x: {type: int, desc: "目标X坐标"}
+      y: {type: int, desc: "目标Y坐标"}
+      duration: {type: float, optional: true, desc: "移动持续时间(秒)", default: 0.5}
+    tier: 2
+    tags: [gui, mouse, automation]
+    domains: [gui_automation]
+
+  gui_type:
+    desc: 模拟键盘输入文本
+    params:
+      text: {type: str, desc: "要输入的文本"}
+      interval: {type: float, optional: true, desc: "字符间延迟(秒)", default: 0.1}
+    tier: 2
+    tags: [gui, keyboard, automation]
+    domains: [gui_automation]
+
+  gui_keys:
+    desc: 按下键盘按键
+    params:
+      keys: {type: list, desc: "按键列表，如['ctrl', 'c']或['enter']"}
+    tier: 2
+    tags: [gui, keyboard, automation]
+    domains: [gui_automation]
+
+  gui_active_window:
+    desc: 获取当前活动窗口信息
+    tier: 2
+    tags: [gui, window, info]
+    domains: [gui_automation]
+
+  gui_find_window:
+    desc: 根据标题查找窗口
+    params:
+      title_keyword: {type: str, desc: "窗口标题关键词"}
+    tier: 2
+    tags: [gui, window, search]
+    domains: [gui_automation]
+
+  gui_activate:
+    desc: 激活指定窗口
+    params:
+      title_keyword: {type: str, desc: "窗口标题关键词"}
+    tier: 2
+    tags: [gui, window, control]
+    domains: [gui_automation]
+
+  gui_screenshot:
+    desc: 屏幕截图
+    params:
+      region_x: {type: int, optional: true, desc: "截图区域X坐标"}
+      region_y: {type: int, optional: true, desc: "截图区域Y坐标"}
+      region_w: {type: int, optional: true, desc: "截图区域宽度"}
+      region_h: {type: int, optional: true, desc: "截图区域高度"}
+      save_path: {type: str, optional: true, desc: "保存路径，默认自动生成"}
+    tier: 2
+    tags: [gui, screen, capture]
+    domains: [gui_automation]
+
+  gui_locate_image:
+    desc: 在屏幕上定位图像
+    params:
+      image_path: {type: str, desc: "模板图像路径"}
+      confidence: {type: float, optional: true, desc: "匹配置信度(0-1)", default: 0.8}
+    tier: 2
+    tags: [gui, image, recognition]
+    domains: [gui_automation]
+
+  gui_open_app:
+    desc: 打开应用程序
+    params:
+      application_path: {type: str, desc: "应用程序路径"}
+      wait_time: {type: int, optional: true, desc: "等待应用程序启动时间(秒)", default: 3}
+    tier: 2
+    tags: [gui, application, launcher]
+    domains: [gui_automation]
+
+  gui_workflow:
+    desc: 执行GUI自动化工作流
+    params:
+      steps: {type: list, desc: "步骤列表，每个步骤包含操作类型和参数"}
+    tier: 3
+    tags: [gui, automation, workflow]
+    domains: [gui_automation]
+
+  # 兼容性别名
+  take_screenshot:
+    desc: 截图功能（兼容性别名）
+    params:
+      save_path: {type: str, optional: true, desc: "保存路径，默认自动生成"}
+    tier: 1
+    tags: [gui, screen, capture]
+    domains: [gui_automation, system_basic]
+
+  write_file:
+    desc: 创建新文件，自动建父目录，已存在则重命名
+    tier: 2
+    tags: [filesystem, general]
+    domains: [code_dev]
+
+  run_python:
+    desc: 执行 Python（数据分析/图表/文件遍历）。库：pandas/openpyxl/matplotlib/xlsxwriter
+    params:
+      code: {type: str, desc: 完整Python代码，用print()输出}
+      timeout: {type: int, default: 300}
+    note: 不可用input()
+    tier: 2
+    tags: [code, general]
+    domains: [code_dev, excel_analyze]
+
+  execute_command:
+    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg
+    note: 禁止 rm -rf/format/shutdown。超时30s
+    tier: 2
+    tags: [shell, system, general]
+    domains: [system_high_risk]
+
+  get_uninstall_string:
+    desc: 获取软件的卸载命令路径。卸载软件时必须首先调用此工具获取卸载程序路径，返回 DisplayName、UninstallString、InstallLocation 等信息，避免手动查询注册表
+    params: {program_name: {type: str, desc: 软件名称，支持模糊匹配，如"迅雷"、"Thunder"}}
+    tier: 1
+    tags: [system, uninstall, software]
+    domains: [system_high_risk]
+
+  modify_registry:
+    desc: 注册表修改（仅 HKCU）。桌面图标/任务栏/主题等视觉设置
+    note: add 前自动验证目标键是否存在
+    tier: 2
+    tags: [system, config, registry]
+    domains: [system_high_risk]
 
   web_search:
     desc: 网页搜索，返回标题+链接+摘要列表
     params: {query: {type: str, desc: 搜索关键词}}
+    tier: 2
+    tags: [web, search]
+    domains: [web_browse]
 
   fetch_webpage:
-    desc: 抓取网页正文。render_js=True 使用无头浏览器渲染 JS 页面（Vue/React/SPA），并自动提取下载链接（.exe/.msi 等）
+    desc: 抓取网页正文。render_js=True 使用无头浏览器渲染 JS 页面（Vue/React/SPA），并自动提取下载链接（.exe/.msi 等）。支持批量抓取（urls 为数组时）。
     params:
-      url: {type: str, desc: 网页URL}
+      url: {type: str, optional: true, desc: 网页URL}
+      urls: {type: list, optional: true, desc: URL列表（批量抓取）}
       render_js: {type: bool, optional: true, desc: 是否用浏览器渲染JS页面(默认false)}
-    note: 遇到 JS 渲染页面(SPA/Vue/React)或下载页时用 render_js=True；普通静态页面用默认即可
-
-  fetch_multiple:
-    desc: 批量抓取网页
-    params: {urls: {type: list, desc: URL列表}}
+    tier: 2
+    tags: [web, scrape]
+    domains: [web_browse]
 
   get_weather:
     desc: 查询天气，默认深圳
     params: {city: {type: str, default: 深圳}}
+    tier: 2
+    tags: [web, weather]
+    domains: [web_browse]
 
   web_download:
     desc: 从 URL 下载任意类型文件到本地。可执行文件（.exe/.msi 等）下载前会弹出风险确认卡片；其他类型直接下载。
     params:
       url: {type: str, desc: 文件直链}
       output_dir: {type: str, optional: true, desc: 默认用户Downloads}
-
-  modify_registry:
-    desc: 安全修改注册表（仅HKCU）。参数 command — 完整 reg 命令字符串
-    note: add 前自动验证目标键是否存在
+    tier: 2
+    tags: [web, download]
+    domains: [web_browse, excel_analyze]
 
   take_screenshot:
     desc: 截取屏幕并保存为 PNG 文件，返回文件路径。不传区域参数时截取全屏；传 left,top,right,bottom 时截取指定区域
@@ -108,137 +273,328 @@ tools:
       right: {type: int, optional: true, desc: 区域右边界像素}
       bottom: {type: int, optional: true, desc: 区域下边界像素}
     note: 依赖 Pillow 库，截图保存至 workspace/screenshots/。**必须将返回结果中的 Markdown 图片链接（![截图](url)）原样呈现在回复中，不得省略或改写。**
+    tier: 2
+    tags: [screen, screenshot]
+    domains: [system_basic]
+
+  system_audio:
+    desc: 音频控制（音量/静音/麦克风/设备切换），value 0-100
+    params:
+      operation: {type: str, desc: 操作类型}
+      value: {type: int, optional: true, desc: 音量值 0-100}
+      device: {type: str, optional: true, desc: 设备名关键词}
+    note: 仅 set_volume/set_mic_volume 需要 value 参数
+    tier: 2
+    tags: [audio, volume, mute, mic, speaker, sound]
+    domains: [system_basic]
+
+  display_config:
+    desc: 显示设置（分辨率/亮度/多显示器/缩放），AutoHotkey 封装
+    params:
+      operation: {type: str, desc: "操作类型: set_resolution/set_brightness/list_displays"}
+      value: {type: str, optional: true, desc: '分辨率如"1920x1080"或亮度如"80"'}
+    note: 依赖 AHK 脚本，仅 Windows
+    tier: 2
+    tags: [display, screen, monitor, resolution, brightness]
+    domains: [system_basic]
 
   append_to_log:
     desc: 追加文本到日志文件
     params:
       file_path: {type: str, desc: 日志文件路径}
       content: {type: str, desc: 追加内容}
+    tier: 2
+    tags: [logging, utility]
 
   remember_user_info:
     desc: 持久化存储用户信息
     params:
       key: {type: str, desc: 信息键}
       value: {type: str, desc: 信息值}
+    tier: 2
+    tags: [memory, user]
 
+# ==================== Excel 高级处理工具 ====================
+  excel_pivot:
+    desc: 创建Excel透视表
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      index_cols: {type: list, desc: 行索引列名列表}
+      value_cols: {type: list, desc: 数值列名列表}
+      agg_func: {type: str, default: sum, desc: 聚合函数(sum/mean/count)}
+    tier: 3
+    tags: [excel, pivot, analysis]
+    domains: [excel_analyze]
+
+  excel_format:
+    desc: Excel格式化处理
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      sheet_name: {type: str, optional: true, desc: 工作表名，默认活动工作表}
+      operations: {type: dict, optional: true, desc: 格式化操作配置}
+    tier: 3
+    tags: [excel, format, styling]
+    domains: [excel_analyze]
+
+  excel_chart_advanced:
+    desc: 高级Excel图表生成
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      chart_config: {type: dict, desc: 图表配置字典(type/bar/line/pie, title等)}
+    tier: 3
+    tags: [excel, chart, visualization]
+    domains: [excel_analyze]
+
+  excel_batch_process:
+    desc: 批量处理Excel文件
+    params:
+      directory: {type: str, desc: 文件夹绝对路径}
+      operations: {type: list, desc: 操作列表}
+    tier: 3
+    tags: [excel, batch, processing]
+    domains: [excel_analyze]
+
+# ==================== Word 文档处理工具 ====================
+  create_word_document:
+    desc: 创建Word文档
+    params:
+      file_path: {type: str, desc: 文件保存绝对路径}
+      content: {type: dict, optional: true, desc: 文档内容配置}
+    tier: 3
+    tags: [word, create, document]
+    domains: [office_word]
+
+  add_word_content:
+    desc: 向Word文档添加内容
+    params:
+      file_path: {type: str, desc: 文档绝对路径}
+      content_type: {type: str, desc: 内容类型(paragraph/table/heading/image)}
+      content_config: {type: dict, desc: 内容配置}
+    tier: 3
+    tags: [word, content, edit]
+    domains: [office_word]
+
+  extract_word_text:
+    desc: 提取Word文档文本内容
+    params:
+      file_path: {type: str, desc: 文档绝对路径}
+      page_range: {type: tuple, optional: true, desc: 页码范围(起始,结束)}
+    tier: 3
+    tags: [word, extract, text]
+    domains: [office_word]
+
+  search_replace_word:
+    desc: 在Word文档中查找替换文本
+    params:
+      file_path: {type: str, desc: 文档绝对路径}
+      search_text: {type: str, desc: 查找文本}
+      replace_text: {type: str, desc: 替换文本}
+      case_sensitive: {type: bool, default: false, desc: 是否区分大小写}
+    tier: 3
+    tags: [word, search, replace]
+    domains: [office_word]
+
+  batch_word_process:
+    desc: 批量处理Word文档
+    params:
+      directory: {type: str, desc: 文件夹绝对路径}
+      operation: {type: str, desc: 操作类型(extract_info/word_count)}
+      params: {type: dict, optional: true, desc: 操作参数}
+    tier: 3
+    tags: [word, batch, processing]
+    domains: [office_word]
+
+# ==================== PowerPoint 处理工具 ====================
+  create_presentation:
+    desc: 创建PowerPoint演示文稿
+    params:
+      file_path: {type: str, desc: 保存绝对路径}
+      config: {type: dict, optional: true, desc: 演示文稿配置}
+    tier: 3
+    tags: [ppt, create, presentation]
+    domains: [office_ppt]
+
+  add_slide_content:
+    desc: 向PPT添加幻灯片内容
+    params:
+      file_path: {type: str, desc: PPT文件绝对路径}
+      slide_config: {type: dict, desc: 幻灯片配置}
+    tier: 3
+    tags: [ppt, slide, content]
+    domains: [office_ppt]
+
+  extract_presentation_info:
+    desc: 提取PPT演示文稿信息
+    params:
+      file_path: {type: str, desc: PPT文件绝对路径}
+    tier: 3
+    tags: [ppt, extract, info]
+    domains: [office_ppt]
+
+  export_presentation_text:
+    desc: 导出PPT文本内容
+    params:
+      file_path: {type: str, desc: PPT文件绝对路径}
+      output_file: {type: str, optional: true, desc: 输出文本文件路径}
+    tier: 3
+    tags: [ppt, export, text]
+    domains: [office_ppt]
+
+  batch_ppt_process:
+    desc: 批量处理PPT文件
+    params:
+      directory: {type: str, desc: 文件夹绝对路径}
+      operation: {type: str, desc: 操作类型(info/merge)}
+    tier: 3
+    tags: [ppt, batch, processing]
+    domains: [office_ppt]
+
+# 统一域定义：keywords + tools + description 合并到一处
 domains:
-  code_generate:
+  code_dev:
+    description: "代码开发"
     keywords:
-      - 代码
-      - 生成
-      - 写一个
-      - 编程
-      - 脚本
-      - 函数
-      - 类
-      - 程序
-      - 项目
-      - 模块
-      - 重构
-      - 实现
-      - 开发
-      - 前端
-      - 后端
-      - api
-      - 接口
-      - 算法
-      - 排序
-      - 爬虫
-      - 正则
-      - sql
+      - 写代码
+      - 创建文件
+      - 运行python
+      - 代码重构
+      - 编写脚本
     tools:
+      - write_file
+      - run_python
       - get_workspace_path
       - search_content
-      - replace_in_file
-      - search_files
-      - get_project_summary
 
   web_browse:
+    description: "上网浏览"
     keywords:
-      - 下载
-      - 下载文件
-      - 下载软件
       - 搜索
-      - 查询
-      - 天气
-      - 新闻
+      - 查一下
       - 网页
-      - 链接
-      - 上网
-      - 百度
-      - google
-      - 互联网
-      - 最新
-      - 实时
-      - 热点
-      - 汇率
-      - 股价
-      - 比赛
-      - 比分
+      - 天气
+      - 下载文件
+      - 联网
     tools:
       - web_search
       - fetch_webpage
-      - fetch_multiple
       - get_weather
       - web_download
 
-  system_config:
+  system_basic:
+    description: "系统基础操作"
     keywords:
-      - 注册表
-      - 安装软件
-      - 卸载
-      - 系统设置
-      - 壁纸
-      - 主题
-      - 配置
-      - 服务
-      - 进程
-      - 启动项
-      - 环境变量
-      - 驱动
-      - 任务管理器
-      - 控制面板
-      - 磁盘管理
-      - 设备管理器
-      - 文件资源管理器
-      - 资源管理器
-      - 显示秒
-      - 日期时间
-      - 右键菜单
-      - 任务栏
-      - 桌面图标
       - 截图
-      - 屏幕截图
-      - 截屏
-      - 截个图
       - 音量
-      - 麦克风
-      - 扬声器
-      - 喇叭
-      - 耳机
-      - 声音
-      - 静音
-      - 调大
-      - 调小
-      - 音频
-      - 录音
-      - wifi
-      - 网络
-      - 联网
-      - 断网
-      - 无线
-      - 蓝牙
-      - bluetooth
-      - 宽带
+      - 亮度
+      - 分辨率
     tools:
-      - modify_registry
-      - web_search
-      - fetch_webpage
       - take_screenshot
-      - run_python
+      - system_audio
+      - display_config
+
+  system_high_risk:
+    description: "高危操作（需用户确认）"
+    keywords:
+      - 卸载
+      - 安装
+      - 删除
+      - 执行命令
+      - 运行程序
+      - 注册表
+      - 重启
+      - 关机
+      - 格式化
+      - 删除文件
+      - 修改系统
+    tools:
       - execute_command
+      - get_uninstall_string
+      - modify_registry
+    requires_confirmation: true
+
+  excel_analyze:
+    description: "数据分析"
+    keywords:
+      - excel
+      - 表格
+      - 数据分析
+      - 图表
+      - 透视表
+      - 批量处理
+      - 格式化
+      - 数据统计
+    tools:
+      - run_python
+      - web_download
+      - excel_pivot
+      - excel_format
+      - excel_chart_advanced
+      - excel_batch_process
+
+  office_word:
+    description: "Word文档处理"
+    keywords:
+      - word
+      - 文档
+      - 报告
+      - 文本处理
+      - 写作
+      - 编辑
+      - 排版
+      - 查找替换
+    tools:
+      - create_word_document
+      - add_word_content
+      - extract_word_text
+      - search_replace_word
+      - batch_word_process
+
+  office_ppt:
+    description: "PowerPoint演示文稿"
+    keywords:
+      - ppt
+      - 演示文稿
+      - 幻灯片
+      - 演讲
+      - 展示
+      - pptx
+      - 汇报
+    tools:
+      - create_presentation
+      - add_slide_content
+      - extract_presentation_info
+      - export_presentation_text
+      - batch_ppt_process
+
+  gui_automation:
+    description: "GUI自动化操作"
+    keywords:
+      - 点击
+      - 鼠标
+      - 键盘
+      - 截图
+      - 自动化
+      - 窗口
+      - 应用程序
+      - 工作流
+      - 界面操作
+      - 自动化脚本
+    tools:
+      - gui_click
+      - gui_move
+      - gui_type
+      - gui_keys
+      - gui_active_window
+      - gui_find_window
+      - gui_activate
+      - gui_screenshot
+      - gui_locate_image
+      - gui_open_app
+      - gui_workflow
+      - take_screenshot
 
   user_memory:
+    description: "用户记忆"
     keywords:
       - 记住
       - 我叫
@@ -252,6 +608,7 @@ domains:
     tools: []
 
   db_query:
+    description: "数据库查询"
     keywords:
       - 数据库
       - sql
@@ -263,35 +620,6 @@ domains:
       - mongodb
       - mysql
     tools: []
-
-  data_excel:
-    keywords:
-      - excel
-      - 表格
-      - 数据清洗
-      - 透视
-      - 透视表
-      - 图表
-      - csv
-      - xlsx
-      - xls
-      - 数据分析
-      - 统计分析
-      - 数据可视化
-      - 合并表格
-      - 拆分表格
-      - 去重
-      - 筛选数据
-      - 排序数据
-      - 求和
-      - 平均值
-      - 制作报表
-    tools:
-      - run_python
-      - read_file
-      - write_file
-      - search_files
-      - web_download
 
 personas:
   architect:
@@ -326,3 +654,63 @@ personas:
     - 老板模式
     - 投入产出
     - roi
+
+# domain_groups 保留用于向后兼容（build_tools_param 等函数引用）
+# 内容与 domains 相同，后续可移除
+domain_groups:
+  code_dev:
+    description: "代码开发"
+    tools:
+      - write_file
+      - run_python
+      - get_workspace_path
+      - search_content
+
+  web_browse:
+    description: "上网浏览"
+    tools:
+      - web_search
+      - fetch_webpage
+      - get_weather
+      - web_download
+
+  system_basic:
+    description: "系统基础操作"
+    tools:
+      - take_screenshot
+      - system_audio
+      - display_config
+
+  system_high_risk:
+    description: "高危操作（需用户确认）"
+    tools:
+      - execute_command
+      - get_uninstall_string
+      - modify_registry
+    requires_confirmation: true
+
+  excel_analyze:
+    description: "数据分析"
+    tools:
+      - run_python
+      - web_download
+      - excel_pivot
+      - excel_format
+      - excel_chart_advanced
+      - excel_batch_process
+
+  gui_automation:
+    description: "GUI自动化操作"
+    tools:
+      - gui_click
+      - gui_move
+      - gui_type
+      - gui_keys
+      - gui_active_window
+      - gui_find_window
+      - gui_activate
+      - gui_screenshot
+      - gui_locate_image
+      - gui_open_app
+      - gui_workflow
+      - take_screenshot

@@ -12,8 +12,8 @@ from llm_client import (
     get_api_key, get_base_url,
 )
 from tools import (
-    TOOL_REGISTRY, build_dynamic_system_prompt,
-    match_domains, match_persona, get_skill_prompt,
+    TOOL_REGISTRY, build_dynamic_system_prompt, build_tools_param,
+    match_domains, match_persona, get_skill_prompt, get_session_domains,
 )
 from tools import skill_learning  # 经验内化模块
 from memory import (
@@ -98,18 +98,26 @@ def run_agent(
         )
         return result
 
-    def llm_stream(messages):
+    def llm_stream(messages, system_prompt="", user_input="", session_id=None):
         """流式调用，产出思考过程文本 chunk，最后产出完整结果 dict"""
         idx = _call_seq[0]
         _call_seq[0] += 1
         t0 = time.perf_counter()
 
+        # 构建工具参数 - 基于匹配的域和已加载的域
+        tools_param = None
+        if session_id:
+            loaded_domains = get_session_domains(session_id)
+            # 合并关键词匹配的域和已加载的域
+            all_domains = set(domains) | set(loaded_domains)
+            tools_param = build_tools_param(loaded_domains=list(all_domains))
+
         if _default_provider == "ollama":
-            stream_gen = _ollama_call_stream(messages, _default_model, trace_id=trace_id)
+            stream_gen = _ollama_call_stream(messages, _default_model, trace_id=trace_id, tools=tools_param)
         else:
             stream_gen = _deepseek_call_stream(messages, _default_model,
                 get_api_key(), _base_url,
-                trace_id=trace_id)
+                trace_id=trace_id, tools=tools_param)
 
         full_content = ""
         full_reasoning = ""
@@ -134,12 +142,19 @@ def run_agent(
 
         elapsed = int((time.perf_counter() - t0) * 1000)
         get_logger().log_llm_call(
-            trace_id=trace_id, session_id=session_id, turn_index=idx,
-            messages=messages, response=full_content,
+            trace_id=trace_id, session_id=session_id,
+            turn=state.turn, child_turn=state.child_turn,
+            user_task=state.user_task,
+            response=full_content,
             model_name=_default_model, provider=_default_provider,
             elapsed_ms=elapsed, session_name=session_name,
             reasoning=full_reasoning,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            messages=messages,
+            user_task_time=state.user_task_time,
         )
+        state.child_turn += 1
         yield {"content": full_content, "reasoning_content": full_reasoning}
 
     def emit(event_type, **kwargs):
@@ -150,6 +165,8 @@ def run_agent(
     # ===== Phase 0: 立即发送初始状态，确保前端第一时间有反馈 =====
     yield emit("step", text="开始分析问题...", status="进行中")
     get_logger().info("Agent启动", trace_id=trace_id, session_id=session_id, user_message=user_message[:100])
+
+    user_message_with_memory = user_message
 
     # ===== Phase 1: 本地关键词域匹配（零延迟）=====
     try:
@@ -211,21 +228,24 @@ def run_agent(
                     
                     yield emit("final", text=success_msg,
                         timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    _save_ai_reply(success_msg)
                     get_logger().info("经验内化成功", trace_id=trace_id, session_id=session_id, 
                                       skill_name=skill_name, file_path=save_result['file_path'])
                 else:
                     yield emit("error", text=f"❌ 经验内化失败：{save_result['message']}")
+                    _save_ai_reply(f"经验内化失败：{save_result['message']}")
                     get_logger().error("经验内化失败", trace_id=trace_id, session_id=session_id,
                                        error=save_result['message'])
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 yield emit("error", text=f"❌ 经验内化失败：{translate_error(str(e))}")
+                _save_ai_reply(f"经验内化失败：{translate_error(str(e))}")
                 get_logger().error("经验内化异常", trace_id=trace_id, session_id=session_id, error=str(e))
             
             return
 
-        # ===== Phase 2: 构建 System Prompt =====
+        # ===== Phase 2: 构建消息序列和工具配置 =====
         # 使用 build_context_messages 获取 SQLite 消息 + 压缩摘要
         history_messages = build_context_messages(session_id)
         # 分离摘要和普通消息：摘要以 system 角色注入 prompt，其余消息用于对话历史
@@ -257,32 +277,81 @@ def run_agent(
         if summary_msgs:
             summary_text = summary_msgs[0]["content"]
 
-        # 4. 组装外部记忆块（长期记忆 + 压缩摘要 + 复杂度规划），统一注入 build_dynamic_system_prompt
+        # 4. 使用 LLM 生成历史对话摘要（提取工具调用、结果、状态）
+        historical_summary = ""
+        chat_user_count = len([m for m in cleaned_history if m.get("role") == "user" and m.get("msg_type") == "chat"])
+        if chat_user_count > 3 and cleaned_history:
+            chat_user_indices = [i for i, m in enumerate(cleaned_history) 
+                                  if m.get("role") == "user" and m.get("msg_type") == "chat"]
+            if len(chat_user_indices) > 3:
+                cutoff_idx = chat_user_indices[-3]
+                early_messages = cleaned_history[:cutoff_idx]
+                
+                early_context = "\n\n".join([f"{m['role']}: {m['content']}" for m in early_messages])
+                if early_context:
+                    summary_prompt = f"""请根据以下历史对话，生成一段简洁的自然语言摘要。
+重点提取：每轮用户意图、工具调用、执行结果（成功/失败）、当前状态。
+不要输出JSON，只用自然语言描述。
+
+历史对话：
+{early_context[:3000]}
+
+摘要："""
+                    
+                    try:
+                        t0 = time.perf_counter()
+                        summary_result = ai_concat(messages=[{"role": "user", "content": summary_prompt}], 
+                                                   model_name=_default_model, provider=_default_provider, 
+                                                   trace_id=trace_id)
+                        elapsed = int((time.perf_counter() - t0) * 1000)
+                        get_logger().info("LLM摘要生成完成", trace_id=trace_id, session_id=session_id, elapsed_ms=elapsed)
+                        historical_summary = summary_result["message"].get("content", "").strip()
+                        if historical_summary:
+                            historical_summary = f"【历史对话摘要】\n{historical_summary}"
+                    except Exception as e:
+                        get_logger().warning("LLM摘要生成失败", trace_id=trace_id, session_id=session_id, error=str(e))
+
+        # 5. 组装外部记忆块（长期记忆 + 压缩摘要 + 历史摘要 + 复杂度规划），统一注入用户消息
         extra_memory_parts = []
         if relevant_memory:
             extra_memory_parts.append(relevant_memory)
-        if summary_text:
+        if historical_summary:
+            extra_memory_parts.append(historical_summary)
+        elif summary_text:
             extra_memory_parts.append(summary_text)
         if planning_extra:
             extra_memory_parts.append(planning_extra)
         extra_memory = "\n\n".join(extra_memory_parts) if extra_memory_parts else ""
 
+        # 构建静态系统提示词（不包含工具信息）
         full_system = build_dynamic_system_prompt(
-            domains=domains, persona_mode=persona_mode, extra_memory=extra_memory
+            domains=domains, persona_mode=persona_mode
         )
+
+        # 构建用户上下文（包含记忆信息但不包含工具列表）
+        user_context = build_user_context(
+            domains=domains,
+            extra_memory=extra_memory,
+            plan_mode=(planning_extra != ""),
+            persona_mode=persona_mode,
+            include_tools=False  # 工具通过tools参数传递，不在消息中
+        )
+
+        user_message_with_context = user_message
+        if user_context:
+            user_message_with_context = f"{user_context}\n\n{user_message}"
 
         messages = [{"role": "system", "content": full_system}] + cleaned_history
 
-        # 避免重复追加用户消息（api_chat 已通过 append_session_message 写入历史）
-        # 当 cleaned_history 最后一条 user 消息与当前 user_message 一致时跳过
+        # 避免重复追加用户消息
         is_duplicate = False
         for m in reversed(cleaned_history):
             if m["role"] == "user":
-                if m["content"].rstrip() == user_message.rstrip():
+                if m["content"].rstrip() == user_message_with_context.rstrip():
                     is_duplicate = True
                 break
         if not is_duplicate:
-            messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "user", "content": user_message_with_context})
 
         log_session_turn("user", user_message, trace_id=trace_id, user_id=user_id, session_id=session_id)
 
@@ -290,6 +359,7 @@ def run_agent(
         import traceback
         traceback.print_exc()
         yield emit("error", text=translate_error(str(e)[:500]))
+        _save_ai_reply(f"错误：{translate_error(str(e)[:500])}")
         return
 
     # ===== Phase 3: ReAct 循环（流式）=====
@@ -302,14 +372,35 @@ def run_agent(
     _final_saved = False      # 防止多次重复存储 AI 最终回复
     _pending_images = []      # (img_md, file_path) 截图结果，在 final 出口统一注入
 
+    class _State:
+        turn = 0
+        child_turn = 0
+        user_task = user_message
+        user_task_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state = _State()
+
+    if session_id:
+        llm_file = get_logger().get_llm_call_file(session_id=session_id, session_name=session_name)
+        if llm_file:
+            try:
+                with open(llm_file, 'r', encoding='utf-8') as f:
+                    llm_data = json.load(f)
+                turns = llm_data.get('turns', [])
+                if turns:
+                    state.turn = max(t.get('turn', 0) for t in turns) + 1
+            except Exception:
+                pass
+
     def _save_ai_reply(text):
-        """在 yield emit("final") 之后立即持久化 AI 回复到 SQLite。"""
+        """在 yield emit("final") 之后立即持久化 AI 回复到 SQLite，并记录日志。"""
         nonlocal _final_saved
         if not _final_saved and session_id and text:
             _final_saved = True
             append_session_message(session_id, "assistant", text,
                                    trace_id=trace_id, user_id=user_id,
                                    skip_compress=True)
+            get_logger().log_turn_complete(session_id=session_id, session_name=session_name,
+                                           turn=state.turn, ai_reply=text)
 
     def _inject_result_images(text):
         """将本轮任务中产生的截图 Markdown 图片链接和文件路径注入最终回复。"""
@@ -421,20 +512,27 @@ def run_agent(
                     time.sleep(RETRY_DELAYS[attempt])
         raise last_exception
 
-    for turn in range(MAX_TURNS):
-        if turn >= MAX_TURNS - 2:
+    for react_iter in range(MAX_TURNS):
+        if react_iter >= MAX_TURNS - 2:
             messages.append({"role": "system", "content": "你即将达到思考轮次上限，请尽快收尾。"})
 
-        # 流式 LLM 调用
-        llm_gen = llm_stream(messages)
+        last_user_msg = user_message_with_memory
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = m.get("content", last_user_msg)
+                break
+
+        llm_gen = llm_stream(messages, system_prompt=full_system, user_input=last_user_msg, session_id=session_id)
         last_result = None
 
         for item in llm_gen:
             if isinstance(item, dict) and item.get("type") == "error":
                 yield emit("error", text=item.get("message", "AI 请求失败"))
+                _save_ai_reply(f"AI 请求失败：{item.get('message', '')}")
                 return
             if item is None:
                 yield emit("error", text="AI 请求失败")
+                _save_ai_reply("AI 请求失败")
                 return
             if isinstance(item, str):
                 yield emit("thinking", text=item)
@@ -561,6 +659,11 @@ def run_agent(
         tool_name = ai_content["tool_name"]
         arguments = ai_content.get("arguments", {})
         _is_tool_error = False
+        
+        # 特殊处理：load_domain_skills工具自动注入session_id
+        if tool_name == "load_domain_skills" and session_id:
+            if "session_id" not in arguments:
+                arguments["session_id"] = session_id
 
         if tool_name == "finished":
             done_text = _inject_result_images("任务已完成")
@@ -845,6 +948,17 @@ def run_agent(
             tool_result_msg = f"工具 {tool_name} 返回：{result_str}"
         messages.append({"role": "assistant", "content": tool_call_msg})
         messages.append({"role": "user", "content": tool_result_msg})
+        append_session_message(session_id, "assistant", tool_call_msg,
+                               trace_id=trace_id, user_id=user_id,
+                               is_temporary=False, msg_type="tool_call")
+        append_session_message(session_id, "user", tool_result_msg,
+                               trace_id=trace_id, user_id=user_id,
+                               is_temporary=False, msg_type="tool_result")
+        get_logger().update_tool_result(
+            session_id=session_id, session_name=session_name,
+            turn=state.turn, child_turn=state.child_turn - 1,
+            tool_result=result_str
+        )
 
     loop_done = _inject_result_images("任务未完成，已保存进度。可以继续。")
     yield emit("final", text=loop_done, timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

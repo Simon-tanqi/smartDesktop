@@ -51,26 +51,42 @@ def read_file(file_path: str, start_line: int = None, end_line: int = None):
     file_path = os.path.normpath(file_path)
     if not os.path.isfile(file_path):
         return json.dumps({"success": False, "message": f"文件不存在: {file_path}"})
+    
+    encodings = ["utf-8", "gbk", "gb2312", "gb18030", "big5"]
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, "r", encoding=encoding) as f:
+                lines = f.readlines()
+            total = len(lines)
+            if start_line is not None or end_line is not None:
+                start = max(0, (start_line or 1) - 1)
+                end = min(total, end_line or total)
+                selected = lines[start:end]
+            else:
+                selected = lines
+            content = "".join(selected)
+            result = {"success": True, "file": file_path, "total_lines": total, "content": content, "encoding": encoding}
+            is_full_read = (start_line is None and end_line is None)
+            read_lines = len(selected)
+            if is_full_read and total > 200 and len(content) > 4000:
+                result["content"] = content[:4000]
+                result["truncated"] = True
+                result["hint"] = f"文件共{total}行，已截断仅显示前4000字符。请使用 search_content 定位关键代码后再局部读取。"
+            return json.dumps(result, ensure_ascii=False)
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return json.dumps({"success": False, "message": str(e)})
+    
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        total = len(lines)
-        if start_line is not None or end_line is not None:
-            start = max(0, (start_line or 1) - 1)
-            end = min(total, end_line or total)
-            selected = lines[start:end]
-        else:
-            selected = lines
-        content = "".join(selected)
-        result = {"success": True, "file": file_path, "total_lines": total, "content": content}
-        # 全量读取时，200行以上自动截断并给出策略提示
-        is_full_read = (start_line is None and end_line is None)
-        read_lines = len(selected)
-        if is_full_read and total > 200 and len(content) > 4000:
-            result["content"] = content[:4000]
-            result["truncated"] = True
-            result["hint"] = f"文件共{total}行，已截断仅显示前4000字符。请使用 search_content 定位关键代码后再局部读取。"
-        return json.dumps(result, ensure_ascii=False)
+        with open(file_path, "rb") as f:
+            raw = f.read(2000)
+        return json.dumps({
+            "success": False,
+            "message": f"无法以文本模式读取文件 {file_path}，可能是二进制文件。文件前2000字节的十六进制预览: {raw.hex()[:200]}",
+            "is_binary": True
+        }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "message": str(e)})
 

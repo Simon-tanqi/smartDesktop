@@ -35,6 +35,150 @@
         "params": {}
       },
       "固化回复模板": "{result_summary}"
+    },
+    "Calculate the number of people and average salary ": {
+      "query_hash": "fb58cf12d8bc",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Summarize the total amount by region from 销售数据_202": {
+      "query_hash": "75d3d2306b40",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Check if file explorer shows file extensions": {
+      "query_hash": "29080abd427f",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Write a Python script to batch rename all txt file": {
+      "query_hash": "572a52152576",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Generate a script that reads an Excel file and gen": {
+      "query_hash": "1b516aad6f28",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Read a non-existent file xxx.xlsx": {
+      "query_hash": "2733ee380722",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "Read ../../../etc/passwd": {
+      "query_hash": "d9ac087feb1c",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把输入法改成搜狗输入法": {
+      "query_hash": "15703f146bcd",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把电脑外放或耳机的喇叭声音值改成79": {
+      "query_hash": "c0ca2a5d0a6d",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把电脑外放或耳机的喇叭声音值改成44": {
+      "query_hash": "8015a753470b",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把电脑外放或耳机的喇叭声音值改成20": {
+      "query_hash": "c7166145914b",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "??": {
+      "query_hash": "e270aeb347f2",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "?????????": {
+      "query_hash": "3126b70f80dc",
+      "success_count": 2,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把迅雷卸载一下": {
+      "query_hash": "f10753f03ce1",
+      "success_count": 4,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把电脑耳机喇叭声音改成50": {
+      "query_hash": "679d08e4b4d7",
+      "success_count": 1,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
+    },
+    "帮我把电脑耳机喇叭声音改成50，同时输出设备有好几个，你都要改成50": {
+      "query_hash": "8f38f4af365e",
+      "success_count": 2,
+      "固化参数": {
+        "tool": "",
+        "params": {}
+      },
+      "固化回复模板": "{result_summary}"
     }
   }
 }

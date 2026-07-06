@@ -7,6 +7,23 @@
 导入方式：
     from config.settings import DEFAULT_TEMPERATURE, LLM_TIMEOUT
 """
+import os
+
+# ═══════════════════════════════════════════════
+#  路径配置
+# ═══════════════════════════════════════════════
+WORKSPACE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 用户数据目录（放在 APPDATA 下，便于项目打包分发）
+# 与 memory/config.py 保持一致，确保记忆文件路径统一
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+SCREENSHOTS_DIR = os.path.join(DATA_DIR, "screenshots")
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+MODELS_CONFIG_PATH = os.path.join(DATA_DIR, "models.json")
+USER_PROFILE_PATH = os.path.join(DATA_DIR, 'user_profile.json')
 # ═══════════════════════════════════════════════
 #  LLM 调用
 # ═══════════════════════════════════════════════
@@ -33,6 +50,8 @@ MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/
 # ═══════════════════════════════════════════════
 #  命令执行
 # ═══════════════════════════════════════════════
+COMMAND_TIMEOUT = 120           # 秒，shell 命令执行超时（统一入口，safe_exec/file_tools 共用）
+PYTHON_TIMEOUT = 300            # 秒，Python 代码执行超时（全盘扫描等耗时操作可临时设更大值）
 MAX_OUTPUT_CHARS = 2000         # 命令输出截断长度
 CONFIRM_TIMEOUT = 300           # 秒，确认等待超时
 
@@ -44,3 +63,29 @@ LOG_MAX_BUFFER_SIZE = 50        # 条，缓冲条数达此值立即刷盘
 LOG_MIN_LEVEL = "INFO"          # 最低记录级别
 LOG_SIZE_LIMIT_MB = 500         # 日志总大小阈值（MB），超限时弹窗提醒
 LOG_SCAN_DEPTH = 3              # 文件搜索目录递归深度上限
+
+# ═══════════════════════════════════════════════
+#  熔断参数（回路护板）
+# ═══════════════════════════════════════════════
+# 连续调用同一工具 ≥N 次 → 拒绝执行本轮
+MAX_SAME_TOOL_STREAK = 3
+# 域内任意工具连续调用 ≥N 次（不限工具名） → 强制终止
+MAX_DOMAIN_TOOL_STREAK = 6
+# 同一工具连续失败 ≥N 次（success:false） → 熔断注入
+MAX_CONSECUTIVE_FAILURES = 3
+# 同一工具同一参数连续调用 ≥N 次 → 拒绝执行
+MAX_EXACT_REPEAT = 3
+
+# ═══════════════════════════════════════════════
+#  模型预设配置
+# ═══════════════════════════════════════════════
+MODEL_PRESETS = {
+    "deepseek":     {"name": "DeepSeek", "base_url": "https://api.deepseek.com",         "temperature": 0.7, "models": ["deepseek-chat", "deepseek-reasoner"]},
+    "hunyuan":      {"name": "混元",      "base_url": "https://api.hunyuan.cloud.tencent.com/v1", "temperature": 0.7, "models": ["hunyuan-turbos-latest", "hunyuan-lite"]},
+    "qwen":         {"name": "通义千问",   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "temperature": 0.7, "models": ["qwen-turbo", "qwen-plus", "qwen-max"]},
+    "zhipu":        {"name": "智谱GLM",   "base_url": "https://open.bigmodel.cn/api/paas/v4", "temperature": 0.7, "models": ["glm-4-flash", "glm-4-plus"]},
+    "doubao":       {"name": "豆包",      "base_url": "https://ark.cn-beijing.volces.com/api/v3", "temperature": 0.7, "models": ["doubao-lite-128k", "doubao-pro-256k"]},
+    "openai":       {"name": "OpenAI",    "base_url": "https://api.openai.com/v1",          "temperature": 0.7, "models": ["gpt-4o", "gpt-4o-mini"]},
+    "ollama":       {"name": "Ollama 本地","base_url": "http://localhost:11434/v1",          "temperature": 0.7, "models": [], "warning": "本地模型功能可能受模型能力影响，效果远不如云端大模型"},
+    "custom":       {"name": "自定义",     "base_url": "",                                   "temperature": 0.7, "models": []},
+}

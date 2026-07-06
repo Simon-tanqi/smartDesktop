@@ -1,11 +1,14 @@
 """
 LLM 调用适配层：支持 Ollama / OpenAI / DeepSeek 等后端
 
-v4: 支持从 YAML 配置读取 provider，支持 Ollama 本地模型。
+v5: 主模型 deepseek-chat 默认复用；可选 summary_model 覆盖，不可用时自动降级回主模型。
 """
 import json
 import threading
-from memory.config import COMPRESS_MODEL_CONFIG, EXTRACT_MODEL_CONFIG
+import logging
+from memory.config import COMPRESS_MODEL_CONFIG, EXTRACT_MODEL_CONFIG, SUMMARY_MODEL_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # ── 缓存 ai_concat 引用 ──
 _ai_concat = None
@@ -57,21 +60,40 @@ def _default_call(messages, model):
     return ai_concat(messages, model_name=model or "deepseek-chat")
 
 
-def call_llm(messages, model=None, config=None):
-    """
-    调用 LLM，自动根据 provider 路由。
-
-    优先级：
-      1. config 参数指定的模型配置
-      2. 默认 COMPRESS_MODEL_CONFIG（蒸馏压缩）
-    """
-    cfg = config or COMPRESS_MODEL_CONFIG
-    provider = cfg.get("provider", "ollama")
-
+def _try_call(cfg, messages, model):
+    """尝试用指定配置调用 LLM，返回结果或 None。"""
+    provider = cfg.get("provider", "deepseek")
     if provider == "ollama":
         return _ollama_call(cfg, messages)
     else:
         return _default_call(messages, model or cfg.get("model_name", "deepseek-chat"))
+
+
+def call_llm(messages, model=None, config=None):
+    """
+    调用 LLM，自动根据 provider 路由，内置降级链：
+
+      1. summary_model（如果配置了）── 优先使用
+      2. 当前 domain 配置（compression / extraction）── 摘要模型失败时回退
+      3. 主模型 _default_call ── 最终兜底
+    """
+    cfg = config or COMPRESS_MODEL_CONFIG
+
+    # 第 1 层：摘要模型优先
+    if SUMMARY_MODEL_CONFIG:
+        result = _try_call(SUMMARY_MODEL_CONFIG, messages, model)
+        if result is not None:
+            return result
+        logger.warning("summary_model 调用失败，降级到 domain 配置")
+
+    # 第 2 层：domain 配置
+    result = _try_call(cfg, messages, model)
+    if result is not None:
+        return result
+
+    # 第 3 层：主模型兜底
+    logger.warning("domain 模型调用失败，降级到主模型 ai_concat")
+    return _default_call(messages, "deepseek-chat")
 
 
 def call_llm_with_config(messages, model_config):

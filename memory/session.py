@@ -18,7 +18,7 @@ from memory.config import (
 from memory.stores.json_store import load_sessions_db, save_sessions_db
 from memory.stores.sqlite_store import (
     add_chat_message, get_chat_messages, log_operation,
-    get_session_messages, get_latest_summary,
+    get_session_messages, get_full_session_messages, get_latest_summary,
 )
 from memory.extractor import extract_facts_async
 from memory.compressor import (
@@ -35,20 +35,30 @@ def _make_title(content: str) -> str:
     cleaned = re.sub(r"```[\s\S]*?```", "", content)
     # 压缩空白
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
-        return "新会话"
+    # 如果去掉代码块后只剩标点/表情等，取原始首段文字
+    if not cleaned or not re.search(r'[\u4e00-\u9fff\w]', cleaned):
+        # 取原始消息中第一个有实际字符的段落
+        fallback = re.sub(r"```[\s\S]*?```", "", content)
+        fallback = re.sub(r"\s+", " ", fallback).strip()
+        if not fallback:
+            return "新会话"
+        cleaned = fallback
     return cleaned[:25]
 
 
 
 # Token优化：这些纯确认/招呼短消息跳过事实提取（"我叫XX"等有信息量短输入不在此列）
-_FACT_EXTRACT_SKIP = set(NOISE_PHRASES) | {
-    "好的", "行", "可以", "继续", "收到", "明白",
-    "ok", "OK", "yes", "no", "对", "没错", "知道", "了解",
-    "来了", "在", "有", "没", "啥", "？", "?", "。。", "...",
-    "下一步", "然后呢", "还有呢", "开始", "开始吧",
-}
 _FACT_EXTRACT_MIN_LEN = 3
+
+
+def _is_noise(text: str) -> bool:
+    """噪声检测：归一化去重后精确匹配 NOISE_PHRASES 集合。
+    
+    归一化规则：连续重复字符压缩为单个（如"嗯嗯嗯"→"嗯"，"行行行"→"行"）。
+    这样无需为每种变体在列表中单独维护条目。
+    """
+    normalized = re.sub(r'(.)\1+', r'\1', text.strip())
+    return normalized in set(NOISE_PHRASES) or text.strip() in set(NOISE_PHRASES)
 
 # 会话创建锁：防止多线程并发创建会话时产生重复 ID（TOCTOU 竞态）
 _session_lock = threading.Lock()
@@ -145,7 +155,7 @@ def ensure_session_titles():
 
 def get_active_session_id():
     if os.path.exists(ACTIVE_SESSION_FILE):
-        with open(ACTIVE_SESSION_FILE, "r") as f:
+        with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
             sid = f.read().strip()
         db = load_sessions_db()
         if sid and sid in db:
@@ -154,7 +164,7 @@ def get_active_session_id():
 
 
 def set_active_session(session_id):
-    with open(ACTIVE_SESSION_FILE, "w") as f:
+    with open(ACTIVE_SESSION_FILE, "w", encoding="utf-8") as f:
         f.write(session_id)
 
 
@@ -182,7 +192,7 @@ def delete_session(session_id):
         save_sessions_db(db)
         delete_chat_session(session_id)
         if os.path.exists(ACTIVE_SESSION_FILE):
-            with open(ACTIVE_SESSION_FILE, "r") as f:
+            with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
                 if f.read().strip() == session_id:
                     os.remove(ACTIVE_SESSION_FILE)
 
@@ -212,10 +222,15 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
         return []
 
     def _bigrams(text):
+        """提取中文 bigram + 英文小写单词作为特征集合。"""
         chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
-        if len(chinese) < 2:
-            return set()
-        return {chinese[i:i+2] for i in range(len(chinese)-1)}
+        # 英文单词：2+ 字母序列转小写
+        english = re.findall(r'[a-zA-Z]{2,}', text.lower())
+        features = set()
+        if len(chinese) >= 2:
+            features.update(chinese[i:i+2] for i in range(len(chinese)-1))
+        features.update(english)
+        return features
 
     def _is_tool_call(content):
         content = content.strip()
@@ -264,10 +279,15 @@ def _calculate_session_relevance(current_user_msg, messages, threshold=0.1):
         return True, 1.0
 
     def _bigrams(text):
+        """提取中文 bigram + 英文小写单词作为特征集合。"""
         chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
-        if len(chinese) < 2:
-            return set()
-        return {chinese[i:i+2] for i in range(len(chinese)-1)}
+        # 英文单词：2+ 字母序列转小写
+        english = re.findall(r'[a-zA-Z]{2,}', text.lower())
+        features = set()
+        if len(chinese) >= 2:
+            features.update(chinese[i:i+2] for i in range(len(chinese)-1))
+        features.update(english)
+        return features
 
     current_bigrams = _bigrams(current_user_msg)
     if not current_bigrams:
@@ -303,13 +323,93 @@ def _calculate_session_relevance(current_user_msg, messages, threshold=0.1):
     return avg_score >= threshold, avg_score
 
 
+def _generate_conversation_summary(messages):
+    """
+    生成对话摘要，将多轮对话压缩成一段摘要
+    格式：近3轮直接显示，超过3轮的生成摘要
+    """
+    if not messages:
+        return ""
+    
+    # 统计对话轮次（user消息）
+    user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    conversation_rounds = len(user_indices)
+    
+    if conversation_rounds <= 3:
+        # 3轮以内直接返回格式化对话
+        dialog_parts = []
+        for i in range(0, len(messages), 2):
+            if i < len(messages) and messages[i].get("role") == "user":
+                user_content = messages[i].get("content", "")[:100] + "..." if len(messages[i].get("content", "")) > 100 else messages[i].get("content", "")
+                dialog_parts.append(f"用户：{user_content}")
+                
+                if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
+                    assistant_content = messages[i + 1].get("content", "")[:150] + "..." if len(messages[i + 1].get("content", "")) > 150 else messages[i + 1].get("content", "")
+                    dialog_parts.append(f"助手：{assistant_content}")
+        
+        return "近期对话：\n" + "\n".join(dialog_parts) if dialog_parts else ""
+    
+    else:
+        # 超过3轮的生成摘要
+        try:
+            # 提取关键对话内容用于摘要生成
+            dialog_summary_parts = []
+            
+            # 近3轮详细记录
+            recent_start_idx = user_indices[-3]  # 最后3轮的第一个user消息
+            recent_messages = messages[recent_start_idx:]
+            
+            # 前面几轮的摘要
+            if len(user_indices) > 3:
+                early_messages = messages[:recent_start_idx]
+                if early_messages:
+                    early_user_msgs = [m.get("content", "")[:50] + "..." for m in early_messages if m.get("role") == "user"]
+                    dialog_summary_parts.append(f"历史对话({len(user_indices)-3}轮)：涉及 {', '.join(early_user_msgs[:3])}")
+            
+            # 近3轮详细记录
+            recent_dialog = []
+            for i, msg in enumerate(recent_messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")[:80] + "..." if len(msg.get("content", "")) > 80 else msg.get("content", "")
+                    recent_dialog.append(f"用户：{content}")
+                elif msg.get("role") == "assistant":
+                    content = msg.get("content", "")[:120] + "..." if len(msg.get("content", "")) > 120 else msg.get("content", "")
+                    recent_dialog.append(f"助手：{content}")
+            
+            if recent_dialog:
+                dialog_summary_parts.append("最近对话：\n" + "\n".join(recent_dialog))
+            
+            return "\n\n".join(dialog_summary_parts)
+            
+        except Exception as e:
+            print(f"[WARN] 对话摘要生成失败: {e}")
+            return "历史对话内容较多，建议关注最近几轮对话。"
+
+
 def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOKEN_BUDGET):
-    """构建 LLM 上下文消息列表。"""
-    messages = get_session_messages(session_id, limit=limit)
+    """构建 LLM 上下文消息列表。
+    
+    修改：优化对话处理逻辑
+    - 近3轮对话（msg_type=chat的用户消息）直接完整显示
+    - 超过3轮的对话使用摘要形式
+    - 保留工具调用和结果消息
+    - 保持其他逻辑（话题检测、重复查询处理等）
+    """
+    messages = get_full_session_messages(session_id, limit=limit)
+    
+    # 统计真实用户轮次（仅 msg_type=chat 的 user 消息）
+    chat_user_indices = [i for i, m in enumerate(messages) 
+                          if m.get("role") == "user" and m.get("msg_type") == "chat"]
+    conversation_rounds = len(chat_user_indices)
+    
+    # 超过3轮，只保留最近3轮的完整消息（包括其间的工具调用和结果）
+    if conversation_rounds > 3:
+        cutoff_idx = chat_user_indices[-3]
+        messages = messages[cutoff_idx:]
 
     last_user_msg = ""
     for m in reversed(messages):
-        if m.get("role") == "user":
+        if m.get("role") == "user" and m.get("msg_type") == "chat":
             last_user_msg = m.get("content", "")
             break
 
@@ -320,8 +420,18 @@ def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOK
             last_user_msg, messages, threshold=RECALL_RELEVANCE_THRESHOLD
         )
         if not is_relevant:
-            # 话题已切换，丢弃全部历史上下文，仅保留压缩摘要
-            messages = []
+            # P2 修复：话题已切换时保留最近 2 轮对话，而非全部丢弃
+            # 统计 user 消息索引，只保留最后 2 个 user 消息及其对应的 assistant 回复
+            user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+            if len(user_indices) >= 3:
+                # 保留最后 2 个 user 消息（即最近 2 轮对话）
+                keep_from = user_indices[-2]
+                messages = messages[keep_from:]
+            # 如果总轮数 ≤ 2，全部保留（无需丢弃）
+            messages.append({
+                "role": "system",
+                "content": f"【话题切换提示】检测到新话题与历史上下文不相关（相似度 {relevance_score:.2f}），已保留最近对话轮次。"
+            })
         else:
             exclude_indices = _detect_repeated_query(messages, last_user_msg)
             if exclude_indices:
@@ -379,7 +489,9 @@ def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOK
 
 def append_session_message(session_id, role, content,
                            trace_id="", user_id="",
-                           skip_compress=False):
+                           skip_compress=False,
+                           is_temporary=False,
+                           msg_type="chat"):
     content = content.strip()
     if not content:
         return session_id
@@ -401,13 +513,14 @@ def append_session_message(session_id, role, content,
 
     # 写入 per-session messages.db
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    add_chat_message(session_id, role, content, msg_type="chat",
-                     trace_id=trace_id, user_id=user_id, timestamp=now_ts)
+    add_chat_message(session_id, role, content, msg_type=msg_type,
+                     trace_id=trace_id, user_id=user_id, timestamp=now_ts,
+                     is_temporary=is_temporary)
 
     if role == "user":
         # Token优化：纯确认/招呼类短消息不触发事实提取，但放过"我叫XX"等有信息量的短输入
         stripped = content.strip()
-        if len(stripped) >= _FACT_EXTRACT_MIN_LEN and stripped not in _FACT_EXTRACT_SKIP:
+        if len(stripped) >= _FACT_EXTRACT_MIN_LEN and not _is_noise(stripped):
             extract_facts_async(content, trace_id=trace_id, user_id=user_id,
                                 session_id=session_id)
 

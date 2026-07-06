@@ -20,6 +20,7 @@ import os
 from datetime import datetime
 
 from config.config_loader import get_safety_config
+from config.settings import COMMAND_TIMEOUT
 
 
 # ═══════════════════════════════════════════════
@@ -145,8 +146,8 @@ def is_dangerous(command):
 # 安全执行
 # ═══════════════════════════════════════════════
 
-def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
-                   challenge_response=None, challenge_token=None):
+def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk",
+                   challenge_response=None, challenge_token=None, domain_confirmed=False):
     """
     安全执行 PowerShell 命令。
 
@@ -202,8 +203,8 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
         _log("BLOCK", f"路径保护拦截 ({protected_hit}): {script[:120]}")
         return {"success": False, "message": f"安全策略：禁止删除 {protected_hit}。此路径受硬保护，不可通过命令删除。"}
 
-    # ── 危险检测 → 发起挑战（分级提示）。已验证过的 challenge 跳过重复检查 ──
-    if not challenge_verified:
+    # ── 危险检测 → 发起挑战（分级提示）。已验证过的 challenge 或域已确认则跳过重复检查 ──
+    if not challenge_verified and not domain_confirmed:
         is_danger, danger_desc, danger_level = _check_danger(script)
     else:
         is_danger = False
@@ -242,25 +243,48 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
             }
 
     # ── 执行：subprocess.run(list, shell=False) ──
-    cmd_list = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+    # 检测是否为 CMD 专有命令（wmic/reg/msiexec 等），需要通过 cmd /c 执行
+    cmd_exclusive_programs = {"wmic", "reg", "msiexec", "sc", "net", "taskkill", "tasklist", "ipconfig", "ping", "tracert", "nslookup", "systeminfo", "where", "findstr", "fc", "comp", "certutil", "shutdown", "format", "diskpart", "assoc", "ftype", "chkdsk", "defrag", "sfc", "chcp", "mode", "title", "color", "prompt", "cls", "ver", "vol", "label", "date", "time", "path", "set", "copy", "move", "del", "rd", "md", "ren", "type", "more", "find", "sort", "tree", "attrib", "xcopy", "robocopy", "for", "if", "goto", "call", "start", "exit", "rem"}
+    first_token = script.strip().split()[0] if script.strip() else ""
+    first_prog = first_token.lower().replace('"', '').replace("'", '')
+    
+    if first_prog in cmd_exclusive_programs:
+        cmd_list = ["cmd", "/c", script]
+    else:
+        cmd_list = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+    
+    is_gui_operation = False
+    if first_prog.endswith(".exe") or "Start-Process" in script or "start-process" in script.lower():
+        is_gui_operation = True
+    
     try:
-        result = subprocess.run(
-            cmd_list,
-            shell=False,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding=encoding,
-            errors="replace",
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            error = result.stderr.strip()
-            _log("FAIL", f"rc={result.returncode} stderr={error[:120]}")
-            return {"success": False, "message": f"命令执行失败 (code {result.returncode}): {error}"}
-        _log("OK", f"返回 {len(output)} 字符")
-        return {"success": True, "output": output}
+        if is_gui_operation:
+            subprocess.Popen(
+                cmd_list,
+                shell=False,
+                cwd=working_dir,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            _log("OK", f"GUI程序已启动: {script[:120]}")
+            return {"success": True, "output": "", "is_gui_operation": True}
+        else:
+            result = subprocess.run(
+                cmd_list,
+                shell=False,
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding=encoding,
+                errors="replace",
+            )
+            output = result.stdout.strip()
+            if result.returncode != 0:
+                error = result.stderr.strip()
+                _log("FAIL", f"rc={result.returncode} stderr={error[:120]}")
+                return {"success": False, "message": f"命令执行失败 (code {result.returncode}): {error}"}
+            _log("OK", f"返回 {len(output)} 字符")
+            return {"success": True, "output": output}
     except subprocess.TimeoutExpired:
         _log("TIMEOUT", f"超时 ({timeout}s): {script[:80]}")
         return {"success": False, "message": f"命令执行超时 ({timeout}s)"}
@@ -269,7 +293,7 @@ def run_powershell(script, working_dir=None, timeout=30, encoding="gbk",
         return {"success": False, "message": str(e)}
 
 
-def run_cmd(command_list, working_dir=None, timeout=30, encoding="gbk",
+def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk",
             challenge_response=None, challenge_token=None):
     """
     安全执行 CMD 命令（list 形式，shell=False）。

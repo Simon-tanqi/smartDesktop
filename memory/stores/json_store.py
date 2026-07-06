@@ -41,8 +41,13 @@ def load_long_term():
 
 
 def save_long_term(memory):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
+    """原子写入：先写临时文件，再 os.replace 保证数据不会因崩溃而丢失。"""
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                      dir=os.path.dirname(MEMORY_FILE),
+                                      delete=False, suffix='.tmp') as tf:
+        json.dump(memory, tf, ensure_ascii=False, indent=2)
+        tmpname = tf.name
+    os.replace(tmpname, MEMORY_FILE)
 
 
 # ═══════════════════════════════════════════════
@@ -57,8 +62,13 @@ def load_compressed():
 
 
 def save_compressed(compressed_list):
-    with open(COMPRESSED_FILE, "w", encoding="utf-8") as f:
-        json.dump(compressed_list, f, ensure_ascii=False, indent=2)
+    """原子写入：先写临时文件，再 os.replace 保证数据不会因崩溃而丢失。"""
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                      dir=os.path.dirname(COMPRESSED_FILE),
+                                      delete=False, suffix='.tmp') as tf:
+        json.dump(compressed_list, tf, ensure_ascii=False, indent=2)
+        tmpname = tf.name
+    os.replace(tmpname, COMPRESSED_FILE)
 
 
 # ═══════════════════════════════════════════════
@@ -99,11 +109,11 @@ def save_sessions_db(db):
 def get_user_id():
     """获取或生成持久用户 ID。"""
     if os.path.exists(USER_ID_FILE):
-        with open(USER_ID_FILE, "r") as f:
+        with open(USER_ID_FILE, "r", encoding="utf-8") as f:
             uid = f.read().strip()
             if uid:
                 return uid
     uid = f"user_{uuid.uuid4().hex[:8]}"
-    with open(USER_ID_FILE, "w") as f:
+    with open(USER_ID_FILE, "w", encoding="utf-8") as f:
         f.write(uid)
     return uid

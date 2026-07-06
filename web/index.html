@@ -391,10 +391,10 @@
             display: flex; padding: 3px 0; border-bottom: 1px solid #444;
         }
         .confirm-card .confirm-detail-key {
-            color: #999; min-width: 70px; flex-shrink: 0;
+            color: #666; min-width: 70px; flex-shrink: 0;
         }
         .confirm-card .confirm-detail-val {
-            color: #eee; word-break: break-all;
+            color: #333; word-break: break-all;
         }
 
         /* 可操作错误气泡 */
@@ -826,12 +826,107 @@
 
         <!-- 2. 右侧：聊天主界面 -->
         <div class="main-content">
+            <!-- 系统控制面板 -->
+            <div id="systemPanel" class="control-panel" style="
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                background: white;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 15px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                z-index: 1000;
+                width: 250px;
+            ">
+                <h4 style="margin: 0 0 15px 0; color: #333; font-size: 16px;">系统控制中心</h4>
+                
+                <!-- 音量控制 -->
+                <div class="control-group" style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-size: 14px;">音量: <span id="volumeValue">50</span>%</label>
+                    <input type="range" id="volumeSlider" min="0" max="100" value="50" 
+                           style="width: 100%; margin-bottom: 5px;">
+                    <button onclick="setVolume('set_volume', 50)" style="width: 48%; margin-right: 2%; padding: 4px; font-size: 12px;">设为50%</button>
+                    <button onclick="setVolume('toggle_mute')" style="width: 48%; margin-left: 2%; padding: 4px; font-size: 12px;">静音</button>
+                </div>
+                
+                <!-- 亮度控制 -->
+                <div class="control-group" style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-size: 14px;">亮度: <span id="brightnessValue">80</span>%</label>
+                    <input type="range" id="brightnessSlider" min="10" max="100" value="80"
+                           style="width: 100%; margin-bottom: 5px;">
+                    <button onclick="setBrightness(80)" style="width: 100%; padding: 4px; font-size: 12px;">恢复默认</button>
+                </div>
+                
+                <!-- 快捷按钮 -->
+                <div class="control-group">
+                    <button onclick="takeScreenshot()" style="width: 100%; padding: 6px; margin-bottom: 8px; font-size: 14px;">截图保存</button>
+                    <button onclick="openTaskManager()" style="width: 48%; margin-right: 2%; padding: 6px; font-size: 14px;">任务管理</button>
+                    <button onclick="showSystemInfo()" style="width: 48%; margin-left: 2%; padding: 6px; font-size: 14px;">系统信息</button>
+                </div>
+                
+                <button onclick="toggleSystemPanel()" style="
+                    position: absolute;
+                    top: 5px;
+                    right: 5px;
+                    background: #f0f0f0;
+                    border: 1px solid #ccc;
+                    border-radius: 3px;
+                    width: 20px;
+                    height: 20px;
+                    font-size: 12px;
+                    cursor: pointer;
+                ">×</button>
+            </div>
+            
             <div class="header">
                 <h1>🤖 AI Agent</h1>
                 <p>Tank_桌面前端</p>
             </div>
             
             <div class="chat-area" id="chatArea">
+                <!-- Office文件拖放区 -->
+                <div id="officeDropZone" class="drop-zone" style="
+                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                    border: 3px dashed #4CAF50;
+                    border-radius: 12px;
+                    padding: 30px;
+                    text-align: center;
+                    margin: 20px 0;
+                    cursor: pointer;
+                    transition: all 0.3s ease;
+                ">
+                    <div style="font-size: 48px; margin-bottom: 15px;">📄</div>
+                    <h3 style="color: #333; margin: 0 0 10px 0;">Office文档智能处理</h3>
+                    <p style="color: #666; margin: 0 0 20px 0;">拖放Excel、Word、PPT文件到此处，我将为您：</p>
+                    
+                    <div style="display: flex; justify-content: space-around; margin: 20px 0; font-size: 14px;">
+                        <div>📊 Excel分析图表</div>
+                        <div>📝 Word内容提取</div>
+                        <div>🎯 PPT内容总结</div>
+                    </div>
+                    
+                    <div id="dropZoneText" style="color: #4CAF50; font-weight: bold;">
+                        拖放文件到此处或点击选择文件
+                    </div>
+                    
+                    <input type="file" id="fileInput" multiple accept=".xlsx,.xls,.docx,.doc,.pptx,.ppt,.txt" 
+                           style="display: none;">
+                </div>
+                
+                <!-- 文件处理结果展示 -->
+                <div id="processingResults" style="
+                    display: none;
+                    background: #f8f9fa;
+                    border: 1px solid #e9ecef;
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin: 20px 0;
+                ">
+                    <h4 style="margin: 0 0 15px 0; color: #495057;">处理结果</h4>
+                    <div id="resultsContent"></div>
+                </div>
+                
                 <div class="typing-indicator" id="typingIndicator">
                     <span></span><span></span><span></span>
                 </div>
@@ -890,6 +985,9 @@
 		let userScrolledUp = false;
 		// 文件上传：待发送附件列表
 		let pendingFiles = [];  // [{name, path}, ...]
+		// 全局状态：是否有任何会话正在运行
+		let hasActiveSession = false;
+		let activeSessionId = null;
 
 		// ============================
 		// 2. DOM 元素
@@ -947,16 +1045,28 @@
 		}
 
 		// 问题3+4：取消当前请求
-		function cancelCurrentRequest() {
-			const ctrl = sessionAbortControllers[currentSessionId];
-			if (ctrl) {
-				ctrl.abort();
-				delete sessionAbortControllers[currentSessionId];
-			}
-			pulseSpinner.style.display = 'none';
-			slowHint.style.display = 'none';
-			typingIndicator.style.display = 'none';
+	async function cancelCurrentRequest() {
+		const ctrl = sessionAbortControllers[currentSessionId];
+		if (ctrl) {
+			ctrl.abort();
+			delete sessionAbortControllers[currentSessionId];
 		}
+		// 发送明确的取消请求到后端
+		if (currentSessionId) {
+			try {
+				await fetch('/api/cancel', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ session_id: currentSessionId })
+				});
+			} catch (e) {
+				console.log('取消请求发送失败:', e);
+			}
+		}
+		pulseSpinner.style.display = 'none';
+		slowHint.style.display = 'none';
+		typingIndicator.style.display = 'none';
+	}
 
 		// ============================
 		// 3. 辅助函数
@@ -1387,11 +1497,19 @@
 			const text = messageInput.value.trim();
 			if ((!text && pendingFiles.length === 0) || !currentSessionId || isSending) return;
 
+			if (hasActiveSession && activeSessionId !== currentSessionId) {
+				alert(`会话 "${activeSessionId}" 正在运行中，请等待它完成后再发送新消息。`);
+				return;
+			}
+
 			// 立即清空输入框，按钮切换为"停止"状态（允许点击中断）
 			isSending = true;
 			sendButton.textContent = '停止';
 			sendButton.classList.add('sending');
 			sendButton.disabled = false;
+			
+			hasActiveSession = true;
+			activeSessionId = currentSessionId;
 			messageInput.value = '';
 			// 注入附件块
 			let finalMessage = text;
@@ -1470,7 +1588,8 @@
 						model_choice: modelChoice,
 						model_id: modelId
 					}),
-					signal: sessionAbortControllers[requestSessionId].signal
+					signal: sessionAbortControllers[requestSessionId].signal,
+					keepalive: true
 				});
 
 				// 非 SSE 响应（如 JSON 错误），直接展示错误信息
@@ -1663,8 +1782,29 @@
 			sendButton.textContent = '发送';
 			sendButton.classList.remove('sending');
 			sendButton.disabled = false;
+			
+			hasActiveSession = false;
+			activeSessionId = null;
 		}
 	}
+
+		async function checkActiveSessions() {
+			try {
+				const response = await fetch('/api/session/status');
+				const data = await response.json();
+				if (data.success && data.has_active_sessions) {
+					hasActiveSession = true;
+					if (data.active_sessions && data.active_sessions.length > 0) {
+						activeSessionId = data.active_sessions[0];
+					}
+				} else {
+					hasActiveSession = false;
+					activeSessionId = null;
+				}
+			} catch (e) {
+				console.error('checkActiveSessions error:', e);
+			}
+		}
 
 		// ============================
 		// 6. 初始化（唯一监听器）
@@ -1715,6 +1855,11 @@
 			if (!currentSessionId) {
 				await createNewSession();
 			}
+			
+			// 定期检查活跃会话状态
+			checkActiveSessions();
+			setInterval(checkActiveSessions, 5000);
+			
 			// 事件绑定
 			newChatBtn.addEventListener('click', () => createNewSession());
 			sendButton.addEventListener('click', () => {
@@ -2023,29 +2168,673 @@
 			}
 			loadPresets();
 
-			document.getElementById('mf_preset').addEventListener('change', function() {
-				const key = this.value;
-				const preset = presetsData[key];
-				const warningEl = document.getElementById('presetWarning');
-				if (!preset) { warningEl.style.display = 'none'; return; }
-				document.getElementById('mf_provider').value = key;
-				document.getElementById('mf_base_url').value = preset.base_url || '';
-				document.getElementById('mf_temperature').value = preset.temperature || 0.7;
-				if (preset.warning) {
-					warningEl.textContent = preset.warning;
-					warningEl.style.display = 'block';
-				} else {
-					warningEl.style.display = 'none';
-				}
-				// 预设模型名
-				if (preset.models && preset.models.length > 0) {
-					document.getElementById('mf_model').value = preset.models[0];
-					document.getElementById('mf_name').value = preset.name + ' - ' + preset.models[0];
-				} else if (key === 'ollama') {
-					document.getElementById('mf_model').placeholder = '填写本地模型名，如 llama3';
-				}
-			});
+            document.getElementById('mf_preset').addEventListener('change', function() {
+			const key = this.value;
+			const preset = presetsData[key];
+			const warningEl = document.getElementById('presetWarning');
+			if (!preset) { warningEl.style.display = 'none'; return; }
+			document.getElementById('mf_provider').value = key;
+			document.getElementById('mf_base_url').value = preset.base_url || '';
+			document.getElementById('mf_temperature').value = preset.temperature || 0.7;
+			if (preset.warning) {
+				warningEl.textContent = preset.warning;
+				warningEl.style.display = 'block';
+			} else {
+				warningEl.style.display = 'none';
+			}
+			// 预设模型名
+			if (preset.models && preset.models.length > 0) {
+				document.getElementById('mf_model').value = preset.models[0];
+				document.getElementById('mf_name').value = preset.name + ' - ' + preset.models[0];
+			} else if (key === 'ollama') {
+				document.getElementById('mf_model').placeholder = '填写本地模型名，如 llama3';
+			}
 		});
+		});
+
+	// =====================================
+	// GUI增强功能 - 系统控制面板
+	// =====================================
+
+	// 系统控制面板JavaScript函数
+
+	// 音量控制
+	function setVolume(operation, value = 50) {
+	    const volumeSlider = document.getElementById('volumeSlider');
+	    const volumeValue = document.getElementById('volumeValue');
+	    
+	    if (operation === 'set_volume') {
+	        volumeSlider.value = value;
+	        volumeValue.textContent = value;
+	    }
+	    
+	    // 调用Agent的音量控制工具
+	    sendQuickCommand(`帮我调整音量为${value}%`);
+	    
+	    // 也可以直接调用API（如果实现了后端接口）
+	    // fetch('/api/system/volume', {
+	    //     method: 'POST',
+	    //     headers: {'Content-Type': 'application/json'},
+	    //     body: JSON.stringify({operation, value})
+	    // });
+	}
+
+	// 亮度控制
+	function setBrightness(value) {
+	    const brightnessSlider = document.getElementById('brightnessSlider');
+	    const brightnessValue = document.getElementById('brightnessValue');
+	    
+	    brightnessSlider.value = value;
+	    brightnessValue.textContent = value;
+	    
+	    // 调用Agent的亮度控制工具
+	    sendQuickCommand(`帮我调整屏幕亮度为${value}%`);
+	    
+	    console.log(`设置亮度: ${value}%`);
+	}
+
+	// 截图功能  
+	function takeScreenshot() {
+	    // 调用Agent的截图工具
+	    sendQuickCommand("请帮我截图并保存到工作空间");
+	    
+	    console.log('执行截图操作');
+	    alert('截图命令已发送，请查看Agent执行结果');
+	}
+
+	// 任务管理器
+	function openTaskManager() {
+	    sendQuickCommand("请帮我查看当前运行的进程和CPU使用情况");
+	}
+
+	// 系统信息
+	function showSystemInfo() {
+	    sendQuickCommand("请帮我显示系统信息：CPU使用率、内存使用、磁盘空间");
+	}
+
+	// 快捷命令发送函数
+	function sendQuickCommand(command) {
+	    // 获取输入框和发送按钮
+	    const input = document.getElementById('messageInput');
+	    const sendBtn = document.getElementById('sendButton');
+	    
+	    // 填充命令并发送
+	    if (input && sendBtn) {
+	        input.value = command;
+	        sendBtn.click();
+	    }
+	}
+
+	// 面板显示/隐藏切换
+	function toggleSystemPanel() {
+	    const panel = document.getElementById('systemPanel');
+	    if (panel.style.display === 'none') {
+	        panel.style.display = 'block';
+	    } else {
+	        panel.style.display = 'none';
+	    }
+	}
+
+	// 绑定滑块事件
+	document.addEventListener('DOMContentLoaded', function() {
+	    const volumeSlider = document.getElementById('volumeSlider');
+	    const brightnessSlider = document.getElementById('brightnessSlider');
+	    
+	    if (volumeSlider) {
+	        volumeSlider.addEventListener('input', function() {
+	            document.getElementById('volumeValue').textContent = this.value;
+	        });
+	        
+	        volumeSlider.addEventListener('change', function() {
+	            setVolume('set_volume', parseInt(this.value));
+	        });
+	    }
+	    
+	    if (brightnessSlider) {
+	        brightnessSlider.addEventListener('input', function() {
+	            document.getElementById('brightnessValue').textContent = this.value;
+	        });
+	        
+	        brightnessSlider.addEventListener('change', function() {
+	            setBrightness(parseInt(this.value));
+	        });
+	    }
+	    
+	    console.log('系统控制面板加载完成');
+	});
+
+	// 快捷键支持
+
+document.addEventListener('keydown', function(e) {
+	    // Ctrl+Shift+S: 截图
+	    if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+	        e.preventDefault();
+	        takeScreenshot();
+	    }
+	    
+	    // Ctrl+Shift+T: 系统信息
+	    if (e.ctrlKey && e.shiftKey && e.key === 'T') {
+	        e.preventDefault();  
+	        showSystemInfo();
+	    }
+	    
+	    // Ctrl+Shift+P: 切换面板显示
+	    if (e.ctrlKey && e.shiftKey && e.key === 'P') {
+	        e.preventDefault();
+	        toggleSystemPanel();
+	    }
+});
+
+	// =====================================
+	// GUI增强功能 - Office文件拖放处理
+	// =====================================
+
+	// Office文件拖放处理JavaScript
+
+	class OfficeDropZone {
+	    constructor() {
+	        this.dropZone = document.getElementById('officeDropZone');
+	        this.fileInput = document.getElementById('fileInput');
+	        this.dropZoneText = document.getElementById('dropZoneText');
+	        this.resultsContent = document.getElementById('resultsContent');
+	        this.processingResults = document.getElementById('processingResults');
+	        
+	        this.initDropZone();
+	        this.initFileInput();
+	    }
+	    
+	    initDropZone() {
+	        if (!this.dropZone) return;
+	        
+	        // 拖放事件
+	        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+	            this.dropZone.addEventListener(eventName, (e) => {
+	                e.preventDefault();
+	                e.stopPropagation();
+	            });
+	        });
+	        
+	        // 拖拽进入/悬停效果
+	        this.dropZone.addEventListener('dragenter', () => {
+	            this.dropZone.style.borderColor = '#2196F3';
+	            this.dropZone.style.backgroundColor = '#e3f2fd';
+	        });
+	        
+	        this.dropZone.addEventListener('dragover', () => {
+	            this.dropZone.style.borderColor = '#2196F3'; 
+	            this.dropZone.style.backgroundColor = '#e3f2fd';
+	        });
+	        
+	        // 拖拽离开
+	        this.dropZone.addEventListener('dragleave', () => {
+	            this.dropZone.style.borderColor = '#4CAF50';
+	            this.dropZone.style.backgroundColor = '';
+	        });
+	        
+	        // 放置文件
+	        this.dropZone.addEventListener('drop', (e) => {
+	            this.dropZone.style.borderColor = '#4CAF50';
+	            this.dropZone.style.backgroundColor = '';
+	            
+	            const files = e.dataTransfer.files;
+	            this.handleFiles(files);
+	        });
+	        
+	        // 点击选择文件
+	        this.dropZone.addEventListener('click', () => {
+	            this.fileInput.click();
+	        });
+	    }
+	    
+	    initFileInput() {
+	        if (!this.fileInput) return;
+	        
+	        this.fileInput.addEventListener('change', (e) => {
+	            this.handleFiles(e.target.files);
+	            this.fileInput.value = ''; // 清空选择
+	        });
+	    }
+	    
+	    handleFiles(files) {
+	        const officeFiles = Array.from(files).filter(file => {
+	            const ext = this.getFileExtension(file.name).toLowerCase();
+	            return ['.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt', '.txt'].includes(ext);
+	        });
+	        
+	        if (officeFiles.length === 0) {
+	            this.showError('请拖放Excel、Word、PPT或文本文件');
+	            return;
+	        }
+	        
+	        officeFiles.forEach(file => {
+	            this.processOfficeFile(file);
+	        });
+	    }
+	    
+	    processOfficeFile(file) {
+	        const ext = this.getFileExtension(file.name).toLowerCase();
+	        let command = '';
+	        
+	        // 根据文件类型生成不同的处理命令
+	        switch(ext) {
+	            case '.xlsx':
+	            case '.xls':
+	                command = `请分析Excel文件：${file.name}，生成数据透视表和图表，总结关键数据趋势`;
+	                break;
+	                
+	            case '.docx':
+	            case '.doc': 
+	                command = `请提取Word文档：${file.name} 的主要内容，生成摘要和关键点`;
+	                break;
+	                
+	            case '.pptx':
+	            case '.ppt':
+	                command = `请总结PPT演示文稿：${file.name} 的主要内容，提取核心观点和结论`;
+	                break;
+	                
+	            case '.txt':
+	                command = `请阅读文本文件：${file.name}，总结主要内容和关键信息`;
+	                break;
+	        }
+	        
+	        // 显示处理中状态
+	        this.showProcessing(file.name, ext);
+	        
+	        // 调用Agent处理
+	        setTimeout(() => {
+	            this.sendOfficeCommand(command, file.name);
+	        }, 1000);
+	        
+	        console.log(`处理文件: ${file.name} (${ext})`);
+	    }
+	    
+	    showProcessing(filename, ext) {
+	        const icon = this.getFileIcon(ext);
+	        const processingHtml = `
+	            <div style="display: flex; align-items: center; margin: 10px 0; padding: 10px; background: #fff3cd;
+	                        border: 1px solid #ffeaa7; border-radius: 5px;">
+	                <span style="font-size: 24px; margin-right: 10px;">${icon}</span>
+	                <div>
+	                    <strong style="color: #856404;">${filename}</strong>
+	                    <div style="font-size: 12px; color: #856404;">处理中...请稍候</div>
+	                </div>
+	                <div style="margin-left: auto;">
+	                    <div class="spinner" style="width: 20px; height: 20px; border: 2px solid #f3f3f3;
+	                         border-top: 2px solid #4CAF50; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+	                </div>
+	            </div>
+	        `;
+	        
+	        this.resultsContent.innerHTML += processingHtml;
+	        this.processingResults.style.display = 'block';
+	    }
+	    
+	    sendOfficeCommand(command, filename) {
+	        // 发送命令给Agent
+	        const input = document.getElementById('messageInput');
+	        const sendBtn = document.getElementById('sendButton');
+	        
+	        if (input && sendBtn) {
+	            input.value = command;
+	            sendBtn.click();
+	            
+	            // 添加处理结果跟踪
+	            this.addResultEntry(filename, command);
+	        }
+	    }
+	    
+	    addResultEntry(filename, command) {
+	        const entryHtml = `
+	            <div style="margin: 10px 0; padding: 10px; background: white; border-left: 4px solid #4CAF50;">
+	                <strong style="color: #4CAF50;">✓ ${filename}</strong>
+	                <div style="font-size: 12px; color: #666; margin-top: 5px;">
+	                    命令: ${command}
+	                </div>
+	                <div style="font-size: 11px; color: #999; margin-top: 3px;">
+	                    等待Agent处理结果...
+	                </div>
+	            </div>
+	        `;
+	        
+	        this.resultsContent.innerHTML += entryHtml;
+	    }
+	    
+	    showError(message) {
+	        alert(message);
+	    }
+	    
+	    getFileExtension(filename) {
+	        return filename.slice(filename.lastIndexOf('.')).toLowerCase();
+	    }
+	    
+	    getFileIcon(ext) {
+	        const icons = {
+	            '.xlsx': '📊', '.xls': '📊',
+	            '.docx': '📝', '.doc': '📝', 
+	            '.pptx': '📽️', '.ppt': '📽️',
+	            '.txt': '📄'
+	        };
+	        return icons[ext] || '📄';
+	    }
+	}
+
+	// 初始化拖放区
+
+document.addEventListener('DOMContentLoaded', function() {
+	    if (document.getElementById('officeDropZone')) {
+	        new OfficeDropZone();
+	        console.log('Office拖放区初始化完成');
+	    }
+});
+
+	// 样式动画
+const style = document.createElement('style');
+style.textContent = `
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    
+    .drop-zone:hover {
+        border-color: #2196F3 !important;
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+    }
+    
+    @keyframes slideIn {
+        from { transform: translateY(-100px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
+    
+    @keyframes slideOut {
+        from { transform: translateY(0); opacity: 1; }
+        to { transform: translateY(-100px); opacity: 0; }
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 0.8; }
+        50% { opacity: 1; }
+    }
+`;
+document.head.appendChild(style);
+
+// =====================================
+// 加载用户体验增强功能
+// =====================================
+const script = document.createElement('script');
+script.textContent = `
+/* 
+ * GUI增强功能 - 用户体验优化
+ * 提供流畅的交互体验和视觉反馈
+ */
+
+class EnhancedUIFeatures {
+    constructor() {
+        this.init();
+    }
+    
+    init() {
+        this.bindSystemControls();
+        this.bindOfficeDropZone();
+        this.addKeyboardShortcuts();
+        this.addNotificationSystem();
+        this.setupAutoHidePanel();
+        console.log('GUI增强功能初始化完成');
+    }
+    
+    bindSystemControls() {
+        // 音量控制事件绑定
+        this.bindCustomSlider('volumeSlider', (value) => {
+            this.sendSystemCommand(`set_volume_system`, { value: value });
+        });
+        
+        // 亮度控制事件绑定
+        this.bindCustomSlider('brightnessSlider', (value) => {
+            this.sendSystemCommand(`set_brightness_system`, { value: value });
+        });
+    }
+    
+    bindCustomSlider(sliderId, callback) {
+        const slider = document.getElementById(sliderId);
+        if (!slider) return;
+        
+        // 实时值显示
+        slider.addEventListener('input', function() {
+            const valueElement = document.getElementById(this.id.replace('Slider', 'Value'));
+            if (valueElement) {
+                valueElement.textContent = this.value;
+                this.style.background = \`linear-gradient(to right, #4CAF50 0%, #4CAF50 \\${this.value}%, #ddd \\${this.value}%, #ddd 100%)\`;
+            }
+        });
+        
+        // 变更操作
+        slider.addEventListener('change', function() {
+            callback(parseInt(this.value));
+        });
+    }
+    
+    bindOfficeDropZone() {
+        const dropZone = document.getElementById('officeDropZone');
+        if (!dropZone) return;
+        
+        // 优化拖放视觉效果
+        const enhanceDropEffects = () => {
+            dropZone.addEventListener('dragenter', (e) => {
+                e.preventDefault();
+                this.showDropHint('释放文件开始处理...', 'success');
+            });
+            
+            dropZone.addEventListener('dragleave', () => {
+                this.hideDropHint();
+            });
+        };
+        
+        enhanceDropEffects();
+    }
+    
+    addKeyboardShortcuts() {
+        document.addEventListener('keydown', (e) => {
+            // Ctrl+Shift+快捷键
+            if (e.ctrlKey && e.shiftKey) {
+                switch(e.key.toLowerCase()) {
+                    case 's':
+                        e.preventDefault();
+                        this.quickScreenshot();
+                        break;
+                    case 't':
+                        e.preventDefault();
+                        this.showSystemInfo();
+                        break;
+                    case 'p':
+                        e.preventDefault();
+                        this.toggleSystemPanel();
+                        break;
+                    case 'd':
+                        e.preventDefault();
+                        this.focusDropZone();
+                        break;
+                }
+            }
+        });
+    }
+    
+    addNotificationSystem() {
+        // 创建通知容器
+        const notificationContainer = document.createElement('div');
+        notificationContainer.id = 'gui-notifications';
+        notificationContainer.style.cssText = \\\`
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10000;
+            pointer-events: none;
+        \\\`;
+        document.body.appendChild(notificationContainer);
+    }
+    
+    setupAutoHidePanel() {
+        const panel = document.getElementById('systemPanel');
+        if (!panel) return;
+        
+        let hideTimer;
+        const hideDelay = 15000; // 15秒后开始渐隐
+        
+        // 鼠标移出时自动隐藏
+        panel.addEventListener('mouseleave', () => {
+            hideTimer = setTimeout(() => {
+                panel.style.opacity = '0.2';
+                panel.style.transform = 'translateX(200px)';
+                panel.style.transition = 'all 0.5s ease';
+            }, hideDelay);
+        });
+        
+        // 鼠标移入时显示
+        panel.addEventListener('mouseenter', () => {
+            clearTimeout(hideTimer);
+            panel.style.opacity = '1';
+            panel.style.transform = 'translateX(0)';
+        });
+        
+        // 点击时保持显示
+        panel.addEventListener('click', () => {
+            clearTimeout(hideTimer);
+            panel.style.opacity = '1';
+            panel.style.transform = 'translateX(0)';
+        });
+    }
+    
+    // 快捷操作函数
+    quickScreenshot() {
+        this.sendChatCommand('请帮我截图并保存到工作空间');
+        this.showNotification('截图命令已发送', 'success');
+    }
+    
+    showSystemInfo() {
+        this.sendChatCommand('请帮我显示系统信息');
+        this.showNotification('系统信息命令已发送', 'info');
+    }
+    
+    toggleSystemPanel() {
+        const panel = document.getElementById('systemPanel');
+        if (panel.style.display === 'none') {
+            panel.style.display = 'block';
+            this.showNotification('系统面板已显示', 'info');
+        } else {
+            panel.style.display = 'none';
+            this.showNotification('系统面板已隐藏', 'info');
+        }
+    }
+    
+    focusDropZone() {
+        const dropZone = document.getElementById('officeDropZone');
+        if (dropZone) {
+            dropZone.scrollIntoView({ behavior: 'smooth' });
+            dropZone.style.borderColor = '#FF9800';
+            setTimeout(() => {
+                dropZone.style.borderColor = '#4CAF50';
+            }, 1000);
+            this.showNotification('Office拖放区已高亮', 'info');
+        }
+    }
+    
+    // 通知系统
+    showNotification(message, type = 'info') {
+        const container = document.getElementById('gui-notifications');
+        if (!container) return;
+        
+        const notification = document.createElement('div');
+        notification.style.cssText = \\\`
+            background: \\${this.getNotificationColor(type)};
+            color: white;
+            padding: 12px 20px;
+            margin: 5px;
+            border-radius: 6px;
+            font-size: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            animation: slideIn 0.3s ease;
+            pointer-events: auto;
+            cursor: pointer;
+            z-index: 10001;
+        \\\`;
+        
+        notification.textContent = message;
+        notification.onclick = () => notification.remove();
+        container.appendChild(notification);
+        
+        // 自动移除
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.style.animation = 'slideOut 0.3s ease';
+                setTimeout(() => notification.remove(), 300);
+            }
+        }, 4000);
+    }
+    
+    getNotificationColor(type) {
+        const colors = {
+            success: '#4CAF50',
+            error: '#F44336', 
+            Warning: '#FF9800',
+            info: '#2196F3'
+        };
+        return colors[type] || colors.info;
+    }
+    
+    showDropHint(message, type = 'info') {
+        const dropZone = document.getElementById('officeDropZone');
+        if (!dropZone) return;
+        
+        const hint = document.createElement('div');
+        hint.style.cssText = \\\`
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: \\${this.getNotificationColor(type)};
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            font-size: 14px;
+            z-index: 10;
+            animation: pulse 1s ease-in-out infinite;
+        \\\`;
+        hint.textContent = message;
+        hint.id = 'dropHint';
+        
+        dropZone.style.position = 'relative';
+        dropZone.appendChild(hint);
+    }
+    
+    hideDropHint() {
+        const hint = document.getElementById('dropHint');
+        if (hint) hint.remove();
+    }
+    
+    // 命令发送
+    sendChatCommand(command) {
+        const input = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendButton');
+        
+        if (input && sendBtn) {
+            input.value = command;
+            sendBtn.click();
+        }
+    }
+    
+    sendSystemCommand(operation, params = {}) {
+        // 发送到Agent处理
+        const command = \\\`系统命令: \\${operation} \\${JSON.stringify(params)}\\\`;
+        this.sendChatCommand(command);
+    }
+}
+
+// 初始化增强功能
+document.addEventListener('DOMContentLoaded', function() {
+    window.enhancedUI = new EnhancedUIFeatures();
+});
+`;
+document.head.appendChild(script);
 	</script>
 </body>
 </html>

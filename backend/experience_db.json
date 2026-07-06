@@ -1,0 +1,117 @@
+{
+  "records": {
+    "set_volume:system_config": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "mute:system_config": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "set_mic_volume:system_config": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "switch_audio_device:system_config": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "set_resolution:system_config": {
+      "recommended_tool": "display_config",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "set_brightness:system_config": {
+      "recommended_tool": "display_config",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "modify_registry:system_config": {
+      "recommended_tool": "modify_registry",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 0,
+      "fail_count": 0,
+      "last_used": "",
+      "failed_tools": []
+    },
+    "general:general_chat": {
+      "recommended_tool": "search_files",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 30,
+      "fail_count": 10,
+      "last_used": "2026-07-04T16:25:48",
+      "failed_tools": []
+    },
+    "set_volume:general_chat": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 2,
+      "fail_count": 0,
+      "last_used": "2026-07-04T16:32:28",
+      "failed_tools": []
+    },
+    "set_volume:general": {
+      "recommended_tool": "system_audio",
+      "recommended_params": {
+        "level": "tool"
+      },
+      "success_count": 4,
+      "fail_count": 1,
+      "last_used": "2026-07-05T10:40:10",
+      "failed_tools": [
+        "ask_user_clarification"
+      ]
+    },
+    "general:general": {
+      "recommended_tool": "execute_command",
+      "recommended_params": {
+        "level": "domain"
+      },
+      "success_count": 59,
+      "fail_count": 20,
+      "last_used": "2026-07-05T14:06:04",
+      "failed_tools": []
+    }
+  },
+  "pre_seeded": true
+}

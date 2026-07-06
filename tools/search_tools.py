@@ -5,9 +5,11 @@ import json
 import asyncio
 
 import requests
+from urllib.parse import urlparse
 
 from . import register_tool, path_params
 from config.config_loader import get_safety_config
+from config.settings import SEARCH_TIMEOUT, HTML_PARSE_MAX_CHARS, USER_AGENT, MOBILE_UA
 
 # Playwright 懒加载 —— 仅在 render_js=True 时导入
 _playwright_available = None  # None=未检测
@@ -144,8 +146,8 @@ def search_files(keyword: str, search_path: str = None, file_extensions: list = 
 #  网页浏览工具
 # ═══════════════════════════════════════════
 
-_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-_MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+_USER_AGENT = USER_AGENT
+_MOBILE_UA = MOBILE_UA
 
 # JS 渲染页面的典型空壳特征
 _JS_SHELL_PATTERNS = [
@@ -211,7 +213,7 @@ JSON 输出："""
             "http://localhost:11434/api/generate",
             json={"model": "deepseek-r1:7b", "prompt": prompt, "stream": False,
                   "options": {"temperature": 0.1}},
-            timeout=30,
+            timeout=SEARCH_TIMEOUT,
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
@@ -233,7 +235,12 @@ def web_search(query: str, max_results: int = 10):
     """使用 Bing 搜索引擎搜索网页，返回标题、链接和摘要。适合获取最新新闻、实时信息。"""
     try:
         url = "https://www.bing.com/search"
-        resp = requests.get(url, params={"q": query}, headers={"User-Agent": _USER_AGENT}, timeout=10)
+        resp = requests.get(url, params={"q": query}, headers={"User-Agent": _USER_AGENT}, timeout=max(SEARCH_TIMEOUT // 3, 5))
+        if resp.status_code == 429:
+            return json.dumps({
+                "success": False,
+                "error": "Bing 搜索触发限流 (429)，请等待 30 秒后重试或换用其他搜索引擎。"
+            }, ensure_ascii=False)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
@@ -314,7 +321,7 @@ def fetch_webpage(url: str, max_length: int = 3000, render_js: bool = False):
                 # 尝试 m. 子域名
                 ua = _MOBILE_UA
                 target_url = re.sub(r'https?://(www\.)?', 'https://m.', url, count=1)
-            resp = requests.get(target_url, headers={"User-Agent": ua}, timeout=15, allow_redirects=True)
+            resp = requests.get(target_url, headers={"User-Agent": ua}, timeout=SEARCH_TIMEOUT, allow_redirects=True)
             resp.raise_for_status()
             if resp.encoding and resp.encoding.lower() != "utf-8":
                 try:
@@ -342,7 +349,7 @@ def fetch_webpage(url: str, max_length: int = 3000, render_js: bool = False):
             return web_download(url)
 
     # 对常见文件扩展名做路由
-    parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(resp_url)
+    parsed = urlparse(resp_url)
     path_lower = parsed.path.lower()
     if any(path_lower.endswith(ext) for ext in get_safety_config().downloadable_exts):
         from .web_download import web_download
@@ -388,7 +395,7 @@ def fetch_multiple(urls: list, max_length: int = 2000):
     results = []
     for url in urls[:5]:
         try:
-            resp = requests.get(url, headers={"User-Agent": _MOBILE_UA}, timeout=15, allow_redirects=True)
+            resp = requests.get(url, headers={"User-Agent": _MOBILE_UA}, timeout=SEARCH_TIMEOUT, allow_redirects=True)
             resp.raise_for_status()
             raw = resp.text
             body_m = re.search(r"<body[^>]*>(.*?)</body>", raw, re.DOTALL | re.IGNORECASE)
@@ -412,7 +419,7 @@ def get_weather(city: str = "Shenzhen"):
     # 主路径：wttr.in
     try:
         url = f"https://wttr.in/{city}?format=j1&lang=zh"
-        resp = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=8)
+        resp = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=max(SEARCH_TIMEOUT // 3, 5))
         resp.raise_for_status()
         data = resp.json()
         current = data["current_condition"][0]
@@ -442,7 +449,7 @@ def get_weather(city: str = "Shenzhen"):
     try:
         query = f"{city} 天气 明天" if "明天" not in str(city) else f"{city} 天气"
         url = "https://www.bing.com/search"
-        resp = requests.get(url, params={"q": query}, headers={"User-Agent": _USER_AGENT}, timeout=10)
+        resp = requests.get(url, params={"q": query}, headers={"User-Agent": _USER_AGENT}, timeout=max(SEARCH_TIMEOUT // 3, 5))
         resp.raise_for_status()
         html = resp.text
 

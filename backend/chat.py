@@ -1,0 +1,664 @@
+import re as _re
+import time
+import json
+import datetime
+import os
+from flask import Blueprint, request, jsonify, Response, stream_with_context, send_from_directory
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import atexit
+
+from llm_client import get_available_models, ai_concat
+from memory import (append_session_message, generate_trace_id,
+                    get_user_id, log_operation, list_sessions)
+from memory.long_term import _rewrite_md, _read_lines
+from memory.config import USER_MD, FACTS_MD, SESSION_DIR
+from utils.error_mapper import translate_error
+from logger import get_logger
+from backend.agent import run_agent
+from backend.routing import check_chat_layer, check_frequent_cache, check_complexity, record_success
+from config.settings import SCREENSHOTS_DIR, MODELS_CONFIG_PATH, USER_PROFILE_PATH, MODEL_PRESETS
+
+chat_bp = Blueprint('chat', __name__)
+
+# ── 全局会话状态管理 ──
+_active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id}}
+_active_sessions_lock = threading.Lock()
+
+def _register_session(session_id):
+    with _active_sessions_lock:
+        _active_sessions[session_id] = {
+            "started_at": time.time(),
+            "thread_id": threading.current_thread().ident
+        }
+
+def _unregister_session(session_id):
+    with _active_sessions_lock:
+        _active_sessions.pop(session_id, None)
+
+def _is_session_active(session_id):
+    with _active_sessions_lock:
+        return session_id in _active_sessions
+
+def _has_active_sessions():
+    with _active_sessions_lock:
+        return len(_active_sessions) > 0
+
+# ── 附件标记常量 ──
+_ATTACHMENT_START = "<attachments>"
+_ATTACHMENT_END = "</attachments>"
+
+
+def _extract_attachments(user_message: str):
+    start = user_message.find(_ATTACHMENT_START)
+    end = user_message.find(_ATTACHMENT_END)
+    if start == -1 or end == -1 or end <= start:
+        return user_message, []
+
+    file_list = []
+    block = user_message[start + len(_ATTACHMENT_START):end]
+    for line in block.strip().split("\n"):
+        line = line.strip()
+        m = _re.search(r"\[(.+?)\]\(<(.+?)>\)", line)
+        if m:
+            file_list.append((m.group(1), m.group(2)))
+
+    clean = (user_message[:start] + user_message[end + len(_ATTACHMENT_END):]).strip()
+    return clean, file_list
+
+
+def _inject_attachment_context(user_message: str, file_list: list):
+    if not file_list:
+        return user_message
+    lines = ["", _ATTACHMENT_START]
+    for name, path in file_list:
+        lines.append(f"- [{name}]({path})")
+    lines.append(_ATTACHMENT_END)
+    return user_message + "\n".join(lines)
+
+
+# ── 工具执行线程池单例 ──
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
+atexit.register(_TOOL_EXECUTOR.shutdown, wait=False)
+
+# ── 命令确认机制 ──
+_pending_confirmations: dict = {}
+_pending_lock = threading.Lock()
+_TOKEN_STORE_FILE = os.path.join(SESSION_DIR, "confirmation_tokens.json")
+
+
+def _load_token_store() -> dict:
+    if not os.path.exists(_TOKEN_STORE_FILE):
+        return {}
+    try:
+        with open(_TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        backup = _TOKEN_STORE_FILE + ".corrupted"
+        os.replace(_TOKEN_STORE_FILE, backup)
+        return {}
+
+
+def _save_token_store(store: dict):
+    tmp = _TOKEN_STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _TOKEN_STORE_FILE)
+
+
+def _cleanup_expired_tokens():
+    store = _load_token_store()
+    now = time.time()
+    cleaned = {k: v for k, v in store.items() if v.get("expires", 0) > now}
+    if len(cleaned) != len(store):
+        _save_token_store(cleaned)
+
+
+_cleanup_expired_tokens()
+
+
+def wait_for_confirmation(confirmation_token: str, timeout: float = 300) -> dict:
+    import time
+    evt = threading.Event()
+    result_holder = {"confirmed": False}
+    with _pending_lock:
+        _pending_confirmations[confirmation_token] = {"event": evt, "result": result_holder}
+    store = _load_token_store()
+    store[confirmation_token] = {"created": time.time(), "expires": time.time() + timeout}
+    _save_token_store(store)
+    
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if evt.is_set():
+            break
+        time.sleep(0.1)
+    
+    got_signal = evt.is_set()
+    with _pending_lock:
+        _pending_confirmations.pop(confirmation_token, None)
+    store = _load_token_store()
+    store.pop(confirmation_token, None)
+    _save_token_store(store)
+    if not got_signal:
+        return {"confirmed": False, "timeout": True}
+    return result_holder
+
+
+# ── 模型选择 ──
+available_models = get_available_models()
+default_model = available_models[0] if available_models else {"provider": "ollama", "model": "deepseek-r1:7b", "display": "本地 Ollama"}
+
+
+def get_model_choice(display_name=None, model_id=None):
+    for m in available_models:
+        if model_id and m.get("id") == model_id:
+            return m
+        if m["display"] == display_name:
+            return m
+    return default_model
+
+
+# ── SSE 快捷响应辅助 ──
+def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
+    import datetime as dt
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def generate():
+        yield f"data: {json.dumps({'type': 'step', 'text': '处理中...', 'status': '进行中'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'final', 'text': text, 'timestamp': now}, ensure_ascii=False)}\n\n"
+
+    append_session_message(session_id, "assistant", text,
+                           trace_id=trace_id, user_id=user_id,
+                           skip_compress=True)
+    return generate()
+
+
+# ── 截图静态服务 ──
+@chat_bp.route('/screenshots/<path:filename>')
+def serve_screenshot(filename):
+    return send_from_directory(SCREENSHOTS_DIR, filename)
+
+
+# ── 聊天主路由 ──
+@chat_bp.route("/api/chat", methods=["POST"])
+def api_chat():
+    trace_id = generate_trace_id()
+    user_id = get_user_id()
+    try:
+        data = request.json
+        user_input = data.get("message", "").strip()
+        session_id = data.get("session_id")
+        if not session_id:
+            return jsonify({"success": False, "message": "缺少 session_id"}), 400
+
+        cleaned_msg, attachments = _extract_attachments(user_input)
+        user_input = _inject_attachment_context(cleaned_msg, attachments)
+
+        append_session_message(session_id, "user", user_input, skip_compress=False,
+                               trace_id=trace_id, user_id=user_id)
+
+        model_choice = data.get("model_choice")
+        if (not model_choice or not isinstance(model_choice, dict)
+                or "provider" not in model_choice or "model" not in model_choice):
+            model_display = data.get("model", None)
+            model_id = data.get("model_id", None)
+            model_choice = get_model_choice(model_display, model_id)
+
+        print(f"[DIAG /chat] session={session_id} model_choice={model_choice} msg_len={len(user_input)}", flush=True)
+
+        session_name = ""
+        for s in list_sessions():
+            if s["id"] == session_id:
+                session_name = s.get("title", "")
+                break
+
+        # ── 第1层：闲聊匹配 ──
+        chat_reply = check_chat_layer(user_input)
+        if chat_reply is not None:
+            print(f"[ROUTE L1] 闲聊命中 → 直接返回", flush=True)
+            gen = _sse_quick_reply(chat_reply, session_id, trace_id, user_id)
+            return Response(stream_with_context(gen),
+                            mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+        # ── 第2层：高频固化 ──
+        cache_hit, cache_reply = check_frequent_cache(user_input)
+        if cache_hit and cache_reply:
+            print(f"[ROUTE L2] 高频固化命中 → 直接调用工具返回", flush=True)
+            gen = _sse_quick_reply(cache_reply, session_id, trace_id, user_id)
+            return Response(stream_with_context(gen),
+                            mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+        # ── 第3层：复杂度判断 ──
+        complexity = check_complexity(user_input, model_choice)
+        print(f"[ROUTE L3] 复杂度判定: {complexity}", flush=True)
+
+        planning_extra = ""
+        if complexity == "复杂":
+            planning_extra = (
+                "\n\n[系统指令 - 步骤规划] 这是一个复杂任务。"
+                "请在首轮以 JSON 格式输出结构化步骤规划：\n"
+                '{"plan": [{"step": 1, "description": "第一步做什么", "expected_tool": "建议工具"}, ...]}\n'
+                "输出规划后，按步骤顺序逐一执行。每完成一步，用 progress 报告完成进度（如 '已完成步骤1: xxx'）。"
+            )
+            print(f"[ROUTE L3] 复杂任务 → 注入规划提示", flush=True)
+        else:
+            print(f"[ROUTE L3] 简单任务 → 直接执行", flush=True)
+
+        _register_session(session_id)
+        
+        def _run_agent_with_cleanup():
+            try:
+                for chunk in run_agent(
+                    user_message=user_input,
+                    model_choice=model_choice,
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    user_id=user_id,
+                    streaming=True,
+                    session_name=session_name,
+                    tool_executor=_TOOL_EXECUTOR,
+                    default_model=default_model,
+                    confirmation_handler=wait_for_confirmation,
+                    planning_extra=planning_extra,
+                    on_success=lambda msg, tn="", p=None: record_success(msg, tn, p),
+                ):
+                    try:
+                        yield chunk
+                    except GeneratorExit:
+                        get_logger().info("客户端连接已断开，终止任务", trace_id=trace_id, session_id=session_id)
+                        raise
+            finally:
+                _unregister_session(session_id)
+        
+        return Response(
+            stream_with_context(_run_agent_with_cleanup()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
+    except Exception as e:
+        log_operation(trace_id, user_id, session_id if 'session_id' in locals() else "",
+                      "error", str(e))
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
+
+
+# ── 取消请求 API ──
+@chat_bp.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    try:
+        data = request.json
+        session_id = data.get("session_id", "").strip()
+        if not session_id:
+            return jsonify({"success": False, "message": "缺少 session_id"}), 400
+        
+        _unregister_session(session_id)
+        
+        get_logger().info("会话已取消", session_id=session_id)
+        return jsonify({"success": True, "message": "会话已取消"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ── 命令确认 API ──
+@chat_bp.route("/api/confirm", methods=["POST"])
+def api_confirm():
+    try:
+        data = request.json
+        token = data.get("confirmation_token", "").strip()
+        confirmed = data.get("confirmed", False)
+        if not token:
+            return jsonify({"success": False, "message": "缺少 confirmation_token"}), 400
+        with _pending_lock:
+            pending = _pending_confirmations.get(token)
+        if not pending:
+            return jsonify({"success": False, "message": "令牌无效或已过期"}), 404
+        pending["result"]["confirmed"] = confirmed
+        pending["event"].set()
+        get_logger().info("命令确认", confirmation_token=token[:8], confirmed=confirmed)
+        return jsonify({"success": True, "message": "已确认" if confirmed else "已取消"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ── 会话状态 API ──
+@chat_bp.route("/api/session/status", methods=["GET"])
+def api_session_status():
+    try:
+        session_id = request.args.get("session_id")
+        if session_id:
+            is_active = _is_session_active(session_id)
+            return jsonify({
+                "success": True,
+                "has_active_sessions": _has_active_sessions(),
+                "session_active": is_active,
+                "active_sessions": list(_active_sessions.keys())
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "has_active_sessions": _has_active_sessions(),
+                "active_sessions": list(_active_sessions.keys())
+            })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ── 模型配置 API ──
+def _load_models_config():
+    if os.path.exists(MODELS_CONFIG_PATH):
+        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"models": [], "active_model_id": ""}
+
+
+def _save_models_config(config):
+    with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def _load_user_profile():
+    if os.path.exists(USER_PROFILE_PATH):
+        with open(USER_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_user_profile(profile):
+    from memory import append_fact
+    with open(USER_PROFILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+    name = profile.get("name") or profile.get("nickname") or ""
+    parts = []
+    if name:
+        parts.append(f"- 姓名: {name}")
+    if profile.get("nickname") and profile.get("name") and profile["nickname"] != profile["name"]:
+        parts.append(f"- 称呼偏好: {profile['nickname']}")
+    if parts:
+        _rewrite_md(USER_MD, "# 用户信息\n\n" + "\n".join(parts) + "\n\n# 偏好\n\n(无)\n")
+
+    if profile.get("background"):
+        existing = _read_lines(FACTS_MD)
+        text = f"- [职业背景] {profile['background']}"
+        if text not in existing:
+            append_fact(text)
+    if profile.get("hobbies"):
+        existing = _read_lines(FACTS_MD)
+        text = f"- [兴趣爱好] {profile['hobbies']}"
+        if text not in existing:
+            append_fact(text)
+
+
+@chat_bp.route('/api/config/models', methods=['GET'])
+def api_get_models_config():
+    return jsonify({"success": True, **_load_models_config()})
+
+
+@chat_bp.route('/api/config/models', methods=['POST'])
+def api_save_models_config():
+    try:
+        data = request.json
+        if not data or "models" not in data:
+            return jsonify({"success": False, "message": "缺少 models 字段"}), 400
+        _save_models_config(data)
+        return jsonify({"success": True, "message": "配置已保存"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+@chat_bp.route('/api/config/models/active', methods=['POST'])
+def api_set_active_model():
+    try:
+        data = request.json
+        model_id = data.get("model_id", "")
+        config = _load_models_config()
+        config["active_model_id"] = model_id
+        _save_models_config(config)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ── 用户信息与首次启动 API ──
+@chat_bp.route('/api/config/user_profile', methods=['GET'])
+def api_get_user_profile():
+    return jsonify({"success": True, "profile": _load_user_profile()})
+
+
+@chat_bp.route('/api/config/user_profile', methods=['POST'])
+def api_save_user_profile():
+    try:
+        data = request.json
+        if not data or "profile" not in data:
+            return jsonify({"success": False, "message": "缺少 profile 字段"}), 400
+        _save_user_profile(data["profile"])
+        return jsonify({"success": True, "message": "个人信息已保存"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+@chat_bp.route('/api/config/first_run', methods=['GET'])
+def api_check_first_run():
+    import os
+    return jsonify({"first_run": not os.path.exists(USER_PROFILE_PATH)})
+
+
+@chat_bp.route('/api/config/model_presets', methods=['GET'])
+def api_get_model_presets():
+    return jsonify({"success": True, "presets": MODEL_PRESETS})
+
+
+# ── 日志查询 API ──
+@chat_bp.route('/logs/view')
+def log_viewer():
+    from flask import current_app
+    return current_app.send_static_file('log_viewer.html')
+
+
+@chat_bp.route('/api/logs/query')
+def api_logs_query():
+    lg = get_logger()
+    date_from = request.args.get("date_from", "")
+    date_to = request.args.get("date_to", "")
+    level = request.args.get("level", "")
+    keyword = request.args.get("keyword", "")
+    session_name = request.args.get("session_name", "")
+    limit = int(request.args.get("limit", 200))
+
+    sid = None
+    if session_name:
+        for s in list_sessions():
+            if session_name.lower() in s["title"].lower():
+                sid = s["id"]
+                break
+
+    results = lg.query(
+        date_from=date_from or None, date_to=date_to or None,
+        level=level or None, keyword=keyword or None,
+        session_id=sid, limit=min(limit, 500),
+    )
+
+    if results:
+        session_map = {s["id"]: s["title"] for s in list_sessions()}
+        for entry in results:
+            eid = (entry.get("extra") or {}).get("session_id", "")
+            entry["session_name"] = session_map.get(eid, "")
+
+    return jsonify({"success": True, "logs": results})
+
+
+@chat_bp.route('/api/logs/dates')
+def api_logs_available_dates():
+    from logger import LOG_DIR
+    dates = []
+    if LOG_DIR.exists():
+        for f in sorted(LOG_DIR.glob("agent_*.jsonl"), reverse=True):
+            dates.append(f.stem.replace("agent_", ""))
+    return jsonify({"success": True, "dates": dates})
+
+
+@chat_bp.route('/api/logs/llm_call')
+def api_logs_llm_call():
+    import os
+    session_id = request.args.get("session_id", "")
+    turn = int(request.args.get("turn", 0))
+    if not session_id:
+        return jsonify({"success": False, "message": "缺少 session_id"}), 400
+    lg = get_logger()
+    file_path = lg.get_llm_call_file(session_id, turn)
+    if file_path and os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return jsonify({"success": True, "data": json.load(f)})
+    return jsonify({"success": False, "message": "未找到该 LLM 调用记录"}), 404
+
+
+# ── 会话管理 API ──
+@chat_bp.route('/api/sessions', methods=['POST'])
+def save_session():
+    from memory.session import load_sessions_db, save_sessions_db
+    from memory.stores.sqlite_store import get_chat_messages as sql_get_messages, add_chat_message as sql_add_message
+    try:
+        data = request.json
+        session_id = data.get("id")
+        if session_id:
+            from memory import set_active_session
+            set_active_session(session_id)
+            db = load_sessions_db()
+            if session_id not in db:
+                db[session_id] = {
+                    "id": session_id,
+                    "title": data.get("title", "新会话"),
+                    "created": data.get("created_at", datetime.datetime.now().isoformat()),
+                }
+                save_sessions_db(db)
+            messages = data.get("messages", [])
+            if messages:
+                existing = sql_get_messages(session_id)
+                existing_ids = {m.get("msg_id", "") for m in existing if m.get("msg_id")}
+                existing_keys = {(m["role"], m.get("msg_type", "chat"), m["content"]) for m in existing if not m.get("msg_id")}
+                sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
+                for msg in messages:
+                    role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
+                    msg_id = msg.get("msgId", "")
+                    if msg_id and msg_id in existing_ids:
+                        continue
+                    if not msg_id:
+                        key = (role, msg.get("msgType", "chat"), (msg.get("text") or ""))
+                        if key in existing_keys:
+                            continue
+                    frontend_ts = msg.get("timestamp", "")
+                    if frontend_ts:
+                        try:
+                            from datetime import datetime, timezone, timedelta
+                            dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
+                            local_dt = dt.astimezone(timezone(timedelta(hours=8)))
+                            frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            frontend_ts = frontend_ts.replace("T", " ")[:19]
+                    sql_add_message(session_id,
+                        "user" if msg.get("sender") == "user" else "assistant",
+                        msg.get("text", ""),
+                        msg_type=msg.get("msgType", "chat"),
+                        msg_id=msg_id,
+                        timestamp=frontend_ts)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
+
+
+@chat_bp.route('/api/sessions/new', methods=['POST'])
+def new_session():
+    from memory.session import create_session
+    try:
+        session_id = create_session(title=None)
+        sessions = list_sessions()
+        session_data = next((s for s in sessions if s["id"] == session_id), None)
+        return jsonify({"success": True, "session": session_data})
+    except Exception as e:
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
+
+
+@chat_bp.route('/api/sessions', methods=['GET'])
+def get_sessions():
+    try:
+        sessions = list_sessions()
+        return jsonify(sessions)
+    except Exception as e:
+        print(f"[API] 获取会话列表错误: {e}")
+        return jsonify([])
+
+
+@chat_bp.route('/api/models', methods=['GET'])
+def get_models():
+    try:
+        available_models = get_available_models()
+        if not available_models:
+            return jsonify([{
+                "provider": "ollama",
+                "model": "deepseek-r1:7b",
+                "display": "本地 Ollama"
+            }])
+        return jsonify(available_models)
+    except Exception as e:
+        print(f"[API] 加载模型列表错误: {e}")
+        return jsonify([{
+            "provider": "ollama",
+            "model": "deepseek-r1:7b",
+            "display": "本地 Ollama"
+        }])
+
+
+@chat_bp.route('/api/sessions/<session_id>', methods=['DELETE'])
+def delete_session_route(session_id):
+    from memory import delete_session
+    from backend.upload_api import cleanup_session_uploads
+    try:
+        cleanup_session_uploads(session_id)
+        delete_session(session_id)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
+
+
+@chat_bp.route('/api/sessions/active', methods=['GET'])
+def get_active_session():
+    from memory import get_active_session_id
+    session_id = get_active_session_id()
+    return jsonify({"session_id": session_id})
+
+
+@chat_bp.route('/api/sessions/<session_id>', methods=['GET'])
+def get_session(session_id):
+    from memory import get_chat_messages
+    try:
+        messages = get_chat_messages(session_id)
+        formatted = []
+        for msg in messages:
+            sender = "user" if msg["role"] == "user" else "ai"
+            formatted.append({
+                "sender": sender,
+                "text": msg["content"],
+                "msgType": msg.get("msg_type", "chat"),
+                "timestamp": msg.get("created_at", ""),
+                "msgId": msg.get("msg_id", "")
+            })
+        return jsonify({"success": True, "messages": formatted})
+    except Exception as e:
+        return jsonify({"success": False, "message": translate_error(str(e))}), 500
+
+
+@chat_bp.route('/api/sessions/<session_id>/rename', methods=['POST'])
+def api_rename_session(session_id):
+    from memory import rename_session
+    data = request.json or {}
+    new_title = data.get("title", "").strip()
+    if not new_title:
+        return jsonify({"success": False, "message": "名称不能为空"}), 400
+    ok = rename_session(session_id, new_title)
+    return jsonify({"success": ok, "message": "已修改" if ok else "会话不存在"})

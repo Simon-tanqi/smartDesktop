@@ -51,41 +51,35 @@ safe_exec:
 
   # 危险模式定义（仅保留高风险操作；taskkill 等已由 execute_command 确认层处理）
   danger_patterns:
-    - pattern: \bdel\b
-      desc: "删除文件"
+    - pattern: \breg\s+add\b.*\bHKLM\b
+      desc: "写入系统级注册表 (HKLM)"
       level: challenge
-    - pattern: \brmdir\b
-      desc: "删除目录"
-      level: challenge
-    - pattern: \bformat\b
-      desc: "格式化磁盘"
-      level: challenge
-    - pattern: \brmtree\b
-      desc: "递归删除目录"
-      level: challenge
-    - pattern: \bshutil\.rmtree
-      desc: "递归删除目录"
-      level: challenge
-    - pattern: \bRemove-Item\b.*-Recurse
-      desc: "强制递归删除"
-      level: challenge
-    - pattern: \breg\s+delete\b
-      desc: "删除注册表项"
-      level: challenge
-    - pattern: \bClear-RecycleBin\b
-      desc: "清空回收站"
+    - pattern: \breg\s+add\b.*\bHKEY_LOCAL_MACHINE\b
+      desc: "写入系统级注册表 (HKLM)"
       level: challenge
 
   # 这些模式始终拦截，不进入确认流程（Layer 1 硬拦截）
   always_blocked:
     - \bformat\s+\w:\b
+    - \bformat\b
+    - \bdel\b
     - \bdel\s+/[fF]\s+/[sS]
+    - \brm\b
     - \brm\s+-rf\s+/
-    - \bdiskpart\s+clean\b
-    - \bshutdown\s+/[sSrR]\s+/t\s+0\b
+    - \brmdir\b
+    - \brmdir\s+/[sS]\s+C:\\
+    - \brmtree\b
+    - \bshutil\.rmtree
+    - \bRemove-Item\b
+    - \bRemove-Item\b.*-Recurse
+    - \breg\s+delete\b
     - \breg\s+delete\s+.*HKLM\b
     - \breg\s+delete\s+.*HKEY_LOCAL_MACHINE\b
-    - \brmdir\s+/[sS]\s+C:\\
+    - \bClear-RecycleBin\b
+    - \bdiskpart\s+clean\b
+    - \bshutdown\s+/[sSrR]\s+/t\s+0\b
+    - \bStop-Computer\b
+    - \bRestart-Computer\b
 
 # ── file_tools: 文件操作安全集合 ──
 file_tools:
@@ -123,25 +117,19 @@ file_tools:
     - dir
     - copy
     - move
-    - del
     - mkdir
-    - rmdir
     - echo
     - type
     - findstr
     - where
     - python
-    - pip
     - git
-    - npm
     - node
     - npx
     - yarn
     - systeminfo
     - wmic
     - tasklist
-    - powershell
-    - winget
     - Get-ItemProperty
     - Get-ChildItem
     - Get-Process
@@ -149,6 +137,89 @@ file_tools:
     - Get-WmiObject
     - Get-CimInstance
     - Get-Content
+
+  # 只读命令/PowerShell cmdlet 集合：不触发确认，直接执行
+  readonly_patterns:
+    # 应用启动（只读打开，无副作用）
+    apps:
+      - explorer
+      - notepad
+      - calc
+      - mspaint
+      - charmap
+    # PowerShell 查询 cmdlet
+    ps_cmdlets:
+      - get-childitem
+      - get-itemproperty
+      - get-process
+      - get-service
+      - get-content
+      - get-wmiobject
+      - get-ciminstance
+      - get-item
+      - get-date
+      - get-location
+      - get-history
+      - get-command
+      - get-module
+      - get-variable
+      - get-alias
+      - get-psdrive
+      - get-psprovider
+      - get-host
+      - get-culture
+      - get-uiculture
+    # CMD 查询 / 输出命令
+    cmd_queries:
+      - dir
+      - cat
+      - type
+      - echo
+      - where
+      - findstr
+      - select-string
+      - write-host
+      - write-output
+    # 系统信息查询
+    sys_info:
+      - whoami
+      - hostname
+      - systeminfo
+      - tasklist
+      - net
+      - ipconfig
+      - ping
+      - tracert
+      - nslookup
+    # 文件比较 / 校验
+    file_compare:
+      - fc
+      - comp
+      - certutil
+    # 其他
+    other:
+      - wmic
+
+  # 低风险注册表操作关键词：用户偏好类（桌面图标/任务栏/资源管理器外观）直接放行
+  low_risk_registry_patterns:
+    # 桌面图标显隐（纯UI偏好）
+    - HideDesktopIcons
+    - ShowDesktopIcons
+    # 任务栏设置
+    - ShowSecondsInSystemClock
+    - TaskbarSi
+    - TaskbarDa
+    - TaskbarGlomLevel
+    - EnableAutoTray
+    # 文件资源管理器偏好
+    - ShowStatusBar
+    - ShowPreviewHandlers
+    - Hidden
+    - HideFileExt
+    - ShowSuperHidden
+    # 开始菜单/搜索
+    - Start_Show
+    - DisableSearchBoxSuggestions
 
   # 命令反模式
   command_anti_patterns:

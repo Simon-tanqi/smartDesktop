@@ -48,6 +48,8 @@ class SafetyConfig:
     forbidden_patterns: list = field(default_factory=list)
     registry_write_commands: list = field(default_factory=list)
     skip_confirm_programs: set = field(default_factory=set)
+    readonly_patterns: set = field(default_factory=set)
+    low_risk_registry_patterns: list = field(default_factory=list)
     command_anti_patterns: list = field(default_factory=list)
 
     # search_tools
@@ -96,6 +98,14 @@ def _parse_yaml() -> SafetyConfig:
     cfg.forbidden_patterns = ft.get("forbidden_patterns", [])
     cfg.registry_write_commands = ft.get("registry_write_commands", [])
     cfg.skip_confirm_programs = set(ft.get("skip_confirm_programs", []))
+    # 合并所有 readonly 子列表为一个 set
+    rp = ft.get("readonly_patterns", {})
+    readonly_set = set()
+    for sublist in rp.values():
+        if isinstance(sublist, list):
+            readonly_set.update(sublist)
+    cfg.readonly_patterns = readonly_set
+    cfg.low_risk_registry_patterns = ft.get("low_risk_registry_patterns", [])
     cfg.command_anti_patterns = [
         (item["pattern"], item["message"])
         for item in ft.get("command_anti_patterns", [])

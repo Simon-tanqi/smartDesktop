@@ -41,24 +41,57 @@ CONFIG_YAML = os.path.join(CONFIG_DIR, 'memory_policy.yaml')
 DEFAULT_CONFIG_YAML = os.path.join(APP_DIR, 'memory', 'config', 'memory_policy.yaml')
 
 
-def _load_policy():
-    """加载 memory_policy.yaml，不存在时从 APP_DIR 复制默认配置。"""
-    if not os.path.exists(CONFIG_YAML) and os.path.exists(DEFAULT_CONFIG_YAML):
-        import shutil
-        shutil.copy(DEFAULT_CONFIG_YAML, CONFIG_YAML)
-
-    defaults = {
+def _generate_default_policy():
+    """从代码默认值生成 memory_policy.yaml 写入磁盘，确保始终有可编辑的配置文件。"""
+    default_policy = {
+        # 可选：专用摘要/提取模型（不配置则复用主模型 deepseek-chat）
+        # summary_model:
+        #   provider: ollama
+        #   model_name: qwen2.5:7b
+        #   base_url: http://localhost:11434/v1
+        #   api_key: ollama
         'compression': {
-            'model': {'provider': 'ollama', 'model_name': 'deepseek-r1:7b',
-                      'base_url': 'http://localhost:11434/v1', 'api_key': 'ollama'},
+            'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
             'token_budget': {'soft_threshold': 30000, 'hard_threshold': 50000,
                              'target_tokens': 15000},
             'recent_turns': 3,
             'max_summary_chars': 500,
         },
         'extraction': {
-            'model': {'provider': 'ollama', 'model_name': 'deepseek-r1:7b',
-                      'base_url': 'http://localhost:11434/v1', 'api_key': 'ollama'},
+            'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
+        },
+        'retrieval': {
+            'long_term_top_k': 3,
+            'max_chars': 800,
+        },
+        'skills': {
+            'custom': {},
+        },
+    }
+    try:
+        with open(CONFIG_YAML, 'w', encoding='utf-8') as f:
+            f.write("# MyAgent 记忆策略配置\n")
+            f.write("# 修改后调用 reload_policy() 或重启生效\n\n")
+            yaml.dump(default_policy, f, allow_unicode=True, default_flow_style=False)
+    except Exception:
+        pass  # 写入失败不阻断启动，使用内存中的 defaults
+
+
+def _load_policy():
+    """加载 memory_policy.yaml，不存在时从代码默认值生成一份写入磁盘。"""
+    if not os.path.exists(CONFIG_YAML):
+        _generate_default_policy()
+
+    defaults = {
+        'compression': {
+            'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
+            'token_budget': {'soft_threshold': 30000, 'hard_threshold': 50000,
+                             'target_tokens': 15000},
+            'recent_turns': 3,
+            'max_summary_chars': 500,
+        },
+        'extraction': {
+            'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
         },
         'retrieval': {
             'long_term_top_k': 3,
@@ -77,8 +110,8 @@ def _load_policy():
                 for section in defaults:
                     if section in loaded and isinstance(loaded[section], dict):
                         defaults[section].update(loaded[section])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] Failed to load memory_policy.yaml: {e}")
     return defaults
 
 
@@ -94,6 +127,9 @@ MAX_SUMMARY_CHARS       = _policy['compression']['max_summary_chars']
 
 # ── 提取配置 ──
 EXTRACT_MODEL_CONFIG    = _policy['extraction']['model']
+
+# ── 可选摘要模型（覆盖压缩和提取的模型配置；不配则复用主模型）──
+SUMMARY_MODEL_CONFIG    = _policy.get('summary_model')
 
 # ── 检索配置 ──
 LONG_TERM_TOP_K         = _policy['retrieval']['long_term_top_k']
@@ -206,8 +242,13 @@ MAX_COMPRESSED_ENTRIES = 100
 NOISE_PHRASES = [
     "你好", "在吗", "谢谢", "再见", "哦", "嗯", "哈哈", "哈喽",
     "hey", "hi", "你是谁",
-    # 短确认/应答词 — 从 session.py 子串匹配迁移至此，统一精确匹配
-    "好的", "没问题", "知道了", "OK", "ok", "收到", "懂了", "行", "好"
+    # 短确认/应答词 — 从 session.py _FACT_EXTRACT_SKIP 合并至此
+    "好的", "没问题", "知道了", "OK", "ok", "收到", "懂了", "行", "好",
+    "可以", "明白", "yes", "no", "对", "没错", "知道", "了解",
+    "继续",
+    # 极简无信息量短词
+    "来了", "在", "有", "没", "啥", "？", "?", "。。", "...",
+    "下一步", "然后呢", "还有呢", "开始", "开始吧",
 ]
 
 # ═══════════════════════════════════════════════
@@ -224,7 +265,7 @@ def reload_policy():
     """热重载 YAML 配置（开发调试用）。"""
     global _policy, COMPRESS_MODEL_CONFIG, TOKEN_SOFT_THRESHOLD, TOKEN_HARD_THRESHOLD
     global TOKEN_TARGET, RECENT_TURNS_KEEP, MAX_SUMMARY_CHARS
-    global EXTRACT_MODEL_CONFIG, LONG_TERM_TOP_K, MAX_RELEVANT_MEMORY_CHARS
+    global EXTRACT_MODEL_CONFIG, SUMMARY_MODEL_CONFIG, LONG_TERM_TOP_K, MAX_RELEVANT_MEMORY_CHARS
     global SKILLS_CUSTOM
     global RECENT_TOKEN_MIN, RECENT_TOKEN_MAX, SUMMARY_TOKEN_BUDGET
     global DEFAULT_SUMMARY_MODEL, SUMMARY_MODEL, MAX_SUMMARY_LENGTH, DEFAULT_KEEP_ROUNDS
@@ -237,6 +278,7 @@ def reload_policy():
     RECENT_TURNS_KEEP       = _policy['compression']['recent_turns']
     MAX_SUMMARY_CHARS       = _policy['compression']['max_summary_chars']
     EXTRACT_MODEL_CONFIG    = _policy['extraction']['model']
+    SUMMARY_MODEL_CONFIG    = _policy.get('summary_model')
     LONG_TERM_TOP_K         = _policy['retrieval']['long_term_top_k']
     MAX_RELEVANT_MEMORY_CHARS = _policy['retrieval']['max_chars']
     SKILLS_CUSTOM           = _policy.get('skills', {}).get('custom', {})

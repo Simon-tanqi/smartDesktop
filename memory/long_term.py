@@ -277,7 +277,7 @@ def _extract_keywords(text):
     result = []
     seen = set()
     for w in words:
-        if len(w) > 1 and w not in _STOPWORDS:
+        if len(w) >= 2:
             if w not in seen:
                 seen.add(w)
                 result.append(w)
@@ -360,15 +360,9 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     从所有 Markdown 文件 + 自定义技能目录中检索相关内容。
     返回格式化字符串，可直接拼入 system prompt。
     
-    Token优化：文件内容按 mtime 缓存，只有文件变更时才重新读取磁盘。
+    修改：长期记忆不多的情况下，全部拼接，不进行关键词过滤
     """
     _ensure_migrated()
-
-    keywords = _extract_keywords(user_message)
-    if not keywords:
-        return ""  # 无有效关键词时跳过长期记忆检索，避免无效 IO 和 Token 浪费
-
-    tw_start, tw_end = _detect_time_window(user_message)
 
     sections = []
 
@@ -377,7 +371,7 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     if user_lines:
         sections.append(("用户", user_lines))
 
-    # 基础类别
+    # 基础类别 - 全部加载（长期记忆不多的情况下）
     categories = [
         ("技能", SKILLS_MD),
         ("项目", PROJECTS_MD),
@@ -389,26 +383,15 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     for key, filepath in list_custom_skill_files().items():
         categories.append((f"技能: {key}", filepath))
 
+    # 加载所有类别的内容（不进行关键词过滤）
     for cat_name, filepath in categories:
         lines = _read_lines_cached(filepath)
-        if not lines:
-            continue
-        recent = lines[-30:] if len(lines) > 30 else lines
-        hits = []
-        for line in recent[::-1]:
-            line_lower = line.lower()
-            if not any(k.lower() in line_lower for k in keywords):
-                continue
-            if cat_name == "摘要" and tw_start is not None:
-                line_date = _parse_summary_timestamp(line)
-                if line_date is None or line_date < tw_start or line_date > tw_end:
-                    continue
-            hits.append(line)
-            if len(hits) >= 5:
-                break
-        if hits:
-            sections.append((cat_name, hits[::-1]))
+        if lines:
+            # 取最近的内容，避免过长
+            recent = lines[-20:] if len(lines) > 20 else lines
+            sections.append((cat_name, recent))
 
+    # 如果没有找到任何内容，返回空字符串（用户信息已在sections中）
     if not sections:
         return ""
 

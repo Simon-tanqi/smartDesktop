@@ -28,9 +28,13 @@ from memory.stores.sqlite_store import (
 # ── Token 估算 ──
 
 def estimate_tokens(text):
+    """估算 token 数量：CJK 字符 ~1.5 token/字，ASCII ~0.25 token/字。"""
     if not text:
         return 0
-    return max(1, int(len(text) * 0.55))
+    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff')
+    ascii_count = len(text) - cjk_count
+    # CJK: ~1.5 tokens/char, ASCII: ~0.25 tokens/char, floor at 1
+    return max(1, int(cjk_count * 1.5 + ascii_count * 0.25))
 
 
 def estimate_messages_tokens(messages):
@@ -98,7 +102,7 @@ def _generate_summary(messages, old_summary="", max_len=MAX_SUMMARY_CHARS):
 # ═══════════════════════════════════════════════
 
 def _find_cut_point(messages, target_tokens):
-    """反向累加 token，找到保留起点。保留最近 N 轮完整对话不动。"""
+    """反向累加 token，找到保留起点。保留最近 N 轮完整对话不动，但受硬上限约束。"""
     if not messages:
         return len(messages)
 
@@ -107,13 +111,22 @@ def _find_cut_point(messages, target_tokens):
     keep_turns = min(RECENT_TURNS_KEEP, len(user_indices))
 
     if keep_turns >= len(user_indices):
-        # 所有轮次都在保留范围内
         return len(messages)
+
+    # 计算保留轮次的 token 开销
+    last_user_idx = user_indices[-keep_turns] if keep_turns > 0 else len(messages)
+    preserved_tokens = sum(
+        estimate_tokens(messages[i].get("content", "")) + 4
+        for i in range(last_user_idx, len(messages))
+    )
+    # 硬上限：保留轮次已用掉 60% token 预算时，减少保留轮数
+    if preserved_tokens > target_tokens * 0.6 and keep_turns > 1:
+        keep_turns = max(1, keep_turns - 1)
+        last_user_idx = user_indices[-keep_turns]
 
     # 从后往前累加 token，参考用户轮次边界
     accumulated = 0
     cut_i = len(messages)
-    last_user_idx = user_indices[-keep_turns] if keep_turns > 0 else len(messages)
 
     for i in range(len(messages) - 1, -1, -1):
         accumulated += estimate_tokens(messages[i].get("content", "")) + 4
@@ -121,7 +134,6 @@ def _find_cut_point(messages, target_tokens):
             cut_i = i
             break
 
-    # 确保切割点不在中间打断一轮对话
     return cut_i
 
 
