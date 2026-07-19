@@ -1,0 +1,40 @@
+{% extends "_base.html" %}
+{% block slide_style %}
+.slide{
+    width:1920px;height:1080px;background:#fff;
+    display:flex;flex-direction:column;padding:0;position:relative;
+}
+.pg{position:absolute;bottom:32px;right:72px;font-size:14px;color:#ccc;z-index:2}
+.twocol{display:flex;flex:1}
+/* 图片侧 */
+.img-side{width:45%;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.img-side::after{content:'';position:absolute;top:0;right:0;width:100%;height:100%;
+    background:linear-gradient(90deg,transparent 70%,rgba(255,255,255,1));z-index:1}
+.img-side .bg{position:absolute;width:100%;height:100%;object-fit:cover}
+.img-placeholder{width:80%;height:70%;border-radius:20px;background:linear-gradient(135deg,{{ theme.color1 }}22,{{ theme.accent }}22);display:flex;align-items:center;justify-content:center;font-size:100px;z-index:1}
+/* 文字侧 */
+.text-side{width:55%;padding:60px 72px 60px 48px;display:flex;flex-direction:column;justify-content:center}
+.text-side::before{content:'';width:60px;height:6px;background:linear-gradient(90deg,{{ theme.color1 }},{{ theme.accent }});border-radius:3px;margin-bottom:24px}
+.text-side h2{font-size:36px;font-weight:700;color:#1a1a2e;line-height:1.3;margin-bottom:20px}
+.text-side .p{font-size:18px;color:#555;line-height:1.8;margin-bottom:16px}
+.text-side .tagline{font-size:16px;color:{{ theme.accent }};font-weight:600;margin-top:8px}
+.highlight{padding:2px 6px;background:rgba(102,126,234,0.1);border-radius:4px;font-weight:600}
+{% endblock %}
+{% block slide_content %}
+<div class="slide">
+<div class="twocol">
+    <div class="img-side">
+        {% if img_url %}<img class="bg" src="{{ img_url }}" alt="">{% endif %}
+        <div class="img-placeholder">{% if icon %}{{ icon }}{% else %}📷{% endif %}</div>
+    </div>
+    <div class="text-side">
+        <h2 data-tb="img-title">{{ title }}</h2>
+        {% for p in paragraphs %}
+        <div class="p" data-tb="img-p-{{ loop.index }}">{{ p }}</div>
+        {% endfor %}
+        {% if tagline %}<div class="tagline" data-tb="img-tagline">{{ tagline }}</div>{% endif %}
+    </div>
+</div>
+<div class="pg" data-tb="pg">{{ page }}</div>
+</div>
+{% endblock %}

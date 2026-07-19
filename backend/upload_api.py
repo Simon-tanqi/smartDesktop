@@ -5,18 +5,21 @@ POST /api/upload
   参数: session_id (form), file (multipart)
   返回: {success, file_path, file_name, size}
 
-会话隔离上传目录: work_space/uploads/{session_id}/
+会话隔离上传目录: DATA_DIR/work_space/uploads/{session_id}/
 文件命名: {uuid}_{原始文件名} → 防重名, 保留扩展名以供工具识别。
 """
 import os
 import uuid
 from flask import Blueprint, request, jsonify
 
+try:
+    from config.settings import DATA_DIR
+except ImportError:
+    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+
 upload_bp = Blueprint("upload", __name__)
 
-# 上传根目录: 项目 work_space/uploads/
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_ROOT = os.path.join(_BASE_DIR, "work_space", "uploads")
+UPLOAD_ROOT = os.path.join(DATA_DIR, "work_space", "uploads")
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".xlsx", ".pptx", ".csv",

@@ -12,6 +12,7 @@ import re
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+import shlex
 
 
 class VerifyResult(Enum):
@@ -114,13 +115,7 @@ def _extract_registry_value(command: str) -> tuple:
 @register_verifier("uninstall")
 def verify_uninstall(ctx: VerifyContext) -> VerifyReport:
     """
-    验证卸载操作：检查程序是否仍然存在
-    
-    支持检测：
-    - Win32_Product (MSI 安装)
-    - Get-AppxPackage (UWP/Store 应用)
-    - 开始菜单快捷方式
-    - 安装目录
+    验证卸载操作：检查程序是否仍然存在（优化版 - 修复转义与匹配逻辑）
     """
     program = _extract_program_name(ctx.original_command)
     if not program:
@@ -130,43 +125,48 @@ def verify_uninstall(ctx: VerifyContext) -> VerifyReport:
             details={"command": ctx.original_command}
         )
 
-    # 转义程序名中的特殊字符，防止 PowerShell 注入
-    program_escaped = program.replace("'", "''").replace('"', "").replace("`", "").replace("$", "`$")
+    # 核心优化1：只转义单引号（PowerShell 单引号字符串的唯一硬性要求），
+    # 不要删除/篡改 $ 或其他字符，交由 [regex]::Escape 处理匹配阶段。
+    program_escaped = program.replace("'", "''")
 
-    # 构建验证命令：多维度检查
+    # 构建验证命令：使用 -match 配合 [regex]::Escape，彻底避免通配符冲突
     verify_cmd = f"""
 $prog = '{program_escaped}'
+$escapedProg = [regex]::Escape($prog)
 $found = @()
 
 # 1. 检查 WMI (MSI 安装)
 try {{
-    $wmi = Get-WmiObject -Class Win32_Product | Where-Object {{ $_.Name -like "*$prog*" }}
+    $wmi = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue | 
+           Where-Object {{ $_.Name -match $escapedProg }}
     if ($wmi) {{ $found += "WMI:" + $wmi.Name }}
 }} catch {{}}
 
 # 2. 检查 Appx (UWP/Store)
 try {{
-    $appx = Get-AppxPackage | Where-Object {{ $_.Name -like "*$prog*" -or $_.DisplayName -like "*$prog*" }}
+    $appx = Get-AppxPackage -ErrorAction SilentlyContinue | 
+            Where-Object {{ $_.Name -match $escapedProg -or $_.DisplayName -match $escapedProg }}
     if ($appx) {{ $found += "Appx:" + $appx.DisplayName }}
 }} catch {{}}
 
-# 3. 检查开始菜单
+# 3. 检查开始菜单 (注意：这里用 .Name 属性)
 try {{
     $startMenu = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -ErrorAction SilentlyContinue | 
-        Where-Object {{ $_.Name -like "*$prog*" }}
+                 Where-Object {{ $_.Name -match $escapedProg }}
     if ($startMenu) {{ $found += "StartMenu:" + $startMenu.Name }}
 }} catch {{}}
 
-# 4. 检查注册表卸载项
+# 4. 检查注册表卸载项（匹配 DisplayName 和 Publisher）
 try {{
     $regPaths = @(
         "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
         "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
-        "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
+        "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
+        "HKCU:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
     )
     foreach ($rp in $regPaths) {{
         $reg = Get-ItemProperty $rp -ErrorAction SilentlyContinue | 
-            Where-Object {{ $_.DisplayName -like "*$prog*" }}
+               Where-Object {{ $_.DisplayName -match $escapedProg }}
         if ($reg) {{ $found += "Registry:" + $reg.DisplayName }}
     }}
 }} catch {{}}
@@ -178,8 +178,11 @@ if ($found.Count -eq 0) {{
 }}
 """
     
-    # 执行验证
-    from . import safe_exec
+    # 执行验证（注意：这里你仍需确保 safe_exec 已正确导入）
+    try:
+        from . import safe_exec
+    except ImportError:
+        safe_exec = None  # 或抛出一个明确的错误提示
     result = safe_exec.run_powershell(verify_cmd, timeout=30)
     
     if not result.get("success"):
@@ -200,14 +203,14 @@ if ($found.Count -eq 0) {{
     elif "STILL_EXISTS:" in output:
         return VerifyReport(
             result=VerifyResult.FAILED,
-            message=f"✗ 验证失败：程序 '{program}' 仍然存在，卸载未成功",
-            details={"program": program, "found_in": output.replace("STILL_EXISTS: ", "")}
+            message=f"✗ 验证失败：程序 '{program}' 仍然存在",
+            details={"program": program, "found_in": output.replace("STILL_EXISTS: ", "").strip()}
         )
     else:
         return VerifyReport(
             result=VerifyResult.UNCERTAIN,
-            message=f"? 验证结果不明确：{output[:200]}",
-            details={"program": program, "raw_output": output}
+            message=f"? 验证结果不明确",
+            details={"program": program, "raw_output": output[:200]}
         )
 
 
@@ -225,10 +228,16 @@ def verify_registry_add(ctx: VerifyContext) -> VerifyReport:
         )
     
     # 构建验证命令
-    verify_cmd = f'reg query "{path}" /v "{value_name or ""}" 2>&1'
+    if value_name:
+        verify_cmd = f'reg query "{path}" /v "{value_name}" 2>&1'
+    else:
+        verify_cmd = f'reg query "{path}" 2>&1'  # 仅查询路径下所有值（验证路径存在）
     
-    from . import safe_exec
-    result = safe_exec.run_cmd(verify_cmd.split(), timeout=10)
+    try:
+        from . import safe_exec
+    except ImportError:
+        safe_exec = None  # 或抛出一个明确的错误提示
+    result = safe_exec.run_cmd(shlex.split(verify_cmd), timeout=10)
     
     if not result.get("success"):
         return VerifyReport(
@@ -269,50 +278,12 @@ def verify_registry_add(ctx: VerifyContext) -> VerifyReport:
         message=f"✓ 验证通过：注册表项 '{path}' 存在",
         details={"path": path, "output": output[:500]}
     )
-
-
-@register_verifier("audio_volume")
-def verify_audio_volume(ctx: VerifyContext) -> VerifyReport:
-    """
-    验证音量设置操作
-    """
-    # 尝试从命令中提取目标音量值
-    volume_match = re.search(r"(\d+)\s*%", ctx.original_command)
-    if not volume_match:
-        volume_match = re.search(r"SetVolume\s*[(\s]*(\d+)", ctx.original_command, re.IGNORECASE)
     
-    expected_volume = volume_match.group(1) if volume_match else None
-    
-    # 查询当前音量
-    verify_cmd = """
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public class Audio {
-    [DllImport("user32.dll")] static extern IntPtr SendMessageW(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
-    public static int GetVolume() {
-        return (int)SendMessageW((IntPtr)0xffff, 0x14a0, (IntPtr)0, (IntPtr)0);
-    }
-}
-'@ -Language CSharp -ErrorAction SilentlyContinue
-
-try {
-    $vol = [Audio]::GetVolume()
-    Write-Output "CURRENT_VOLUME: $vol"
-} catch {
-    # 备选方案：使用 nircmd 或 SoundVolumeView
-    $nircmd = Get-Command nircmd -ErrorAction SilentlyContinue
-    if ($nircmd) {
-        $vol = & nircmd.exe showsoundvolume
-        Write-Output "CURRENT_VOLUME: $vol"
-    } else {
-        Write-Output "CANNOT_VERIFY: 无法获取当前音量"
-    }
-}
-"""
-    
-    from . import safe_exec
-    result = safe_exec.run_powershell(verify_cmd, timeout=15)
+    try:
+        from . import safe_exec
+    except ImportError:
+        safe_exec = None  # 或抛出一个明确的错误提示
+    result = safe_exec.run_cmd(shlex.split(verify_cmd), timeout=10)
     
     if not result.get("success"):
         return VerifyReport(

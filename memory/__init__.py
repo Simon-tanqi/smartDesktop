@@ -52,13 +52,11 @@ from memory.long_term import (
     append_skill,
     append_project,
     append_fact,
-    append_summary,
     append_custom_skill,
     add_compressed_summary,
     read_skills,
     read_projects,
     read_facts,
-    read_summaries,
     read_user_info,
     list_custom_skill_files,
 )
@@ -79,6 +77,7 @@ from memory.compressor import (
     get_latest_summary_for_session,
     estimate_tokens,
     estimate_messages_tokens,
+    increment_merge_summary,
 )
 
 # ── 会话管理 ──
@@ -88,6 +87,7 @@ from memory.session import (
     get_active_session_id,
     set_active_session,
     list_sessions,
+    get_session,
     delete_session,
     append_session_message,
     log_session_turn,
@@ -97,4 +97,8 @@ from memory.session import (
     get_log_dir,
     save_ai_log,
     build_context_messages,
+    get_full_session_messages,
+    build_child_turn_context,
+    build_step_summary,
+    append_think_step,
 )

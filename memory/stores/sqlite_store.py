@@ -71,44 +71,41 @@ def _get_conn(db_path, row_factory=False):
             if db_path in pool:
                 conn = pool[db_path]
                 try:
-                    # 测试连接是否仍然有效
                     conn.execute("SELECT 1").fetchone()
                     access.remove(db_path)
                 except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-                    # 连接已损坏，需要重建
                     try:
                         conn.close()
-                    except:
+                    except Exception:
                         pass
                     del pool[db_path]
                     if db_path in access:
                         access.remove(db_path)
-                    # 从全局注册表移除损坏的连接
                     with _global_conn_lock:
                         if db_path in _global_conns and conn in _global_conns[db_path]:
                             _global_conns[db_path].remove(conn)
                     conn = None
             
-            # 创建新连接
             if conn is None:
                 if len(pool) >= _MAX_CONNS_PER_THREAD:
                     oldest = access.pop(0)
                     oldest_conn = pool[oldest]
                     try:
                         oldest_conn.close()
-                    except:
+                    except Exception:
                         pass
                     del pool[oldest]
-                    # 从全局注册表移除被驱逐的连接
                     with _global_conn_lock:
                         if oldest in _global_conns and oldest_conn in _global_conns[oldest]:
                             _global_conns[oldest].remove(oldest_conn)
                 
-                conn = sqlite3.connect(db_path, check_same_thread=True, timeout=10)
+                print(f"[DEBUG] Opening SQLite: {db_path}")
+                print(f"[DEBUG] Exists: {os.path.exists(db_path)}")
+                print(f"[DEBUG] Parent dir: {os.path.exists(os.path.dirname(db_path))}")
+                conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=5000")
                 pool[db_path] = conn
-                # 注册到全局表，以便跨线程关闭
                 with _global_conn_lock:
                     _global_conns.setdefault(db_path, []).append(conn)
             
@@ -117,12 +114,11 @@ def _get_conn(db_path, row_factory=False):
             if row_factory:
                 conn.row_factory = sqlite3.Row
             
-            # 连接准备就绪，跳出重试循环
             break
             
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-            if attempt < 2:  # 不是最后一次尝试
-                # 短暂延迟后重试
+            print(f"[DEBUG] SQLite error on attempt {attempt+1}: {e}")
+            if attempt < 2:
                 import time
                 time.sleep(0.1 * (attempt + 1))
                 continue
@@ -142,7 +138,7 @@ def _get_conn(db_path, row_factory=False):
                 # 如果commit失败，尝试rollback
                 try:
                     conn.rollback()
-                except:
+                except Exception:
                     pass
 
 
@@ -271,7 +267,8 @@ def _init_chat_tables(conn):
             content TEXT NOT NULL,
             msg_type TEXT DEFAULT 'chat',
             msg_id TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(trace_id, role, content)
         )
     """)
     for col, col_type in [
@@ -287,6 +284,7 @@ def _init_chat_tables(conn):
             pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_trace ON chat_history(trace_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msg_id ON chat_history(session_id, msg_id) WHERE msg_id != ''")
 
 
 def add_chat_message(session_id, role, content, msg_type="chat",
@@ -313,15 +311,25 @@ def get_chat_messages(session_id, limit=200, offset=0):
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
-    with _get_conn(db_path, row_factory=True) as conn:
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA busy_timeout=5000")
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content, msg_type, msg_id, is_temporary, created_at FROM chat_history "
-            "WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type = '' OR msg_type IS NULL OR msg_type = 'think') "
+            "ORDER BY id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
-    return [{"role": r[0], "content": r[1], "msg_type": r[2],
-             "msg_id": r[3], "is_temporary": bool(r[4]), "created_at": r[5]} for r in rows]
+        result = []
+        for r in rows:
+            result.append({"role": r[0], "content": r[1], "msg_type": r[2] or "chat",
+                     "msg_id": r[3], "is_temporary": bool(r[4]), "created_at": r[5]})
+        return result
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_session_messages(session_id, limit=500):

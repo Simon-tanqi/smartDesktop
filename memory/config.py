@@ -8,6 +8,8 @@ import os
 import sys
 import uuid
 import yaml
+import threading
+from datetime import datetime
 
 
 # ═══════════════════════════════════════════════
@@ -15,41 +17,45 @@ import yaml
 # ═══════════════════════════════════════════════
 
 if getattr(sys, 'frozen', False):
-    # PyInstaller 打包后：exe 内部临时解压目录（只读）
     APP_DIR = sys._MEIPASS
 else:
     APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 用户数据目录（可读写，持久化）
-if sys.platform == 'win32':
-    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
-elif sys.platform == 'darwin':
-    DATA_DIR = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'MyAgent')
-else:
-    DATA_DIR = os.path.join(os.path.expanduser('~'), '.config', 'MyAgent')
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
 
-os.makedirs(DATA_DIR, exist_ok=True)
 
-# ═══════════════════════════════════════════════
-# 策略配置（YAML）
-# ═══════════════════════════════════════════════
+def _ensure_dir(path):
+    """安全创建目录，无权限时静默返回，不阻断启动。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
+_ensure_dir(DATA_DIR)
 
 CONFIG_DIR = os.path.join(DATA_DIR, 'config')
-os.makedirs(CONFIG_DIR, exist_ok=True)
+_ensure_dir(CONFIG_DIR)
 
 CONFIG_YAML = os.path.join(CONFIG_DIR, 'memory_policy.yaml')
 DEFAULT_CONFIG_YAML = os.path.join(APP_DIR, 'memory', 'config', 'memory_policy.yaml')
 
 
+def _deep_merge(default, override):
+    """递归深度合并两个字典，override 的值覆盖 default，但不丢失 default 中 override 没有的键。"""
+    result = dict(default)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def _generate_default_policy():
     """从代码默认值生成 memory_policy.yaml 写入磁盘，确保始终有可编辑的配置文件。"""
     default_policy = {
-        # 可选：专用摘要/提取模型（不配置则复用主模型 deepseek-chat）
-        # summary_model:
-        #   provider: ollama
-        #   model_name: qwen2.5:7b
-        #   base_url: http://localhost:11434/v1
-        #   api_key: ollama
         'compression': {
             'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
             'token_budget': {'soft_threshold': 30000, 'hard_threshold': 50000,
@@ -74,14 +80,12 @@ def _generate_default_policy():
             f.write("# 修改后调用 reload_policy() 或重启生效\n\n")
             yaml.dump(default_policy, f, allow_unicode=True, default_flow_style=False)
     except Exception:
-        pass  # 写入失败不阻断启动，使用内存中的 defaults
+        pass
+    return default_policy
 
 
 def _load_policy():
-    """加载 memory_policy.yaml，不存在时从代码默认值生成一份写入磁盘。"""
-    if not os.path.exists(CONFIG_YAML):
-        _generate_default_policy()
-
+    """加载 memory_policy.yaml，不存在时从内置配置文件或代码默认值生成。"""
     defaults = {
         'compression': {
             'model': {'provider': 'deepseek', 'model_name': 'deepseek-chat'},
@@ -101,15 +105,25 @@ def _load_policy():
             'custom': {},
         },
     }
+
+    if os.path.exists(DEFAULT_CONFIG_YAML):
+        try:
+            with open(DEFAULT_CONFIG_YAML, 'r', encoding='utf-8') as f:
+                builtin = yaml.safe_load(f)
+            if builtin:
+                defaults = _deep_merge(defaults, builtin)
+        except Exception:
+            pass
+
+    if not os.path.exists(CONFIG_YAML):
+        _generate_default_policy()
+
     try:
         if os.path.exists(CONFIG_YAML):
             with open(CONFIG_YAML, 'r', encoding='utf-8') as f:
                 loaded = yaml.safe_load(f)
             if loaded:
-                # 深度合并
-                for section in defaults:
-                    if section in loaded and isinstance(loaded[section], dict):
-                        defaults[section].update(loaded[section])
+                defaults = _deep_merge(defaults, loaded)
     except Exception as e:
         print(f"[WARN] Failed to load memory_policy.yaml: {e}")
     return defaults
@@ -153,14 +167,14 @@ DEFAULT_KEEP_ROUNDS     = RECENT_TURNS_KEEP  # 已废弃，保留兼容
 
 # 召回过滤：当前用户消息与会话历史的 bigram Jaccard 加权相似度阈值
 # 低于此阈值时，判定话题已切换，丢弃全部历史上下文（仅保留压缩摘要）
-RECALL_RELEVANCE_THRESHOLD = 0.1
+RECALL_RELEVANCE_THRESHOLD = 0.15
 
 # ═══════════════════════════════════════════════
 # 长期记忆目录（DATA_DIR 下）
 # ═══════════════════════════════════════════════
 
 LONG_TERM_DIR = os.path.join(DATA_DIR, 'memory', 'long_term')
-os.makedirs(LONG_TERM_DIR, exist_ok=True)
+_ensure_dir(LONG_TERM_DIR)
 
 USER_MD        = os.path.join(LONG_TERM_DIR, 'user.md')
 PROJECTS_MD    = os.path.join(LONG_TERM_DIR, 'projects.md')
@@ -168,16 +182,15 @@ SKILLS_MD      = os.path.join(LONG_TERM_DIR, 'skills.md')
 FACTS_MD       = os.path.join(LONG_TERM_DIR, 'facts.md')
 SUMMARIES_MD   = os.path.join(LONG_TERM_DIR, 'summaries.md')
 
-# ── 自定义技能目录：用户可以直接在此放 .md 文件 ──
 CUSTOM_SKILLS_DIR = os.path.join(LONG_TERM_DIR, 'custom')
-os.makedirs(CUSTOM_SKILLS_DIR, exist_ok=True)
+_ensure_dir(CUSTOM_SKILLS_DIR)
 
 # ═══════════════════════════════════════════════
 # 短期记忆目录（DATA_DIR 下，按会话隔离）
 # ═══════════════════════════════════════════════
 
 SHORT_TERM_DIR = os.path.join(DATA_DIR, 'memory', 'short_term')
-os.makedirs(SHORT_TERM_DIR, exist_ok=True)
+_ensure_dir(SHORT_TERM_DIR)
 
 def get_session_dir(session_id):
     """获取会话专属目录，不存在则创建。"""
@@ -214,10 +227,10 @@ OLD_COMPRESSED_FILE = os.path.join(OLD_MEMORY_DIR, 'compressed_memory.json')
 # ═══════════════════════════════════════════════
 
 SESSION_DIR         = os.path.join(DATA_DIR, 'session')
-os.makedirs(SESSION_DIR, exist_ok=True)
+_ensure_dir(SESSION_DIR)
 
 LOGS_DIR            = os.path.join(DATA_DIR, 'logs')
-os.makedirs(LOGS_DIR, exist_ok=True)
+_ensure_dir(LOGS_DIR)
 
 # ── 元数据（保留 JSON，轻量索引）──
 SESSION_LOG_FILE    = os.path.join(SESSION_DIR, 'session_log.json')
@@ -257,8 +270,10 @@ NOISE_PHRASES = [
 
 def generate_trace_id():
     """生成每次请求的追踪 ID。"""
-    from datetime import datetime
     return f"{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:12]}"
+
+
+_reload_lock = threading.Lock()
 
 
 def reload_policy():
@@ -270,23 +285,24 @@ def reload_policy():
     global RECENT_TOKEN_MIN, RECENT_TOKEN_MAX, SUMMARY_TOKEN_BUDGET
     global DEFAULT_SUMMARY_MODEL, SUMMARY_MODEL, MAX_SUMMARY_LENGTH, DEFAULT_KEEP_ROUNDS
 
-    _policy = _load_policy()
-    COMPRESS_MODEL_CONFIG   = _policy['compression']['model']
-    TOKEN_SOFT_THRESHOLD    = _policy['compression']['token_budget']['soft_threshold']
-    TOKEN_HARD_THRESHOLD    = _policy['compression']['token_budget']['hard_threshold']
-    TOKEN_TARGET            = _policy['compression']['token_budget']['target_tokens']
-    RECENT_TURNS_KEEP       = _policy['compression']['recent_turns']
-    MAX_SUMMARY_CHARS       = _policy['compression']['max_summary_chars']
-    EXTRACT_MODEL_CONFIG    = _policy['extraction']['model']
-    SUMMARY_MODEL_CONFIG    = _policy.get('summary_model')
-    LONG_TERM_TOP_K         = _policy['retrieval']['long_term_top_k']
-    MAX_RELEVANT_MEMORY_CHARS = _policy['retrieval']['max_chars']
-    SKILLS_CUSTOM           = _policy.get('skills', {}).get('custom', {})
+    with _reload_lock:
+        _policy = _load_policy()
+        COMPRESS_MODEL_CONFIG   = _policy['compression']['model']
+        TOKEN_SOFT_THRESHOLD    = _policy['compression']['token_budget']['soft_threshold']
+        TOKEN_HARD_THRESHOLD    = _policy['compression']['token_budget']['hard_threshold']
+        TOKEN_TARGET            = _policy['compression']['token_budget']['target_tokens']
+        RECENT_TURNS_KEEP       = _policy['compression']['recent_turns']
+        MAX_SUMMARY_CHARS       = _policy['compression']['max_summary_chars']
+        EXTRACT_MODEL_CONFIG    = _policy['extraction']['model']
+        SUMMARY_MODEL_CONFIG    = _policy.get('summary_model')
+        LONG_TERM_TOP_K         = _policy['retrieval']['long_term_top_k']
+        MAX_RELEVANT_MEMORY_CHARS = _policy['retrieval']['max_chars']
+        SKILLS_CUSTOM           = _policy.get('skills', {}).get('custom', {})
 
-    RECENT_TOKEN_MIN        = TOKEN_SOFT_THRESHOLD
-    RECENT_TOKEN_MAX        = TOKEN_HARD_THRESHOLD
-    SUMMARY_TOKEN_BUDGET    = TOKEN_TARGET
-    DEFAULT_SUMMARY_MODEL   = COMPRESS_MODEL_CONFIG.get('model_name', 'deepseek-r1:7b')
-    SUMMARY_MODEL           = COMPRESS_MODEL_CONFIG.get('model_name', 'deepseek-r1:7b')
-    MAX_SUMMARY_LENGTH      = MAX_SUMMARY_CHARS
-    DEFAULT_KEEP_ROUNDS     = RECENT_TURNS_KEEP
+        RECENT_TOKEN_MIN        = TOKEN_SOFT_THRESHOLD
+        RECENT_TOKEN_MAX        = TOKEN_HARD_THRESHOLD
+        SUMMARY_TOKEN_BUDGET    = 800
+        DEFAULT_SUMMARY_MODEL   = COMPRESS_MODEL_CONFIG.get('model_name', 'deepseek-r1:7b')
+        SUMMARY_MODEL           = COMPRESS_MODEL_CONFIG.get('model_name', 'deepseek-r1:7b')
+        MAX_SUMMARY_LENGTH      = MAX_SUMMARY_CHARS
+        DEFAULT_KEEP_ROUNDS     = RECENT_TURNS_KEEP

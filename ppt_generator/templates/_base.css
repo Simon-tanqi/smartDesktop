@@ -1,0 +1,33 @@
+*{margin:0;padding:0;box-sizing:border-box}
+body{width:1920px;height:1080px;font-family:'Microsoft YaHei','PingFang SC','Helvetica Neue',sans-serif;overflow:hidden}
+/* ── 工具类 ── */
+.flex{display:flex}.flex-center{display:flex;align-items:center;justify-content:center}
+.flex-col{flex-direction:column}.flex-1{flex:1}.gap-sm{gap:12px}.gap-md{gap:24px}.gap-lg{gap:40px}
+.text-center{text-align:center}.text-right{text-align:right}
+/* ── 装饰性小图标（纯 CSS） ── */
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px}
+.bar{height:4px;border-radius:2px;margin:16px 0}
+/* ── 图表 ── */
+.chart-bar-group{display:flex;align-items:flex-end;gap:20px;height:260px;padding:0 20px}
+.chart-bar{flex:1;border-radius:6px 6px 0 0;min-width:30px;position:relative;transition:all 0.3s}
+.chart-bar .val{position:absolute;top:-28px;left:50%;transform:translateX(-50%);font-size:16px;font-weight:700;white-space:nowrap}
+.chart-bar .lbl{position:absolute;bottom:-28px;left:50%;transform:translateX(-50%);font-size:14px;color:#666;white-space:nowrap}
+/* ── 饼图 ── */
+.pie{width:220px;height:220px;border-radius:50%;position:relative;flex-shrink:0}
+.pie-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:100px;height:100px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#333}
+/* ── 表格 ── */
+.data-table{width:100%;border-collapse:collapse;font-size:18px}
+.data-table th{padding:14px 16px;text-align:left;font-weight:600;font-size:17px}
+.data-table td{padding:12px 16px;border-bottom:1px solid rgba(0,0,0,0.06);font-size:16px}
+.data-table tr:last-child td{border-bottom:none}
+/* ── 图标网格 ── */
+.icon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:20px}
+.icon-card{display:flex;flex-direction:column;align-items:center;padding:24px 16px;border-radius:16px;background:rgba(0,0,0,0.02);text-align:center;border:1px solid rgba(0,0,0,0.06)}
+.icon-card .ico{font-size:48px;margin-bottom:12px;line-height:1}
+.icon-card .ico-title{font-size:18px;font-weight:600;color:#1a1a2e;margin-bottom:4px}
+.icon-card .ico-desc{font-size:14px;color:#888}
+/* ── 对比列 ── */
+.compare-col{flex:1;padding:28px;border-radius:16px}
+.compare-col h3{font-size:24px;font-weight:700;margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid}
+.compare-col li{font-size:17px;line-height:1.8;margin-bottom:8px;list-style:none;padding-left:24px;position:relative}
+.compare-col li::before{content:'✓';position:absolute;left:0;font-weight:700}

@@ -12,7 +12,6 @@ import os
 # ═══════════════════════════════════════════════
 #  路径配置
 # ═══════════════════════════════════════════════
-WORKSPACE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 用户数据目录（放在 APPDATA 下，便于项目打包分发）
 # 与 memory/config.py 保持一致，确保记忆文件路径统一

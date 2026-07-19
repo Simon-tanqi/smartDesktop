@@ -3,7 +3,7 @@ import os
 import json
 from pathlib import Path
 
-# from . import register_tool, path_params  # 将在函数内部导入避免循环依赖
+from . import register_tool, path_params
 
 
 try:
@@ -17,6 +17,7 @@ except ImportError:
     WORD_AVAILABLE = False
 
 
+@register_tool(timeout=60)
 def create_word_document(file_path: str, content: dict = None):
     """创建Word文档。file_path: 文件保存路径, content: 文档内容配置"""
     if not WORD_AVAILABLE:
@@ -75,6 +76,7 @@ def create_word_document(file_path: str, content: dict = None):
         return json.dumps({"success": False, "message": f"创建文档失败: {str(e)}"}, ensure_ascii=False)
 
 
+@register_tool(timeout=60)
 def add_word_content(file_path: str, content_type: str, content_config: dict):
     """向Word文档添加内容。file_path: 文档路径, content_type: 内容类型(paragraph/table/heading/image), content_config: 内容配置"""
     if not WORD_AVAILABLE:
@@ -144,6 +146,7 @@ def add_word_content(file_path: str, content_type: str, content_config: dict):
         return json.dumps({"success": False, "message": f"添加内容失败: {str(e)}"}, ensure_ascii=False)
 
 
+@register_tool(timeout=60)
 def extract_word_text(file_path: str, page_range: tuple = None):
     """提取Word文档文本内容。file_path: 文档路径, page_range: 页码范围(起始,结束)"""
     if not WORD_AVAILABLE:
@@ -196,6 +199,7 @@ def extract_word_text(file_path: str, page_range: tuple = None):
         return json.dumps({"success": False, "message": f"提取文本失败: {str(e)}"}, ensure_ascii=False)
 
 
+@register_tool(timeout=60)
 def search_replace_word(file_path: str, search_text: str, replace_text: str, case_sensitive: bool = False):
     """在Word文档中查找替换文本。file_path: 文档路径, search_text: 查找文本, replace_text: 替换文本, case_sensitive: 是否区分大小写"""
     if not WORD_AVAILABLE:
@@ -253,6 +257,7 @@ def search_replace_word(file_path: str, search_text: str, replace_text: str, cas
         return json.dumps({"success": False, "message": f"查找替换失败: {str(e)}"}, ensure_ascii=False)
 
 
+@register_tool(timeout=60)
 def batch_word_process(directory: str, operation: str, params: dict = None):
     """批量处理Word文档。directory: 文件夹路径, operation: 操作类型, params: 操作参数"""
     if not WORD_AVAILABLE:

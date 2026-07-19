@@ -3,38 +3,105 @@ import time
 import json
 import datetime
 import os
-from flask import Blueprint, request, jsonify, Response, stream_with_context, send_from_directory
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import traceback
 import threading
 import atexit
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from flask import Blueprint, request, jsonify, Response, stream_with_context, send_from_directory
 
 from llm_client import get_available_models, ai_concat
 from memory import (append_session_message, generate_trace_id,
                     get_user_id, log_operation, list_sessions)
 from memory.long_term import _rewrite_md, _read_lines
-from memory.config import USER_MD, FACTS_MD, SESSION_DIR
+from memory.config import USER_MD, FACTS_MD
 from utils.error_mapper import translate_error
 from logger import get_logger
 from backend.agent import run_agent
 from backend.routing import check_chat_layer, check_frequent_cache, check_complexity, record_success
 from config.settings import SCREENSHOTS_DIR, MODELS_CONFIG_PATH, USER_PROFILE_PATH, MODEL_PRESETS
+from core.agent_state import checkpoint_manager
 
 chat_bp = Blueprint('chat', __name__)
 
 # ── 全局会话状态管理 ──
-_active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id}}
+_active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id, "cancel_event": Event}}
 _active_sessions_lock = threading.Lock()
 
+
 def _register_session(session_id):
+    """注册会话并返回 (cancel_event, request_id)。
+    如果会话已存在，先取消旧任务再注册新任务。
+    引入 request_id 区分同会话的不同请求，避免竞态问题。
+    """
+    cancel_event = threading.Event()
+    request_id = str(uuid.uuid4())[:8]
     with _active_sessions_lock:
+        existing = _active_sessions.get(session_id)
+        if existing:
+            existing["cancel_event"].set()
         _active_sessions[session_id] = {
             "started_at": time.time(),
-            "thread_id": threading.current_thread().ident
+            "thread_id": threading.current_thread().ident,
+            "cancel_event": cancel_event,
+            "status": "running",
+            "current_state": "running",
+            "request_id": request_id,
         }
+    return cancel_event, request_id
 
-def _unregister_session(session_id):
+def _unregister_session(session_id, request_id=None):
+    """注销会话，仅当 request_id 匹配时才删除，避免竞态删除其他任务。"""
     with _active_sessions_lock:
-        _active_sessions.pop(session_id, None)
+        info = _active_sessions.get(session_id)
+        if info:
+            if request_id is None or info.get("request_id") == request_id:
+                _active_sessions.pop(session_id, None)
+
+def _cancel_session(session_id):
+    """设置取消信号并标记会话为取消中，等待 worker 真正结束后再移除。"""
+    with _active_sessions_lock:
+        info = _active_sessions.get(session_id)
+        if info:
+            info["cancel_event"].set()
+            info["status"] = "cancelling"
+            info["cancelled_at"] = time.time()
+
+
+def _cleanup_zombie_sessions():
+    """定时清理超过阈值的僵尸会话：
+    1. cancelling 状态超过 10 分钟未结束的会话
+    2. running 状态但关联线程已死亡的会话
+    """
+    while True:
+        time.sleep(60)
+        now = time.time()
+        zombies = []
+        with _active_sessions_lock:
+            for sid, info in _active_sessions.items():
+                status = info.get("status")
+                if status == "cancelling":
+                    cancelled_at = info.get("cancelled_at", 0)
+                    if now - cancelled_at > 600:
+                        zombies.append(("timeout", sid))
+                elif status == "running":
+                    thread_id = info.get("thread_id")
+                    if thread_id:
+                        try:
+                            import threading as th
+                            thread = th._active.get(thread_id)
+                            if thread is None or not thread.is_alive():
+                                zombies.append(("dead_thread", sid))
+                        except Exception:
+                            pass
+            for reason, sid in zombies:
+                _active_sessions.pop(sid, None)
+                get_logger().warning("清理僵尸会话", session_id=sid, reason=reason)
+
+
+_cleanup_thread = threading.Thread(target=_cleanup_zombie_sessions, daemon=True, name="session-cleanup")
+_cleanup_thread.start()
 
 def _is_session_active(session_id):
     with _active_sessions_lock:
@@ -44,6 +111,16 @@ def _has_active_sessions():
     with _active_sessions_lock:
         return len(_active_sessions) > 0
 
+
+def _get_session_title(session_id: str) -> str:
+    """按 ID 直接查会话标题，使用统一的会话接口。"""
+    try:
+        from memory import get_session
+        session_data = get_session(session_id)
+        return session_data.get("title", "") if session_data else ""
+    except Exception:
+        return ""
+
 # ── 附件标记常量 ──
 _ATTACHMENT_START = "<attachments>"
 _ATTACHMENT_END = "</attachments>"
@@ -51,8 +128,14 @@ _ATTACHMENT_END = "</attachments>"
 
 def _extract_attachments(user_message: str):
     start = user_message.find(_ATTACHMENT_START)
-    end = user_message.find(_ATTACHMENT_END)
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
+        return user_message, []
+    end = user_message.find(_ATTACHMENT_END, start)
+    if end == -1 or end <= start:
+        return user_message, []
+    # 仅当附件块位于消息末尾时才解析，防止正文中出现 <attachments> 字样被误判
+    trailing = user_message[end + len(_ATTACHMENT_END):].strip()
+    if trailing:
         return user_message, []
 
     file_list = []
@@ -63,7 +146,7 @@ def _extract_attachments(user_message: str):
         if m:
             file_list.append((m.group(1), m.group(2)))
 
-    clean = (user_message[:start] + user_message[end + len(_ATTACHMENT_END):]).strip()
+    clean = user_message[:start].strip()
     return clean, file_list
 
 
@@ -81,71 +164,43 @@ def _inject_attachment_context(user_message: str, file_list: list):
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False)
 
-# ── 命令确认机制 ──
+# ── 命令确认机制（纯内存管理，无磁盘持久化） ──
 _pending_confirmations: dict = {}
 _pending_lock = threading.Lock()
-_TOKEN_STORE_FILE = os.path.join(SESSION_DIR, "confirmation_tokens.json")
 
 
-def _load_token_store() -> dict:
-    if not os.path.exists(_TOKEN_STORE_FILE):
-        return {}
-    try:
-        with open(_TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        backup = _TOKEN_STORE_FILE + ".corrupted"
-        os.replace(_TOKEN_STORE_FILE, backup)
-        return {}
-
-
-def _save_token_store(store: dict):
-    tmp = _TOKEN_STORE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, _TOKEN_STORE_FILE)
-
-
-def _cleanup_expired_tokens():
-    store = _load_token_store()
-    now = time.time()
-    cleaned = {k: v for k, v in store.items() if v.get("expires", 0) > now}
-    if len(cleaned) != len(store):
-        _save_token_store(cleaned)
-
-
-_cleanup_expired_tokens()
-
-
-def wait_for_confirmation(confirmation_token: str, timeout: float = 300) -> dict:
-    import time
+def wait_for_confirmation(confirmation_token: str, timeout: float = 300,
+                          cancel_event: threading.Event = None) -> dict:
+    """阻塞等待用户确认。支持 cancel_event 提前中断（用于任务取消）。"""
     evt = threading.Event()
     result_holder = {"confirmed": False}
     with _pending_lock:
         _pending_confirmations[confirmation_token] = {"event": evt, "result": result_holder}
-    store = _load_token_store()
-    store[confirmation_token] = {"created": time.time(), "expires": time.time() + timeout}
-    _save_token_store(store)
-    
+
     start_time = time.time()
     while time.time() - start_time < timeout:
         if evt.is_set():
             break
+        if cancel_event is not None and cancel_event.is_set():
+            with _pending_lock:
+                _pending_confirmations.pop(confirmation_token, None)
+            return {"confirmed": False, "cancelled": True}
         time.sleep(0.1)
-    
+
     got_signal = evt.is_set()
     with _pending_lock:
         _pending_confirmations.pop(confirmation_token, None)
-    store = _load_token_store()
-    store.pop(confirmation_token, None)
-    _save_token_store(store)
     if not got_signal:
         return {"confirmed": False, "timeout": True}
     return result_holder
 
 
 # ── 模型选择 ──
-available_models = get_available_models()
+try:
+    available_models = get_available_models()
+except Exception as e:
+    get_logger().error("加载模型列表失败，使用默认配置", error=str(e))
+    available_models = []
 default_model = available_models[0] if available_models else {"provider": "ollama", "model": "deepseek-r1:7b", "display": "本地 Ollama"}
 
 
@@ -160,8 +215,7 @@ def get_model_choice(display_name=None, model_id=None):
 
 # ── SSE 快捷响应辅助 ──
 def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
-    import datetime as dt
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def generate():
         yield f"data: {json.dumps({'type': 'step', 'text': '处理中...', 'status': '进行中'}, ensure_ascii=False)}\n\n"
@@ -194,8 +248,13 @@ def api_chat():
         cleaned_msg, attachments = _extract_attachments(user_input)
         user_input = _inject_attachment_context(cleaned_msg, attachments)
 
-        append_session_message(session_id, "user", user_input, skip_compress=False,
-                               trace_id=trace_id, user_id=user_id)
+        # 立即写入用户消息到数据库，防止连接中断导致消息丢失
+        msg_id = data.get("msg_id", "")
+        get_logger().info(f"[/chat] 开始保存用户消息，session_id={session_id}, msg_id={msg_id}", trace_id=trace_id)
+        append_session_message(session_id, "user", user_input,
+                              trace_id=trace_id, user_id=user_id,
+                              skip_compress=True, msg_id=msg_id)
+        get_logger().info(f"[/chat] 用户消息保存完成", trace_id=trace_id)
 
         model_choice = data.get("model_choice")
         if (not model_choice or not isinstance(model_choice, dict)
@@ -204,74 +263,168 @@ def api_chat():
             model_id = data.get("model_id", None)
             model_choice = get_model_choice(model_display, model_id)
 
-        print(f"[DIAG /chat] session={session_id} model_choice={model_choice} msg_len={len(user_input)}", flush=True)
+        get_logger().info("[/chat] 请求接入", session_id=session_id,
+                          model=model_choice.get("model"),
+                          provider=model_choice.get("provider"),
+                          model_id=model_choice.get("id"),
+                          model_choice=model_choice,
+                          msg_len=len(user_input))
 
-        session_name = ""
-        for s in list_sessions():
-            if s["id"] == session_id:
-                session_name = s.get("title", "")
-                break
+        # 直接按 ID 查会话标题，避免全量遍历 + 排序
+        session_name = _get_session_title(session_id)
 
         # ── 第1层：闲聊匹配 ──
-        chat_reply = check_chat_layer(user_input)
+        chat_context = {"session_id": session_id, "user_id": user_id}
+        chat_reply = check_chat_layer(user_input, context=chat_context)
         if chat_reply is not None:
-            print(f"[ROUTE L1] 闲聊命中 → 直接返回", flush=True)
+            get_logger().info("[ROUTE L1] 闲聊命中 → 直接返回", session_id=session_id)
             gen = _sse_quick_reply(chat_reply, session_id, trace_id, user_id)
             return Response(stream_with_context(gen),
                             mimetype='text/event-stream',
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
+        # ── 第1.5层：任务恢复检测 ──
+        # 仅当消息本身就是恢复短语时才触发，避免「继续删除文件」等误判
+        # 支持带标点的输入如「继续。」「接着来！」
+        resumed_checkpoint = None
+        continue_keywords = {"继续", "继续任务", "接着来", "继续执行", "继续上次", "恢复任务"}
+        user_input_lower = user_input.lower().strip()
+        stripped_input = user_input_lower.rstrip("。！？，,?!.")
+        is_continue_request = stripped_input in continue_keywords
+        if is_continue_request:
+            checkpoint = checkpoint_manager.get_latest_checkpoint(session_id)
+            if checkpoint:
+                get_logger().info("[ROUTE L1.5] 任务恢复请求 → 加载检查点",
+                                  session_id=session_id, checkpoint=checkpoint.checkpoint_id)
+                resumed_checkpoint = checkpoint
+            else:
+                get_logger().info("[ROUTE L1.5] 任务恢复请求 → 未找到检查点", session_id=session_id)
+
         # ── 第2层：高频固化 ──
         cache_hit, cache_reply = check_frequent_cache(user_input)
         if cache_hit and cache_reply:
-            print(f"[ROUTE L2] 高频固化命中 → 直接调用工具返回", flush=True)
+            get_logger().info("[ROUTE L2] 高频固化命中 → 直接返回", session_id=session_id)
             gen = _sse_quick_reply(cache_reply, session_id, trace_id, user_id)
             return Response(stream_with_context(gen),
                             mimetype='text/event-stream',
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
-        # ── 第3层：复杂度判断 ──
-        complexity = check_complexity(user_input, model_choice)
-        print(f"[ROUTE L3] 复杂度判定: {complexity}", flush=True)
-
-        planning_extra = ""
-        if complexity == "复杂":
-            planning_extra = (
-                "\n\n[系统指令 - 步骤规划] 这是一个复杂任务。"
-                "请在首轮以 JSON 格式输出结构化步骤规划：\n"
-                '{"plan": [{"step": 1, "description": "第一步做什么", "expected_tool": "建议工具"}, ...]}\n'
-                "输出规划后，按步骤顺序逐一执行。每完成一步，用 progress 报告完成进度（如 '已完成步骤1: xxx'）。"
-            )
-            print(f"[ROUTE L3] 复杂任务 → 注入规划提示", flush=True)
-        else:
-            print(f"[ROUTE L3] 简单任务 → 直接执行", flush=True)
-
-        _register_session(session_id)
-        
         def _run_agent_with_cleanup():
+            # 首先发送初始 heartbeat，让前端立即知道连接已建立
+            yield f"data: {json.dumps({'type': 'heartbeat', 'status': 'running'})}\n\n"
+
+            # ── 第3层：复杂度判断（移入 SSE 流中，避免阻塞前端渲染） ──
             try:
-                for chunk in run_agent(
-                    user_message=user_input,
-                    model_choice=model_choice,
-                    session_id=session_id,
-                    trace_id=trace_id,
-                    user_id=user_id,
-                    streaming=True,
-                    session_name=session_name,
-                    tool_executor=_TOOL_EXECUTOR,
-                    default_model=default_model,
-                    confirmation_handler=wait_for_confirmation,
-                    planning_extra=planning_extra,
-                    on_success=lambda msg, tn="", p=None: record_success(msg, tn, p),
-                ):
+                _complexity = check_complexity(user_input, model_choice)
+                get_logger().info(f"[ROUTE L3] 复杂度判定: {_complexity}", session_id=session_id)
+            except Exception as e:
+                get_logger().error(f"复杂度判断异常，使用默认值: {e}", trace_id=trace_id, session_id=session_id)
+                _complexity = "简单"
+            _planning_extra = ""
+            if _complexity == "复杂":
+                _planning_extra = (
+                    "\n\n[系统指令 - 步骤规划] 这是一个复杂任务。"
+                    "请在首轮以 JSON 格式输出结构化步骤规划：\n"
+                    '{"plan": [{"step": 1, "description": "第一步做什么", "expected_tool": "建议工具"}, ...]}\n'
+                    "输出规划后，按步骤顺序逐一执行。每完成一步，用 progress 报告完成进度（如 '已完成步骤1: xxx'）。"
+                )
+
+            # 会话注册移入生成器内部，确保与注销成对执行，异常时不泄漏
+            cancel_event, request_id = _register_session(session_id)
+            try:
+                # 构造带取消信号的确认处理器（捕获 cancel_event 闭包）
+                def _confirmation_handler(token, timeout=300):
+                    with _active_sessions_lock:
+                        info = _active_sessions.get(session_id)
+                        if info:
+                            info["current_state"] = "waiting_confirm"
                     try:
-                        yield chunk
+                        return wait_for_confirmation(token, timeout, cancel_event=cancel_event)
+                    finally:
+                        if cancel_event is None or not cancel_event.is_set():
+                            with _active_sessions_lock:
+                                info = _active_sessions.get(session_id)
+                                if info:
+                                    info["current_state"] = "running"
+
+                event_queue: queue.Queue = queue.Queue(maxsize=100)
+
+                def _worker():
+                    with _active_sessions_lock:
+                        info = _active_sessions.get(session_id)
+                        if info:
+                            info["thread_id"] = threading.current_thread().ident
+                    try:
+                        get_logger().info(f"[/chat] Worker线程启动，开始执行run_agent", trace_id=trace_id)
+                        for chunk in run_agent(
+                            user_message=user_input,
+                            model_choice=model_choice,
+                            session_id=session_id,
+                            trace_id=trace_id,
+                            user_id=user_id,
+                            streaming=True,
+                            session_name=session_name,
+                            tool_executor=_TOOL_EXECUTOR,
+                            default_model=default_model,
+                            confirmation_handler=_confirmation_handler,
+                            planning_extra=_planning_extra,
+                            on_success=lambda msg, tn="", p=None, **kw: record_success(
+                                msg, tn, p,
+                                tool_call_chain=kw.get("tool_call_chain"),
+                                run_was_complete=kw.get("run_was_complete", True),
+                            ),
+                            resumed_checkpoint=resumed_checkpoint,
+                            cancel_event=cancel_event,
+                        ):
+                            get_logger().info(f"[/chat] Worker线程收到chunk，长度={len(chunk)}", trace_id=trace_id)
+                            while True:
+                                try:
+                                    event_queue.put(chunk, block=True, timeout=0.1)
+                                    break
+                                except queue.Full:
+                                    if cancel_event is not None and cancel_event.is_set():
+                                        get_logger().info("队列满时检测到取消信号，终止任务",
+                                                          trace_id=trace_id, session_id=session_id)
+                                        return
+                        get_logger().info(f"[/chat] Worker线程run_agent执行完成", trace_id=trace_id)
+                    except Exception as e:
+                        get_logger().error("Agent worker 执行异常",
+                                           trace_id=trace_id, session_id=session_id, error=str(e))
+                        event_queue.put(("__error__", str(e)))
+                    finally:
+                        event_queue.put(None)  # 哨兵：通知消费端结束
+                        get_logger().info(f"[/chat] Worker线程结束，已放入哨兵", trace_id=trace_id)
+
+                worker_thread = threading.Thread(
+                    target=_worker, daemon=True, name=f"agent-{session_id[:8]}")
+                worker_thread.start()
+
+                while True:
+                    try:
+                        item = event_queue.get(timeout=5)
+                    except queue.Empty:
+                        # 心跳事件：确认等待等长阻塞期间保持 SSE 连接存活
+                        with _active_sessions_lock:
+                            info = _active_sessions.get(session_id)
+                            current_state = info.get("current_state", "running") if info else "running"
+                        yield f"data: {json.dumps({'type': 'heartbeat', 'status': current_state}, ensure_ascii=False)}\n\n"
+                        continue
+
+                    if item is None:
+                        break
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+                        yield f"data: {json.dumps({'type': 'error', 'text': '任务执行异常，请重试。'}, ensure_ascii=False)}\n\n"
+                        break
+                    try:
+                        yield item
                     except GeneratorExit:
-                        get_logger().info("客户端连接已断开，终止任务", trace_id=trace_id, session_id=session_id)
+                        get_logger().info("客户端连接已断开，终止任务",
+                                          trace_id=trace_id, session_id=session_id)
                         raise
             finally:
-                _unregister_session(session_id)
-        
+                cancel_event.set()  # 通知 worker 尽快停止
+                _unregister_session(session_id, request_id)
+
         return Response(
             stream_with_context(_run_agent_with_cleanup()),
             mimetype='text/event-stream',
@@ -283,8 +436,8 @@ def api_chat():
     except Exception as e:
         log_operation(trace_id, user_id, session_id if 'session_id' in locals() else "",
                       "error", str(e))
-        import traceback
-        traceback.print_exc()
+        get_logger().error("[/chat] 处理异常", trace_id=trace_id, error=str(e),
+                           stack=traceback.format_exc())
         return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 
@@ -296,9 +449,9 @@ def api_cancel():
         session_id = data.get("session_id", "").strip()
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
-        
-        _unregister_session(session_id)
-        
+
+        _cancel_session(session_id)
+
         get_logger().info("会话已取消", session_id=session_id)
         return jsonify({"success": True, "message": "会话已取消"})
     except Exception as e:
@@ -312,6 +465,7 @@ def api_confirm():
         data = request.json
         token = data.get("confirmation_token", "").strip()
         confirmed = data.get("confirmed", False)
+        challenge_response = data.get("challenge_response", "").strip()
         if not token:
             return jsonify({"success": False, "message": "缺少 confirmation_token"}), 400
         with _pending_lock:
@@ -319,8 +473,10 @@ def api_confirm():
         if not pending:
             return jsonify({"success": False, "message": "令牌无效或已过期"}), 404
         pending["result"]["confirmed"] = confirmed
+        if challenge_response:
+            pending["result"]["challenge_response"] = challenge_response
         pending["event"].set()
-        get_logger().info("命令确认", confirmation_token=token[:8], confirmed=confirmed)
+        get_logger().info("命令确认", confirmation_token=token[:8], confirmed=confirmed, challenge=bool(challenge_response))
         return jsonify({"success": True, "message": "已确认" if confirmed else "已取消"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -445,7 +601,6 @@ def api_save_user_profile():
 
 @chat_bp.route('/api/config/first_run', methods=['GET'])
 def api_check_first_run():
-    import os
     return jsonify({"first_run": not os.path.exists(USER_PROFILE_PATH)})
 
 
@@ -505,7 +660,6 @@ def api_logs_available_dates():
 
 @chat_bp.route('/api/logs/llm_call')
 def api_logs_llm_call():
-    import os
     session_id = request.args.get("session_id", "")
     turn = int(request.args.get("turn", 0))
     if not session_id:
@@ -541,17 +695,15 @@ def save_session():
             if messages:
                 existing = sql_get_messages(session_id)
                 existing_ids = {m.get("msg_id", "") for m in existing if m.get("msg_id")}
-                existing_keys = {(m["role"], m.get("msg_type", "chat"), m["content"]) for m in existing if not m.get("msg_id")}
+                # 仅用 msg_id 去重，不用 content 去重（防止相同消息的多次请求被错误过滤）
                 sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
                 for msg in messages:
                     role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
+                    msg_text = msg.get("text") or ""
+                    msg_type = msg.get("msgType", "chat")
                     msg_id = msg.get("msgId", "")
                     if msg_id and msg_id in existing_ids:
                         continue
-                    if not msg_id:
-                        key = (role, msg.get("msgType", "chat"), (msg.get("text") or ""))
-                        if key in existing_keys:
-                            continue
                     frontend_ts = msg.get("timestamp", "")
                     if frontend_ts:
                         try:
@@ -590,7 +742,7 @@ def get_sessions():
         sessions = list_sessions()
         return jsonify(sessions)
     except Exception as e:
-        print(f"[API] 获取会话列表错误: {e}")
+        get_logger().error("获取会话列表错误", error=str(e))
         return jsonify([])
 
 
@@ -606,7 +758,7 @@ def get_models():
             }])
         return jsonify(available_models)
     except Exception as e:
-        print(f"[API] 加载模型列表错误: {e}")
+        get_logger().error("加载模型列表错误", error=str(e))
         return jsonify([{
             "provider": "ollama",
             "model": "deepseek-r1:7b",
@@ -650,6 +802,8 @@ def get_session(session_id):
             })
         return jsonify({"success": True, "messages": formatted})
     except Exception as e:
+        get_logger().error("get_session 错误", session_id=session_id, error=str(e),
+                           stack=traceback.format_exc())
         return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 

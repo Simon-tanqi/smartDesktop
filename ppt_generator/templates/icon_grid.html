@@ -1,0 +1,38 @@
+{% extends "_base.html" %}
+{% block slide_style %}
+.slide{
+    width:1920px;height:1080px;background:#fff;
+    display:flex;flex-direction:column;padding:56px 72px;position:relative;
+}
+.slide::before{content:'';position:absolute;top:0;left:0;right:0;height:6px;
+    background:linear-gradient(90deg,{{ theme.color1 }},{{ theme.accent }});}
+.pg{position:absolute;bottom:32px;right:72px;font-size:14px;color:#ccc}
+.header{display:flex;align-items:center;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid rgba(0,0,0,0.05);}
+.header-accent{width:8px;height:36px;background:linear-gradient(180deg,{{ theme.color1 }},{{ theme.accent }});border-radius:4px;margin-right:16px;flex-shrink:0;}
+.header h2{font-size:30px;font-weight:700;color:#1a1a2e;}
+.desc{font-size:17px;color:#666;margin-bottom:24px}
+.grid{flex:1;display:grid;grid-template-columns:repeat({{ cols|default(4) }},1fr);gap:20px;align-content:start}
+.card{display:flex;flex-direction:column;align-items:center;padding:28px 16px 22px;border-radius:16px;background:#fff;text-align:center;border:1px solid rgba(0,0,0,0.06);box-shadow:0 2px 12px rgba(0,0,0,0.04);transition:all 0.2s}
+.card:hover{box-shadow:0 4px 20px rgba(0,0,0,0.08);transform:translateY(-2px)}
+.card .ico{font-size:52px;margin-bottom:12px;line-height:1}
+.card .ico-title{font-size:18px;font-weight:600;color:#1a1a2e;margin-bottom:4px}
+.card .ico-desc{font-size:14px;color:#888;line-height:1.5;max-width:200px}
+.card .ico-stat{font-size:24px;font-weight:800;color:{{ theme.color1 }};margin-top:8px}
+{% endblock %}
+{% block slide_content %}
+<div class="slide">
+<div class="header"><div class="header-accent"></div><h2 data-tb="grid-title">{{ title }}</h2></div>
+{% if desc %}<div class="desc" data-tb="grid-desc">{{ desc }}</div>{% endif %}
+<div class="grid">
+    {% for item in items %}
+    <div class="card">
+        <div class="ico" data-tb="grid-ico-{{ loop.index }}">{{ item.icon }}</div>
+        <div class="ico-title" data-tb="grid-title-{{ loop.index }}">{{ item.title }}</div>
+        {% if item.desc %}<div class="ico-desc" data-tb="grid-desc-{{ loop.index }}">{{ item.desc }}</div>{% endif %}
+        {% if item.stat %}<div class="ico-stat" data-tb="grid-stat-{{ loop.index }}">{{ item.stat }}</div>{% endif %}
+    </div>
+    {% endfor %}
+</div>
+<div class="pg" data-tb="pg">{{ page }}</div>
+</div>
+{% endblock %}

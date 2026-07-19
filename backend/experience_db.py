@@ -49,7 +49,12 @@ class ExperienceDB:
 
     def __init__(self, db_path: str = None):
         if db_path is None:
-            db_dir = os.path.dirname(os.path.abspath(__file__))
+            try:
+                from config.settings import DATA_DIR
+            except ImportError:
+                DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+            db_dir = os.path.join(DATA_DIR, "experience")
+            os.makedirs(db_dir, exist_ok=True)
             db_path = os.path.join(db_dir, "experience_db.json")
         self.db_path = db_path
         self._ensure_db()

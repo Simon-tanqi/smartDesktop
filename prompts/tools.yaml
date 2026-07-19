@@ -7,11 +7,13 @@ always_inject:
   - scan_directory
   - search_files
   - search_content
-  - get_workspace_path
-  - get_project_summary
   - replace_in_file
   - ask_user_clarification
   - load_domain_skills
+  - get_workspace_path
+  - execute_command
+  - modify_registry
+  - copy_file_to_workspace
 
 tools:
   read_file:
@@ -26,6 +28,8 @@ tools:
 
   scan_directory:
     desc: 扫描目录第一层，返回 JSON 数组 [path必须已存在]
+    params:
+      path: {type: str, desc: 要扫描的目录绝对路径}
     tier: 1
     tags: [filesystem, general]
 
@@ -43,8 +47,9 @@ tools:
     desc: 按内容搜索代码文件，返回文件:行号
     params:
       keyword: {type: str, desc: 搜索关键词}
-      path: {type: str, desc: 搜索路径}
+      directory: {type: str, optional: true, desc: 搜索路径}
       file_pattern: {type: str, optional: true, desc: 文件通配符如"*.py"}
+      max_results: {type: int, optional: true, desc: 最大结果数}
     tier: 1
     tags: [code, search, general]
 
@@ -56,7 +61,8 @@ tools:
 
   get_project_summary:
     desc: 返回项目结构概览（子目录+关键文件列表）
-    note: 无参数
+    params:
+      directory: {type: str, optional: true, desc: 目录路径，默认为工作空间}
     tier: 1
     tags: [utility, project, general]
 
@@ -66,6 +72,7 @@ tools:
       file_path: {type: str, desc: 文件绝对路径}
       old_str: {type: str, desc: 要替换的原文本}
       new_str: {type: str, desc: 新文本}
+      occurrence: {type: int, optional: true, default: 1, desc: 替换第几次出现}
     note: 默认唯一匹配
     tier: 1
     tags: [code, edit, general]
@@ -81,11 +88,19 @@ tools:
   load_domain_skills:
     desc: 当用户需求超出基础文件读写/搜索能力时，加载指定的进阶技能域。加载成功后，下一轮对话你将获得该域的全部新工具。
     params:
-      domain: {type: str, enum: ["code_dev", "web_browse", "system_basic", "system_high_risk", "excel_analyze", "office_word", "office_ppt", "gui_automation"], desc: "技能域名称。选择最匹配用户当前需求的一个。"}
+      domain: {type: str, enum: ["code_dev", "web_browse", "system_basic", "system_high_risk", "excel_analyze", "office_word", "office_ppt", "gui_automation","user_memory","db_query"], desc: "技能域名称。选择最匹配用户当前需求的一个。"}
       reason: {type: str, desc: "简要说明加载原因"}
       session_id: {type: str, optional: true, desc: "会话ID，用于跟踪已加载的域"}
     tier: 1
     tags: [utility, skill_loader]
+
+  copy_file_to_workspace:
+    desc: 将外部文件（如桌面、下载文件夹）复制到工作区，以便后续操作
+    params:
+      source_path: {type: str, desc: 源文件绝对路径（如 C:\Users\username\Desktop\file.xlsx）}
+      dest_filename: {type: str, optional: true, desc: 目标文件名（可选，默认使用源文件名）}
+    tier: 1
+    tags: [filesystem, copy, workspace]
 
 # ==================== GUI自动化工具 ====================
   gui_click:
@@ -186,17 +201,28 @@ tools:
     tags: [gui, automation, workflow]
     domains: [gui_automation]
 
-  # 兼容性别名
+  # 已废弃，使用 gui_screenshot 替代
   take_screenshot:
-    desc: 截图功能（兼容性别名）
+    desc: "【已废弃】请改用 gui_screenshot。截取屏幕并保存为 PNG 文件。"
+    deprecated: true
+    replaced_by: gui_screenshot
     params:
-      save_path: {type: str, optional: true, desc: "保存路径，默认自动生成"}
+      left: {type: int, optional: true, desc: 区域左边界像素}
+      top: {type: int, optional: true, desc: 区域上边界像素}
+      right: {type: int, optional: true, desc: 区域右边界像素}
+      bottom: {type: int, optional: true, desc: 区域下边界像素}
+      save_path: {type: str, optional: true, desc: 保存路径，默认自动生成}
+    note: 此工具已废弃，请使用 gui_screenshot 替代。
     tier: 1
-    tags: [gui, screen, capture]
-    domains: [gui_automation, system_basic]
+    tags: [screen, screenshot, deprecated]
+    domains: []
 
   write_file:
     desc: 创建新文件，自动建父目录，已存在则重命名
+    params:
+      file_path: {type: str, desc: 文件绝对路径}
+      content: {type: str, desc: 文件内容}
+      overwrite: {type: bool, optional: true, default: true, desc: 是否覆盖已存在文件}
     tier: 2
     tags: [filesystem, general]
     domains: [code_dev]
@@ -212,14 +238,15 @@ tools:
     domains: [code_dev, excel_analyze]
 
   execute_command:
-    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg
-    note: 禁止 rm -rf/format/shutdown。超时30s
+    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg。注：音量/音频命令自动路由到 system_audio 执行
+    params: {command: {type: str, desc: 要执行的PowerShell命令字符串}}
+    note: 禁止 rm -rf/format/shutdown。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
     tier: 2
     tags: [shell, system, general]
     domains: [system_high_risk]
 
   get_uninstall_string:
-    desc: 获取软件的卸载命令路径。卸载软件时必须首先调用此工具获取卸载程序路径，返回 DisplayName、UninstallString、InstallLocation 等信息，避免手动查询注册表
+    desc: 获取软件的卸载命令路径。卸载软件时必须首先调用此工具获取卸载程序路径，返回 DisplayName、UninstallString、InstallLocation 等信息，避免手动查询注册表。获取到卸载路径后，必须调用 execute_command 工具执行卸载程序
     params: {program_name: {type: str, desc: 软件名称，支持模糊匹配，如"迅雷"、"Thunder"}}
     tier: 1
     tags: [system, uninstall, software]
@@ -265,18 +292,6 @@ tools:
     tags: [web, download]
     domains: [web_browse, excel_analyze]
 
-  take_screenshot:
-    desc: 截取屏幕并保存为 PNG 文件，返回文件路径。不传区域参数时截取全屏；传 left,top,right,bottom 时截取指定区域
-    params:
-      left: {type: int, optional: true, desc: 区域左边界像素}
-      top: {type: int, optional: true, desc: 区域上边界像素}
-      right: {type: int, optional: true, desc: 区域右边界像素}
-      bottom: {type: int, optional: true, desc: 区域下边界像素}
-    note: 依赖 Pillow 库，截图保存至 workspace/screenshots/。**必须将返回结果中的 Markdown 图片链接（![截图](url)）原样呈现在回复中，不得省略或改写。**
-    tier: 2
-    tags: [screen, screenshot]
-    domains: [system_basic]
-
   system_audio:
     desc: 音频控制（音量/静音/麦克风/设备切换），value 0-100
     params:
@@ -313,6 +328,60 @@ tools:
       value: {type: str, desc: 信息值}
     tier: 2
     tags: [memory, user]
+
+# ==================== Excel 基础操作工具 ====================
+  excel_read:
+    desc: 读取Excel文件数据，返回JSON格式
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      sheet_name: {type: str, optional: true, desc: 工作表名，默认第一个}
+      max_rows: {type: int, optional: true, default: 100, desc: 最大读取行数}
+      start_row: {type: int, optional: true, default: 0, desc: 起始行}
+    tier: 2
+    tags: [excel, read, analysis]
+    domains: [excel_analyze]
+
+  excel_write:
+    desc: 写入数据到Excel文件
+    params:
+      file_path: {type: str, desc: 文件保存绝对路径}
+      data: {type: list, desc: 数据列表(字典或列表)}
+      sheet_name: {type: str, optional: true, default: "Sheet1", desc: 工作表名}
+      mode: {type: str, optional: true, default: "write", desc: write(覆盖)/append(追加)/new_sheet(新建Sheet)}
+    tier: 2
+    tags: [excel, write, analysis]
+    domains: [excel_analyze]
+
+  excel_formula:
+    desc: 对Excel单元格应用公式
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      sheet_name: {type: str, optional: true, desc: 工作表名}
+      cell: {type: str, desc: 目标单元格如"A1"}
+      formula: {type: str, desc: 公式如"=SUM(A2:A10)"}
+    tier: 3
+    tags: [excel, formula, calculation]
+    domains: [excel_analyze]
+
+  excel_merge:
+    desc: 合并Excel单元格
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      sheet_name: {type: str, optional: true, desc: 工作表名}
+      start_cell: {type: str, desc: 起始单元格如"A1"}
+      end_cell: {type: str, desc: 结束单元格如"C3"}
+    tier: 3
+    tags: [excel, merge, formatting]
+    domains: [excel_analyze]
+
+  excel_convert:
+    desc: 转换Excel文件格式（xlsx/xls/csv）
+    params:
+      file_path: {type: str, desc: 源文件绝对路径}
+      output_format: {type: str, desc: 输出格式(xlsx/xls/csv)}
+    tier: 3
+    tags: [excel, convert, format]
+    domains: [excel_analyze]
 
 # ==================== Excel 高级处理工具 ====================
   excel_pivot:
@@ -405,23 +474,18 @@ tools:
     domains: [office_word]
 
 # ==================== PowerPoint 处理工具 ====================
-  create_presentation:
-    desc: 创建PowerPoint演示文稿
+  generate_ppt:
+    desc: 一站式生成视觉精美的PowerPoint演示文稿（HTML截图背景+可编辑文字层），
+      支持封面/内容页模板、5种主题配色，最终输出PPTX
     params:
-      file_path: {type: str, desc: 保存绝对路径}
-      config: {type: dict, optional: true, desc: 演示文稿配置}
-    tier: 3
-    tags: [ppt, create, presentation]
+      slides: {type: list, desc: "幻灯片列表，每项含template(cover|content)和data"}
+      theme: {type: str, default: tech_blue, desc: "主题: tech_blue(科技蓝)/business_gray(商务灰)/gradient_purple(渐变紫)/education_orange(教育橙)/minimal_dark(极简黑)"}
+      output_path: {type: str, optional: true, desc: "输出路径，默认自动生成"}
+    tier: 2
+    tags: [ppt, generate, visual, design]
     domains: [office_ppt]
 
-  add_slide_content:
-    desc: 向PPT添加幻灯片内容
-    params:
-      file_path: {type: str, desc: PPT文件绝对路径}
-      slide_config: {type: dict, desc: 幻灯片配置}
-    tier: 3
-    tags: [ppt, slide, content]
-    domains: [office_ppt]
+
 
   extract_presentation_info:
     desc: 提取PPT演示文稿信息
@@ -487,8 +551,16 @@ domains:
       - 音量
       - 亮度
       - 分辨率
+      # 2026-07-12 修复：扩同义词，让"声音/喇叭/扬声器/静音/sound/speaker/mute"等表达也能命中此域
+      - 声音
+      - 喇叭
+      - 扬声器
+      - 静音
+      - sound
+      - speaker
+      - mute
     tools:
-      - take_screenshot
+      - gui_screenshot
       - system_audio
       - display_config
 
@@ -506,10 +578,18 @@ domains:
       - 格式化
       - 删除文件
       - 修改系统
+      - 电源计划
+      - 电源配置
+      - 电源设置
+      - 息屏
+      - 睡眠
+      - 休眠
+      - 待机
     tools:
       - execute_command
       - get_uninstall_string
       - modify_registry
+      - verify_uninstall
     requires_confirmation: true
 
   excel_analyze:
@@ -528,6 +608,11 @@ domains:
       - web_download
       - excel_pivot
       - excel_format
+      - excel_read
+      - excel_write
+      - excel_formula
+      - excel_merge
+      - excel_convert
       - excel_chart_advanced
       - excel_batch_process
 
@@ -560,6 +645,7 @@ domains:
       - pptx
       - 汇报
     tools:
+      - generate_ppt
       - create_presentation
       - add_slide_content
       - extract_presentation_info
@@ -591,7 +677,6 @@ domains:
       - gui_locate_image
       - gui_open_app
       - gui_workflow
-      - take_screenshot
 
   user_memory:
     description: "用户记忆"
@@ -654,63 +739,3 @@ personas:
     - 老板模式
     - 投入产出
     - roi
-
-# domain_groups 保留用于向后兼容（build_tools_param 等函数引用）
-# 内容与 domains 相同，后续可移除
-domain_groups:
-  code_dev:
-    description: "代码开发"
-    tools:
-      - write_file
-      - run_python
-      - get_workspace_path
-      - search_content
-
-  web_browse:
-    description: "上网浏览"
-    tools:
-      - web_search
-      - fetch_webpage
-      - get_weather
-      - web_download
-
-  system_basic:
-    description: "系统基础操作"
-    tools:
-      - take_screenshot
-      - system_audio
-      - display_config
-
-  system_high_risk:
-    description: "高危操作（需用户确认）"
-    tools:
-      - execute_command
-      - get_uninstall_string
-      - modify_registry
-    requires_confirmation: true
-
-  excel_analyze:
-    description: "数据分析"
-    tools:
-      - run_python
-      - web_download
-      - excel_pivot
-      - excel_format
-      - excel_chart_advanced
-      - excel_batch_process
-
-  gui_automation:
-    description: "GUI自动化操作"
-    tools:
-      - gui_click
-      - gui_move
-      - gui_type
-      - gui_keys
-      - gui_active_window
-      - gui_find_window
-      - gui_activate
-      - gui_screenshot
-      - gui_locate_image
-      - gui_open_app
-      - gui_workflow
-      - take_screenshot

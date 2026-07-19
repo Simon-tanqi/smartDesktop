@@ -4,6 +4,7 @@ import re
 import json
 import time
 import uuid
+import threading
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 
@@ -11,6 +12,13 @@ import requests
 
 from . import register_tool
 from config.config_loader import get_safety_config
+
+# 注意：web_download 使用独立的 _pending_confirmations 字典
+# 与 backend/chat.py 的 _pending_confirmations 完全分离，避免数据格式冲突
+# - backend/chat.py 格式: {token: {"event": evt, "result": result_holder}}
+# - web_download.py 格式: {token: {"url": ..., "output_dir": ..., "filename": ..., "expiry": ...}}
+_pending_confirmations: dict = {}
+_pending_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -34,10 +42,42 @@ def _extract_filename(url: str, content_disposition: str = None) -> str:
     return "download"
 
 
+def _is_internal_url(url: str) -> bool:
+    """判断 URL 是否为内网地址（SSRF 防护）"""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return True
+
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return True
+
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True
+    except ValueError:
+        pass
+
+    if host.endswith(".local") or host.endswith(".internal"):
+        return True
+
+    return False
+
+
+def _safe_redirect(resp, **kwargs):
+    """安全重定向回调：禁止重定向到内网地址"""
+    new_url = resp.headers.get("Location", "")
+    if _is_internal_url(new_url):
+        raise requests.exceptions.RequestException(f"禁止重定向到内网地址: {new_url}")
+    return True
+
+
 def _probe_url(url: str) -> dict:
     """HEAD 探测 URL 的 Content-Type、Content-Length 和 Content-Disposition"""
     try:
-        resp = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=15, allow_redirects=True)
+        resp = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=5, allow_redirects=True, hooks={"response": [_safe_redirect]})
         return {
             "content_type": resp.headers.get("Content-Type", ""),
             "content_length": resp.headers.get("Content-Length", ""),
@@ -61,24 +101,40 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
 
     可执行文件（.exe/.msi/.bat 等）下载前会弹出确认卡片让用户判断来源是否可信。
     """
-    # 确定输出目录
+    try:
+        from config.settings import DATA_DIR
+    except ImportError:
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+    workspace_dir = os.path.join(DATA_DIR, "workspace")
+
+    # 确定输出目录并进行路径安全检查
     if output_dir:
-        dl_dir = Path(output_dir)
+        dl_path = Path(output_dir).resolve()
+        if not str(dl_path).startswith(workspace_dir) and not str(dl_path).startswith(str(Path.home())):
+            return json.dumps({
+                "success": False,
+                "error": f"输出目录不在允许的范围内，仅允许写入工作区或用户目录",
+                "allowed_paths": [workspace_dir, str(Path.home())],
+            }, ensure_ascii=False)
+        dl_dir = dl_path
     else:
         dl_dir = Path.home() / "Downloads"
     dl_dir.mkdir(parents=True, exist_ok=True)
 
-    # HEAD 探测
+    # HEAD 探测（可选，失败时降级）
     probe = _probe_url(url)
     if "error" in probe:
-        return json.dumps({"success": False, "error": f"URL 探测失败: {probe['error']}"}, ensure_ascii=False)
+        content_type = ""
+        content_length_str = ""
+        content_disposition = ""
+        final_url = url
+    else:
+        content_type = probe.get("content_type", "")
+        content_length_str = probe.get("content_length", "")
+        content_disposition = probe.get("content_disposition", "")
+        final_url = probe.get("final_url", url)
 
-    content_type = probe.get("content_type", "")
-    content_length_str = probe.get("content_length", "")
-    content_disposition = probe.get("content_disposition", "")
-    final_url = probe.get("final_url", url)
-
-    # 提取文件名
+    # 提取文件名（基于探测结果或 URL）
     filename = _extract_filename(final_url, content_disposition)
     ext = os.path.splitext(filename)[1].lower()
 
@@ -90,6 +146,14 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
     if ext in get_safety_config().risky_extensions:
         if not confirmed:
             token = uuid.uuid4().hex
+            download_info = {
+                "url": url,
+                "output_dir": output_dir,
+                "filename": filename,
+                "expiry": time.time() + 300,
+            }
+            with _pending_lock:
+                _pending_confirmations[token] = download_info
             return json.dumps({
                 "confirmation_required": True,
                 "confirmation_token": token,
@@ -105,35 +169,93 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
                 "url": url,
                 "output_dir": output_dir,
             }, ensure_ascii=False)
-        # confirmed=True 时继续下载，不做二次校验
 
-    # 去重：如果文件已存在，加序号
+        # confirmed=True 时，校验 token 有效性
+        if not confirmation_token:
+            return json.dumps({
+                "success": False,
+                "error": "请提供有效的确认令牌"
+            }, ensure_ascii=False)
+
+        stored_info = None
+        with _pending_lock:
+            if confirmation_token in _pending_confirmations:
+                stored_info = _pending_confirmations[confirmation_token]
+                del _pending_confirmations[confirmation_token]
+
+        if not stored_info:
+            return json.dumps({
+                "success": False,
+                "error": "确认令牌无效或已过期"
+            }, ensure_ascii=False)
+
+        if time.time() > stored_info.get("expiry", 0):
+            return json.dumps({
+                "success": False,
+                "error": "确认令牌已过期"
+            }, ensure_ascii=False)
+
+        if stored_info.get("url") != url or stored_info.get("output_dir") != output_dir:
+            return json.dumps({
+                "success": False,
+                "error": "确认令牌与请求不匹配"
+            }, ensure_ascii=False)
+
+    # 去重：如果文件已存在，加序号（带文件锁防止竞态条件）
     save_path = dl_dir / filename
     counter = 1
     stem, file_ext = os.path.splitext(filename)
-    while save_path.exists():
-        save_path = dl_dir / f"{stem} ({counter}){file_ext}"
-        counter += 1
+    while True:
+        try:
+            fd = os.open(str(save_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            save_path = dl_dir / f"{stem} ({counter}){file_ext}"
+            counter += 1
 
-    # 流式下载
+    # 流式下载（带总时长限制）
     try:
         start_time = time.time()
         downloaded = 0
         chunk_size = 8192
+        total_timeout = 120
 
-        with requests.get(url, stream=True, headers={"User-Agent": USER_AGENT}, timeout=300, allow_redirects=True) as resp:
+        with requests.get(url, stream=True, headers={"User-Agent": USER_AGENT}, timeout=30, allow_redirects=True, hooks={"response": [_safe_redirect]}) as resp:
             resp.raise_for_status()
 
             actual_ct = resp.headers.get("Content-Type", "")
             actual_cl = resp.headers.get("Content-Length", "")
+            actual_cd = resp.headers.get("Content-Disposition", "")
+            actual_final_url = resp.url
+
             if actual_cl and actual_cl.isdigit():
                 file_size = int(actual_cl)
+
+            actual_filename = _extract_filename(actual_final_url, actual_cd)
+            actual_ext = os.path.splitext(actual_filename)[1].lower()
+
+            if actual_ext in get_safety_config().risky_extensions and not confirmed:
+                return json.dumps({
+                    "success": False,
+                    "error": "实际下载的文件为可执行文件，请重新确认后下载",
+                    "actual_filename": actual_filename,
+                    "actual_ext": actual_ext,
+                }, ensure_ascii=False)
 
             with open(save_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+
+                    elapsed = time.time() - start_time
+                    if elapsed > total_timeout:
+                        return json.dumps({
+                            "success": False,
+                            "error": f"下载超时（{total_timeout}s），文件可能过大或网络不稳定",
+                            "downloaded": f"{downloaded / 1024 / 1024:.2f} MB",
+                        }, ensure_ascii=False)
 
         elapsed = time.time() - start_time
         actual_size = os.path.getsize(save_path)

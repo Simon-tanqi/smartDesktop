@@ -1,187 +1,300 @@
 import os
 import json
-import base64
-import requests
 import re
 import time
-import yaml
-from pathlib import Path
-from memory import log_trace
+import threading
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-# ================== 配置管理（keyring + 环境变量 + YAML 兜底） ==================
+import requests
+from memory import log_trace
+from logger import get_logger
+from utils import normalize_path_component
+
+logger = get_logger()
+
 import keyring
 
-_PROJECT_DIR = Path(__file__).parent
 DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
-CONFIG_YAML = os.path.join(DATA_DIR, 'config.yaml')
 KEYRING_SERVICE = "MyAgent"
 KEYRING_USERNAME = "api_key"
 
+_KEYRING_AVAILABLE = None
 
-def _try_keyring_get():
-    """安全地从 keyring 读取 API Key，失败返回 None。"""
+
+def _is_keyring_available():
+    global _KEYRING_AVAILABLE
+    if _KEYRING_AVAILABLE is None:
+        try:
+            keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+            _KEYRING_AVAILABLE = True
+        except Exception:
+            _KEYRING_AVAILABLE = False
+    return _KEYRING_AVAILABLE
+
+
+def _try_keyring_get(model_id=None):
+    if not _is_keyring_available():
+        return None
     try:
-        return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+        username = KEYRING_USERNAME if model_id is None else f"{KEYRING_USERNAME}_{model_id}"
+        return keyring.get_password(KEYRING_SERVICE, username)
     except Exception:
         return None
 
 
-def _try_keyring_set(api_key):
-    """安全地向 keyring 写入 API Key，失败返回 False。"""
+def _try_keyring_set(api_key, model_id=None):
+    if not _is_keyring_available():
+        return False
     try:
-        keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, api_key)
+        username = KEYRING_USERNAME if model_id is None else f"{KEYRING_USERNAME}_{model_id}"
+        keyring.set_password(KEYRING_SERVICE, username, api_key)
         return True
     except Exception:
         return False
 
 
 def load_config():
-    """
-    加载配置。
-    读取优先级：环境变量 > keyring > YAML 明文兜底。
-    非敏感字段（backend / model / base_url）从 YAML 读取。
-    """
-    config = {"backend": "ollama", "model": "deepseek-r1:7b"}
-    yaml_config = {}
+    """加载配置：模型配置从 models.json 读取，API Key 从环境变量读取"""
+    config = {"backend": "deepseek", "model": "deepseek-chat", "models": {}, "base_url": "https://api.deepseek.com"}
 
-    # 读 YAML（非敏感字段）
-    if os.path.exists(CONFIG_YAML):
-        try:
-            with open(CONFIG_YAML, 'r', encoding='utf-8') as f:
-                yaml_config = yaml.safe_load(f) or {}
-            config.update({k: v for k, v in yaml_config.items() if k != "api_key"})
-        except Exception as e:
-            print(f"⚠️ 配置文件读取失败: {e}，使用默认配置。")
+    # 从 models.json 读取模型配置
+    try:
+        models_json = os.path.join(DATA_DIR, "models.json")
+        if os.path.exists(models_json):
+            with open(models_json, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            for m in cfg.get("models", []):
+                m_id = m.get("id", m.get("model", ""))
+                if m_id:
+                    config["models"][m_id] = {
+                        "provider": m.get("provider", "deepseek"),
+                        "model": m.get("model", "deepseek-chat"),
+                        "base_url": m.get("base_url", "https://api.deepseek.com"),
+                        "api_version": m.get("api_version", "v1"),
+                        "temperature": m.get("temperature", DEFAULT_TEMPERATURE),
+                        "api_key": m.get("api_key", ""),
+                    }
+            # 设置默认 backend/model/base_url 为 active model
+            active_id = cfg.get("active_model_id", "")
+            if active_id and active_id in config["models"]:
+                active = config["models"][active_id]
+                config["backend"] = active["provider"]
+                config["model"] = active["model"]
+                config["base_url"] = active["base_url"]
+    except Exception as e:
+        logger.warning(f"加载 models.json 失败: {e}")
 
-    # API Key：环境变量 > keyring > YAML 明文 > 空
+    # API Key 仅从环境变量读取
     env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY")
     if env_key:
         config["api_key"] = env_key
-    else:
-        stored = _try_keyring_get()
-        if stored:
-            config["api_key"] = stored
-        elif yaml_config.get("api_key"):
-            config["api_key"] = yaml_config["api_key"]
 
     return config
 
 
-def save_config(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com"):
-    """保存配置：API Key → keyring，非敏感 → YAML（keyring 不可用时明文兜底）。"""
-    os.makedirs(DATA_DIR, exist_ok=True)
+def _load_config():
+    """加载配置（每次重新读取，不缓存，支持运行时 env 覆盖）"""
+    config = load_config()
+    # 环境变量覆盖（运行时可能变化）
+    if os.environ.get("MYAGENT_API_KEY"):
+        config["api_key"] = os.environ["MYAGENT_API_KEY"]
+    elif os.environ.get("API_KEY"):
+        config["api_key"] = os.environ["API_KEY"]
+    if os.environ.get("API_BASE_URL"):
+        config["base_url"] = os.environ["API_BASE_URL"]
+    if os.environ.get("API_MODEL"):
+        config["model"] = os.environ["API_MODEL"]
+    return config
 
-    yaml_config = {"backend": backend, "model": model, "base_url": base_url}
-    keyring_ok = True
 
+def get_config():
+    return dict(_load_config())
+
+
+def get_api_key(model_id=None):
+    """获取 API Key：环境变量 → models.json 模型配置 → keyring"""
+    # 环境变量优先
+    env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY")
+    if env_key:
+        return env_key
+
+    config = _load_config()
+    if model_id and config.get("models") and config["models"].get(model_id):
+        model_cfg = config["models"][model_id]
+        if model_cfg.get("api_key"):
+            return model_cfg["api_key"]
+
+    # 从 keyring 读取（兼容旧配置）
+    stored = _try_keyring_get(model_id)
+    if stored:
+        return stored
+
+    return ""
+
+
+def get_base_url(model_id=None):
+    """获取 Base URL：models.json 模型配置 → 默认值"""
+    config = _load_config()
+    if model_id and config.get("models") and config["models"].get(model_id):
+        return config["models"][model_id].get("base_url", "https://api.deepseek.com")
+    return config.get("base_url", "https://api.deepseek.com")
+
+
+def get_model_config(model_id):
+    """获取模型配置：优先从 _load_config 缓存，兜底从 models.json 读取"""
+    config = _load_config()
+    if config.get("models") and config["models"].get(model_id):
+        return config["models"][model_id]
+    # Fallback: read from models.json directly
+    try:
+        models_json = os.path.join(DATA_DIR, "models.json")
+        if os.path.exists(models_json):
+            with open(models_json, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            for m in cfg.get("models", []):
+                if m.get("id") == model_id:
+                    return m
+    except Exception:
+        pass
+    return None
+
+
+def invalidate_config_cache():
+    """保留兼容性空函数（不再需要缓存失效）"""
+    pass
+
+
+def save_config(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com", model_id=None):
+    """保存 API Key 到 keyring（模型配置通过 models.json / 前端页面管理）"""
     if backend != "ollama" and api_key:
-        if not _try_keyring_set(api_key):
-            print("⚠️ 系统凭据管理器不可用，API Key 将明文存储。")
-            yaml_config["api_key"] = api_key
-            keyring_ok = False
-
-    with open(CONFIG_YAML, 'w', encoding='utf-8') as f:
-        yaml.dump(yaml_config, f, allow_unicode=True, default_flow_style=False)
-
-    storage = "系统凭据管理器" if keyring_ok else "配置文件（明文）"
-    print(f"✅ 配置已保存至 {CONFIG_YAML}（API Key → {storage}）")
+        _try_keyring_set(api_key, model_id)
+    logger.info(f"配置已保存（API Key → 系统凭据管理器）")
 
 
 def _save_config_raw(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com"):
-    """内部写盘（兼容旧调用）。"""
     save_config(backend, api_key, model, base_url)
 
 
-# ================== 通用 AI 调用接口 ==================
-# 惰性加载配置（不再作为模块级全局变量暴露解密后的 API Key）
-_config_cache = None
+DEFAULT_TEMPERATURE = 0.75
 
-def _load_config():
-    """内部惰性加载，调用方不直接访问。环境变量优先于配置文件。"""
-    global _config_cache
-    if _config_cache is None:
-        _config_cache = load_config()
-    merged = dict(_config_cache)
-    if os.environ.get("API_KEY"):
-        merged["api_key"] = os.environ["API_KEY"]
-    if os.environ.get("API_BASE_URL"):
-        merged["base_url"] = os.environ["API_BASE_URL"]
-    if os.environ.get("API_MODEL"):
-        merged["model"] = os.environ["API_MODEL"]
-    return merged
-
-def get_config():
-    """获取完整配置的浅拷贝（避免调用方意外修改缓存）。"""
-    return dict(_load_config())
-
-def get_api_key():
-    return os.environ.get("API_KEY") or _load_config().get("api_key", "")
-
-def get_base_url():
-    return os.environ.get("API_BASE_URL") or _load_config().get("base_url", "https://api.deepseek.com")
-
-# ── 可配置的 LLM 参数 ──
-# 后续可从前端读取覆盖；当前默认值为 0.3（Agent 场景需要一定随机性）
-DEFAULT_TEMPERATURE = 0.3
+_session = requests.Session()
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST"]
+)
+_session.mount("http://", HTTPAdapter(max_retries=_retry_strategy))
+_session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
 
 
-# 修改原有的 ai_concat，增加 provider 参数以覆盖后端
-def ai_concat(messages, model_name=None, provider=None, trace_id="", tools=None, response_format=None):
-    """
-    统一的 AI 调用入口。
-    provider: 可选 "ollama" 或 "deepseek"，若不传则使用配置文件的后端。
-    model_name: 可选模型名，若不传则使用配置或默认值。
-    trace_id: 可选追踪 ID，用于日志关联。
-    tools: 工具列表，OpenAI 格式。
-    response_format: 响应格式，如 {"type": "json_object"}。
-    """
-    env_key = os.environ.get("API_KEY", "")
-    env_model = os.environ.get("API_MODEL", "")
+def _normalize_base_url(base_url):
+    url = base_url.rstrip('/')
+    url = re.sub(r'/chat/completions/?$', '', url)
+    url = re.sub(r'/v\d+/chat/completions/?$', '', url)
+    return url
 
-    backend = (provider or _load_config().get("backend", "ollama")).lower().strip()
-    if env_key and backend == "ollama":
-        backend = "deepseek"
 
-    if backend == "ollama":
-        return _ollama_call(messages, model_name or _load_config().get("model", "deepseek-r1:7b"), 
-                            trace_id=trace_id, tools=tools, response_format=response_format)
-    else:
-        resolved_model = model_name or env_model or _load_config().get("model", "deepseek-chat")
-        if not resolved_model or "/" in resolved_model or "\\" in resolved_model:
-            print(f"⚠️ 模型名异常 '{resolved_model}'，回退为 deepseek-chat")
-            resolved_model = "deepseek-chat"
-        elif ":" in resolved_model:
-            print(f"⚠️ 模型名 '{resolved_model}' 疑似 Ollama 风格（含冒号），但后端为 {backend}，回退为 deepseek-chat")
-            resolved_model = "deepseek-chat"
-        return _deepseek_call(messages, resolved_model,
-                              get_api_key(),
-                              get_base_url(),
-                              trace_id=trace_id, tools=tools, response_format=response_format)
+def _map_response_format(response_format):
+    if not response_format:
+        return None
+    fmt_type = response_format.get("type", "")
+    if fmt_type == "json_object":
+        return "json"
+    return fmt_type
 
-def _ollama_call(messages, model, trace_id="", tools=None, response_format=None):
-    """原有的 Ollama 调用逻辑"""
+
+def ai_concat(messages, model_name=None, provider=None, trace_id="", 
+              tools=None, response_format=None, base_url_override=None, model_id=None, temperature=None):
+    """统一 AI 调用入口：Ollama 走专属逻辑，其余走通用 OpenAI 兼容协议"""
+    try:
+        get_logger().debug(f"[ai_concat] 开始调用", trace_id=trace_id, model_id=model_id, 
+                          provider=provider, messages_count=len(messages) if messages else 0)
+
+        config = _load_config()
+
+        model_cfg = get_model_from_cache(model_id) if model_id else None
+
+        # 路由优先级：显式传参 > models.json 的 provider > config.yaml backend
+        if provider:
+            backend = provider.lower().strip()
+        elif model_cfg:
+            backend = model_cfg.get("provider", "deepseek").lower().strip()
+        else:
+            backend = config.get("backend", "deepseek").lower().strip()
+
+        if backend == "ollama":
+            model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-r1:7b")
+            resolved_temperature = temperature if temperature is not None else (model_cfg.get("temperature", DEFAULT_TEMPERATURE) if model_cfg else DEFAULT_TEMPERATURE)
+            get_logger().debug(f"[ai_concat] Ollama调用", trace_id=trace_id, model=model, temperature=resolved_temperature)
+            return _ollama_call(messages, model, trace_id=trace_id, 
+                               tools=tools, response_format=response_format, temperature=resolved_temperature)
+
+        else:
+            resolved_model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-chat")
+            resolved_api_key = get_api_key(model_id)
+            
+            if model_cfg:
+                resolved_base_url = base_url_override or model_cfg.get("base_url", "https://api.deepseek.com")
+                resolved_api_version = model_cfg.get("api_version", "v1")
+                resolved_temperature = temperature if temperature is not None else model_cfg.get("temperature", DEFAULT_TEMPERATURE)
+            else:
+                resolved_base_url = base_url_override or get_base_url(model_id)
+                resolved_api_version = "v1"
+                if model_id and config.get("models") and config["models"].get(model_id):
+                    resolved_api_version = config["models"][model_id].get("api_version", "v1")
+                resolved_temperature = temperature if temperature is not None else DEFAULT_TEMPERATURE
+
+            if not resolved_base_url:
+                raise ValueError(f"无法解析 Base URL，请检查 model_id={model_id} 配置或传入 base_url_override")
+
+            get_logger().debug(f"[ai_concat] OpenAI兼容调用", trace_id=trace_id, model=resolved_model, 
+                              base_url=resolved_base_url, api_version=resolved_api_version, 
+                              temperature=resolved_temperature, api_key_set=bool(resolved_api_key))
+
+            return _openai_compatible_call(
+                messages, resolved_model, resolved_api_key, resolved_base_url,
+                provider=backend, trace_id=trace_id, tools=tools, 
+                response_format=response_format, api_version=resolved_api_version,
+                temperature=resolved_temperature
+            )
+
+    except Exception as e:
+        get_logger().error(f"[ai_concat] AI调用初始化失败: {e}", trace_id=trace_id, model_id=model_id, 
+                          exc_info=True)
+        raise RuntimeError(f"AI服务不可用: {e}") from e
+
+
+def _ollama_call(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
     url = "http://localhost:11434/api/chat"
+
+    # 防御性检查：拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
+    if model and model in ("deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3"):
+        msg = f"拒绝路由：模型 '{model}' 是 DeepSeek 在线模型，不应调用本地 Ollama。请检查 model_choice.provider 配置。"
+        get_logger().error(msg, trace_id=trace_id)
+        raise ValueError(msg)
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": DEFAULT_TEMPERATURE}
+        "options": {"temperature": temperature}
     }
     if tools:
         payload["tools"] = tools
-    if response_format:
-        payload["format"] = response_format.get("type", "")
+    fmt = _map_response_format(response_format)
+    if fmt:
+        payload["format"] = fmt
     t0 = time.perf_counter()
     try:
-        response = requests.post(url, json=payload, timeout=30)
+        response = _session.post(url, json=payload, timeout=30)
         response.raise_for_status()
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         result = response.json()
         msg = result.get("message", {})
-        # 保留 DeepSeek-R1 的 reasoning_content，后续在 app.py 中用作思考展示
         reasoning = msg.get("reasoning_content", "")
         content = msg.get("content", "") or ""
-        # 处理 function calling：Ollama 也可能通过 tool_calls 返回
         tool_calls = msg.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
@@ -203,7 +316,7 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None)
         log_trace(
             trace_id=trace_id, span_name="llm.ollama", node_type="llm",
             duration_ms=elapsed_ms, provider="ollama", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE}}}', status="success",
+            model_params=f'{{"temperature":{temperature}}}', status="success",
             input_summary=str(messages)[:200],
             output_summary=output_summary
         )
@@ -220,37 +333,42 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None)
         log_trace(
             trace_id=trace_id, span_name="llm.ollama", node_type="llm",
             duration_ms=elapsed_ms, provider="ollama", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE}}}', status="error",
+            model_params=f'{{"temperature":{temperature}}}', status="error",
             error=error_detail[:500]
         )
         total_chars = sum(len(m.get("content", "")) for m in messages)
-        print(f"❌ Ollama 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
-        return None
+        logger.error(f"Ollama 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
+        return {"message": {"content": "", "error": error_detail, "reasoning_content": ""}}
 
 
-def _ollama_call_stream(messages, model, trace_id="", format=None, tools=None, response_format=None):
-    """Ollama 流式调用 — 逐步产出思考过程 chunk，最后产出完整结果"""
+def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
     url = "http://localhost:11434/api/chat"
+
+    # 防御性检查：拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
+    if model and model in ("deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3"):
+        msg = f"拒绝路由：模型 '{model}' 是 DeepSeek 在线模型，不应调用本地 Ollama。请检查 model_choice.provider 配置。"
+        get_logger().error(msg, trace_id=trace_id)
+        raise ValueError(msg)
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "options": {"temperature": DEFAULT_TEMPERATURE},
+        "options": {"temperature": temperature},
     }
-    if format:
-        payload["format"] = format
     if tools:
         payload["tools"] = tools
-    if response_format:
-        payload["format"] = response_format.get("type", "")
+    fmt = _map_response_format(response_format)
+    if fmt:
+        payload["format"] = fmt
     t0 = time.perf_counter()
     try:
-        response = requests.post(url, json=payload, stream=True, timeout=(30, 120))
+        response = _session.post(url, json=payload, stream=True, timeout=(30,120))
         response.raise_for_status()
 
         full_content = ""
         full_reasoning = ""
-        accumulated_tool_calls = {}  # {index: {"name":..., "arguments": ""}}
+        accumulated_tool_calls = {}
 
         for line in response.iter_lines(decode_unicode=True):
             if not line.strip():
@@ -269,7 +387,6 @@ def _ollama_call_stream(messages, model, trace_id="", format=None, tools=None, r
             if reasoning_chunk:
                 full_reasoning += reasoning_chunk
 
-            # Ollama 流式 function calling
             delta_tool_calls = msg_chunk.get("tool_calls")
             if delta_tool_calls:
                 for i, tc in enumerate(delta_tool_calls):
@@ -291,7 +408,6 @@ def _ollama_call_stream(messages, model, trace_id="", format=None, tools=None, r
             if chunk.get("done"):
                 break
 
-        # 将 function calling 的 tool_calls 转为 ```action 代码块
         if accumulated_tool_calls:
             for idx in sorted(accumulated_tool_calls.keys()):
                 tc = accumulated_tool_calls[idx]
@@ -310,7 +426,7 @@ def _ollama_call_stream(messages, model, trace_id="", format=None, tools=None, r
         log_trace(
             trace_id=trace_id, span_name="llm.ollama", node_type="llm",
             duration_ms=elapsed_ms, provider="ollama", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE},"stream":true}}', status="success",
+            model_params=f'{{"temperature":{temperature},"stream":true}}', status="success",
             input_summary=str(messages)[:200],
             output_summary=full_content[:200]
         )
@@ -320,15 +436,20 @@ def _ollama_call_stream(messages, model, trace_id="", format=None, tools=None, r
         log_trace(
             trace_id=trace_id, span_name="llm.ollama", node_type="llm",
             duration_ms=elapsed_ms, provider="ollama", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE},"stream":true}}', status="error",
+            model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
             error=str(e)[:500]
         )
-        print(f"❌ Ollama 流式请求失败: {e}")
+        logger.error(f"Ollama 流式请求失败: {e}")
         yield {"type": "error", "error": str(e)}
 
 
-def _deepseek_call(messages, model, api_key, base_url, trace_id="", tools=None, response_format=None):
-    """DeepSeek API 调用（兼容 OpenAI 格式）"""
+def _openai_compatible_call(messages, model, api_key, base_url, 
+                            provider="openai_compatible", trace_id="", 
+                            tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE):
+    """通用 OpenAI 兼容接口调用（DeepSeek / 豆包 / 通义等均适用）"""
+    if not api_key:
+        logger.error(f"{provider} API Key 为空，无法发起调用（model={model}, base_url={base_url}）")
+        return {"message": {"content": "", "error": f"{provider} API Key 未配置，请在设置中添加 API Key", "reasoning_content": ""}}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -336,23 +457,31 @@ def _deepseek_call(messages, model, api_key, base_url, trace_id="", tools=None, 
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": DEFAULT_TEMPERATURE,
+        "temperature": temperature,
         "stream": False
     }
     if tools:
         payload["tools"] = tools
     if response_format:
         payload["response_format"] = response_format
+
+    normalized_url = _normalize_base_url(base_url)
     t0 = time.perf_counter()
     try:
-        response = requests.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        response = _session.post(f"{normalized_url}/{api_version}/chat/completions", 
+                                headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         data = response.json()
-        msg = data["choices"][0]["message"]
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("API 返回为空")
+
+        msg = choices[0].get("message", {})
         content = msg.get("content", "") or ""
-        # 处理 function calling：如果 LLM 通过 tool_calls 返回工具调用，转为 ```action 代码块
+        reasoning = msg.get("reasoning_content", "")
         tool_calls = msg.get("tool_calls")
+
         if tool_calls:
             for tc in tool_calls:
                 fn = tc.get("function", {})
@@ -366,14 +495,16 @@ def _deepseek_call(messages, model, api_key, base_url, trace_id="", tools=None, 
                 if content and not content.endswith("\n"):
                     content += "\n"
                 content += f"```action\n{tool_call_json}\n```"
+
         log_trace(
-            trace_id=trace_id, span_name="llm.deepseek", node_type="llm",
-            duration_ms=elapsed_ms, provider="deepseek", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE}}}', status="success",
+            trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
+            duration_ms=elapsed_ms, provider=provider, model_name=model,
+            model_params=f'{{"temperature":{temperature}}}', status="success",
             input_summary=str(messages)[:200],
             output_summary=content[:200]
         )
-        return {"message": {"content": content}}
+        return {"message": {"content": content, "reasoning_content": reasoning}}
+
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         error_detail = str(e)
@@ -384,18 +515,24 @@ def _deepseek_call(messages, model, api_key, base_url, trace_id="", tools=None, 
         except Exception:
             pass
         log_trace(
-            trace_id=trace_id, span_name="llm.deepseek", node_type="llm",
-            duration_ms=elapsed_ms, provider="deepseek", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE}}}', status="error",
+            trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
+            duration_ms=elapsed_ms, provider=provider, model_name=model,
+            model_params=f'{{"temperature":{temperature}}}', status="error",
             error=error_detail[:500]
         )
         total_chars = sum(len(m.get("content", "")) for m in messages)
-        print(f"❌ DeepSeek API 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
-        return None
+        logger.error(f"{provider} 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
+        return {"message": {"content": "", "error": error_detail, "reasoning_content": ""}}
 
 
-def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools=None, response_format=None):
-    """DeepSeek API 流式调用（兼容 OpenAI SSE 格式）"""
+def _openai_compatible_call_stream(messages, model, api_key, base_url,
+                                   provider="openai_compatible", trace_id="",
+                                   tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE):
+    """通用 OpenAI 兼容流式调用"""
+    if not api_key:
+        logger.error(f"{provider} API Key 为空，无法发起流式调用（model={model}, base_url={base_url}）")
+        yield {"type": "error", "error": f"{provider} API Key 未配置，请在设置中添加 API Key"}
+        return
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -403,24 +540,28 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": DEFAULT_TEMPERATURE,
+        "temperature": temperature,
         "stream": True,
     }
     if tools:
         payload["tools"] = tools
     if response_format:
         payload["response_format"] = response_format
+
+    normalized_url = _normalize_base_url(base_url)
     t0 = time.perf_counter()
     try:
-        response = requests.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload, stream=True, timeout=(30, 120))
+        response = _session.post(f"{normalized_url}/{api_version}/chat/completions",
+                                headers=headers, json=payload, stream=True, timeout=(30, 120))
         response.raise_for_status()
-
         full_content = ""
         full_reasoning = ""
-        # 累积 function calling 的 tool_calls（DeepSeek 在传 tools 参数时通过此字段返回）
-        accumulated_tool_calls = {}  # {index: {"id":..., "name":..., "arguments": ""}}
+        accumulated_tool_calls = {}
+        max_duration = 300
 
         for line in response.iter_lines(decode_unicode=True):
+            if time.perf_counter() - t0 > max_duration:
+                raise TimeoutError(f"流式请求超时，超过 {max_duration} 秒")
             if not line.strip() or not line.startswith("data: "):
                 continue
             data_str = line[6:]
@@ -440,7 +581,6 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools
             if reasoning_chunk:
                 full_reasoning += reasoning_chunk
 
-            # 处理 function calling 的 tool_calls 流式增量
             delta_tool_calls = delta.get("tool_calls")
             if delta_tool_calls:
                 for tc in delta_tool_calls:
@@ -457,8 +597,6 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools
 
             yield {"type": "chunk", "content": content_chunk, "reasoning": reasoning_chunk}
 
-        # 如果 LLM 通过 function calling 返回了工具调用，将其转换为 ```action 代码块追加到 content 末尾
-        # 这样 parse_ai_json 可以正常解析，无需修改 agent.py 的解析逻辑
         if accumulated_tool_calls:
             for idx in sorted(accumulated_tool_calls.keys()):
                 tc = accumulated_tool_calls[idx]
@@ -469,23 +607,22 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools
                 except json.JSONDecodeError:
                     args_obj = {"raw": args_str}
                 tool_call_json = json.dumps({"tool_name": tool_name, "arguments": args_obj}, ensure_ascii=False)
-                # 如果 content 已有自然语言，在末尾追加 action 代码块
                 if full_content and not full_content.endswith("\n"):
                     full_content += "\n"
                 full_content += f"```action\n{tool_call_json}\n```"
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log_trace(
-            trace_id=trace_id, span_name="llm.deepseek", node_type="llm",
-            duration_ms=elapsed_ms, provider="deepseek", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE},"stream":true}}', status="success",
+            trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
+            duration_ms=elapsed_ms, provider=provider, model_name=model,
+            model_params=f'{{"temperature":{temperature},"stream":true}}', status="success",
             input_summary=str(messages)[:200],
             output_summary=full_content[:200]
         )
         yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning}
+
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        # 尝试读取响应体获取详细错误信息
         error_detail = str(e)
         try:
             if 'response' in locals():
@@ -494,41 +631,73 @@ def _deepseek_call_stream(messages, model, api_key, base_url, trace_id="", tools
         except Exception:
             pass
         log_trace(
-            trace_id=trace_id, span_name="llm.deepseek", node_type="llm",
-            duration_ms=elapsed_ms, provider="deepseek", model_name=model,
-            model_params=f'{{"temperature":{DEFAULT_TEMPERATURE},"stream":true}}', status="error",
+            trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
+            duration_ms=elapsed_ms, provider=provider, model_name=model,
+            model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
             error=error_detail[:500]
         )
-        print(f"❌ DeepSeek API 流式请求失败: {error_detail[:300]}")
+        logger.error(f"{provider} 流式请求失败: {error_detail[:300]}")
         yield {"type": "error", "error": str(e)}
 
 
-# ================== 保留原有的工具函数 ==================
 def parse_ai_json(content):
     from json_repair import loads as repair_loads
+    import logging
+    logger = logging.getLogger(__name__)
     try:
         clean_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        json_match = re.search(r'```(?:json|action)?\s*([\s\S]*?)\s*```', clean_content)
-        if json_match:
-            clean_content = json_match.group(1).strip()
 
-        # 优先检测多 JSON（json_repair 对多 JSON 不会失败，而是返回最后一个，会吞掉前面对象）
-        lines = [l.strip() for l in clean_content.splitlines() if l.strip().startswith("{") and l.strip().endswith("}")]
-        if len(lines) > 1:
-            for line in lines:
-                try:
-                    obj = repair_loads(line)
-                    if isinstance(obj, dict) and ("tool_name" in obj or "tool_call" in obj or "tool" in obj or "final_message" in obj or "progress" in obj):
-                        return obj
-                except Exception:
+        action_match = re.search(r'```action\s*([\s\S]*?)\s*```', clean_content)
+        if action_match:
+            clean_content = action_match.group(1).strip()
+            logger.debug(f"parse_ai_json: 提取action代码块成功，内容长度: {len(clean_content)}")
+        else:
+            reasoning_match = re.search(r'```reasoning\s*([\s\S]*?)\s*```', clean_content)
+            if reasoning_match:
+                clean_content = reasoning_match.group(1).strip()
+                logger.debug(f"parse_ai_json: 提取reasoning代码块成功，内容长度: {len(clean_content)}")
+            else:
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', clean_content)
+                if json_match:
+                    clean_content = json_match.group(1).strip()
+                    logger.debug(f"parse_ai_json: 提取json代码块成功，内容长度: {len(clean_content)}")
+                else:
+                    logger.debug(f"parse_ai_json: 未找到action/reasoning/json代码块，原始内容前200字符: {content[:200]}")
+
+        start_brace = clean_content.find('{')
+        if start_brace != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start_brace, len(clean_content)):
+                c = clean_content[i]
+                if escape:
+                    escape = False
                     continue
-            # 多行 JSON 但都不匹配预期 key → 不返回 None，继续走后续 fallback
+                if c == '\\':
+                    escape = True
+                    continue
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = repair_loads(clean_content[start_brace:i + 1])
+                            if isinstance(obj, dict) and ("tool_name" in obj or "tool_call" in obj or "tool" in obj or "final_message" in obj or "progress" in obj):
+                                return obj
+                        except Exception:
+                            pass
 
         result = repair_loads(clean_content)
         if result is not None and isinstance(result, dict):
             return result
 
-        # 兜底：LLM 可能在 JSON 前后输出了文本，从 clean_content 中提取第一个完整 {...} 对象
         start = clean_content.find('{')
         if start != -1:
             depth = 0
@@ -555,69 +724,117 @@ def parse_ai_json(content):
                         return repair_loads(clean_content[start:i + 1])
         return None
     except Exception as e:
-        print(f"❌ JSON 解析异常: {e}")
+        logger.error(f"JSON 解析异常: {e}")
         return None
 
 
-def normalize_path_component(path_str):
-    path_str = re.sub(r'([A-Za-z])\s*盘', r'\1:', path_str)
-    path_str = path_str.replace('/', '\\')
-    path_str = re.sub(r'^([A-Za-z]:)(?!\\)', r'\1\\', path_str)
-    return os.path.normpath(path_str)
+_models_cache = None
+_models_cache_mtime = 0
+_models_cache_lock = threading.Lock()
 
-# 新增：获取可用模型列表（供 GUI 使用）
+
+def invalidate_models_cache():
+    global _models_cache, _models_cache_mtime
+    with _models_cache_lock:
+        _models_cache = None
+        _models_cache_mtime = 0
+
+
+def get_model_from_cache(model_id):
+    global _models_cache
+    if _models_cache is None:
+        get_available_models()
+    if _models_cache:
+        return next((m for m in _models_cache if m["id"] == model_id), None)
+    return None
+
+
 def get_available_models():
-    """
-    返回可用模型列表，优先从 models.json 配置文件读取。
-    环境变量 API_KEY + API_MODEL 设置后，自动置顶为默认模型。
-    """
-    env_key = os.environ.get("API_KEY", "")
+    global _models_cache, _models_cache_mtime
+    
+    env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY", "")
     env_model = os.environ.get("API_MODEL", "")
     env_url = os.environ.get("API_BASE_URL", "https://api.deepseek.com")
 
-    models = []
-    if env_key and env_model:
-        models.append({
-            "id": "env_" + env_model,
-            "display": f"环境变量 ({env_model})",
-            "provider": "deepseek",
-            "model": env_model,
-            "base_url": env_url,
-            "temperature": 0.3,
-            "stream": True
-        })
-
-    # 从 models.json 加载配置的模型
     try:
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")
+        config_path = os.path.join(DATA_DIR, "models.json")
+        
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            for m in cfg.get("models", []):
-                m_id = m.get("id", m.get("model", ""))
-                if env_key and env_model and m_id == "env_" + env_model:
-                    continue
-                models.append({
-                    "id": m_id,
-                    "display": m.get("name", m.get("model", m_id)),
-                    "provider": m.get("provider", "deepseek"),
-                    "model": m.get("model", "deepseek-chat"),
-                    "base_url": m.get("base_url", "https://api.deepseek.com"),
-                    "temperature": m.get("temperature", 0.3),
-                    "stream": m.get("stream", True)
-                })
-    except Exception:
-        pass
-
-    if not models:
-        models = [
+            current_mtime = os.path.getmtime(config_path)
+            with _models_cache_lock:
+                if _models_cache is None or current_mtime > _models_cache_mtime:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    
+                    models = []
+                    if env_key and env_model:
+                        models.append({
+                            "id": "env_" + env_model,
+                            "display": f"环境变量 ({env_model})",
+                            "provider": "deepseek",
+                            "model": env_model,
+                            "base_url": env_url,
+                            "api_version": "v1",
+                            "temperature": DEFAULT_TEMPERATURE,
+                            "stream": True
+                        })
+                    
+                    for m in cfg.get("models", []):
+                        m_id = m.get("id", m.get("model", ""))
+                        if env_key and env_model and m_id == "env_" + env_model:
+                            continue
+                        provider = m.get("provider", "deepseek").lower()
+                        models.append({
+                            "id": m_id,
+                            "display": m.get("name", m.get("model", m_id)),
+                            "provider": provider,
+                            "model": m.get("model", "deepseek-chat"),
+                            "base_url": m.get("base_url", "https://api.deepseek.com"),
+                            "api_version": m.get("api_version", "v1"),
+                            "temperature": m.get("temperature", DEFAULT_TEMPERATURE),
+                            "stream": m.get("stream", True)
+                        })
+                    
+                    _models_cache = models
+                    _models_cache_mtime = current_mtime
+                else:
+                    models = _models_cache
+        else:
+            models = [
+                {
+                    "id": "deepseek-chat",
+                    "display": "DeepSeek (deepseek-chat)",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "base_url": "https://api.deepseek.com",
+                    "api_version": "v1",
+                    "temperature": DEFAULT_TEMPERATURE,
+                    "stream": True
+                },
+                {
+                    "id": "ollama-r1",
+                    "display": "本地 Ollama (deepseek-r1:7b)",
+                    "provider": "ollama",
+                    "model": "deepseek-r1:7b",
+                    "base_url": "http://localhost:11434",
+                    "api_version": "v1",
+                    "temperature": DEFAULT_TEMPERATURE,
+                    "stream": True
+                }
+            ]
+            _models_cache = models
+            
+    except Exception as e:
+        logger.warning(f"加载 models.json 失败: {e}")
+        models = _models_cache or [
             {
                 "id": "deepseek-chat",
                 "display": "DeepSeek (deepseek-chat)",
                 "provider": "deepseek",
                 "model": "deepseek-chat",
                 "base_url": "https://api.deepseek.com",
-                "temperature": 0.3,
+                "api_version": "v1",
+                "temperature": DEFAULT_TEMPERATURE,
                 "stream": True
             },
             {
@@ -626,8 +843,84 @@ def get_available_models():
                 "provider": "ollama",
                 "model": "deepseek-r1:7b",
                 "base_url": "http://localhost:11434",
-                "temperature": 0.3,
+                "api_version": "v1",
+                "temperature": DEFAULT_TEMPERATURE,
                 "stream": True
             }
         ]
+    
     return models
+
+
+def _deepseek_call(messages, model, api_key, base_url,
+                   provider="deepseek", trace_id="", tools=None, response_format=None):
+    return _openai_compatible_call(messages, model, api_key, base_url,
+                                   provider=provider, trace_id=trace_id, 
+                                   tools=tools, response_format=response_format)
+
+
+def _deepseek_call_stream(messages, model, api_key, base_url,
+                          provider="deepseek", trace_id="", tools=None, response_format=None,temperature=DEFAULT_TEMPERATURE):
+    return _openai_compatible_call_stream(messages, model, api_key, base_url,
+                                          provider=provider, trace_id=trace_id,
+                                          tools=tools, response_format=response_format,temperature=temperature)
+
+
+def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
+                     tools=None, response_format=None, base_url_override=None, api_version="v1", model_id=None):
+    """统一 AI 流式调用入口：Ollama 走专属逻辑，其余走通用 OpenAI 兼容协议"""
+    try:
+        get_logger().debug(f"[ai_concat_stream] 开始调用", trace_id=trace_id, model_id=model_id, 
+                          provider=provider, messages_count=len(messages) if messages else 0)
+
+        config = _load_config()
+
+        model_cfg = get_model_from_cache(model_id) if model_id else None
+
+        # 路由优先级：显式传参 > models.json 的 provider > config.yaml backend
+        if provider:
+            backend = provider.lower().strip()
+        elif model_cfg:
+            backend = model_cfg.get("provider", "deepseek").lower().strip()
+        else:
+            backend = config.get("backend", "deepseek").lower().strip()
+
+        if backend == "ollama":
+            model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-r1:7b")
+            temperature = model_cfg.get("temperature", DEFAULT_TEMPERATURE) if model_cfg else DEFAULT_TEMPERATURE
+            get_logger().debug(f"[ai_concat_stream] Ollama调用", trace_id=trace_id, model=model, temperature=temperature)
+            yield from _ollama_call_stream(messages, model, trace_id=trace_id,
+                                           tools=tools, response_format=response_format, temperature=temperature)
+        else:
+            resolved_model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-chat")
+            resolved_api_key = get_api_key(model_id)
+            
+            if model_cfg:
+                resolved_base_url = base_url_override or model_cfg.get("base_url", "https://api.deepseek.com")
+                resolved_api_version = model_cfg.get("api_version", "v1")
+                resolved_temperature = model_cfg.get("temperature", DEFAULT_TEMPERATURE)
+            else:
+                resolved_base_url = base_url_override or get_base_url(model_id)
+                resolved_api_version = api_version
+                if model_id and config.get("models") and config["models"].get(model_id):
+                    resolved_api_version = config["models"][model_id].get("api_version", "v1")
+                resolved_temperature = DEFAULT_TEMPERATURE
+
+            if not resolved_base_url:
+                raise ValueError(f"无法解析 Base URL，请检查 model_id={model_id} 配置或传入 base_url_override")
+
+            get_logger().debug(f"[ai_concat_stream] OpenAI兼容调用", trace_id=trace_id, model=resolved_model, 
+                              base_url=resolved_base_url, api_version=resolved_api_version, 
+                              temperature=resolved_temperature, api_key_set=bool(resolved_api_key))
+
+            yield from _openai_compatible_call_stream(
+                messages, resolved_model, resolved_api_key, resolved_base_url,
+                provider=backend, trace_id=trace_id, tools=tools,
+                response_format=response_format, api_version=resolved_api_version,
+                temperature=resolved_temperature
+            )
+
+    except Exception as e:
+        get_logger().error(f"[ai_concat_stream] AI调用初始化失败: {e}", trace_id=trace_id, model_id=model_id, 
+                          exc_info=True)
+        yield {"type": "error", "error": f"AI服务不可用: {e}"}

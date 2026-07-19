@@ -15,35 +15,39 @@ safe_exec:
     - \brmtree\b
     - \bshutil\.rmtree
     - \bClear-RecycleBin\b
+    - \buninstall\b
+    - uninstall
+    - \bunins\b
+    - unins
+    - --mod=uninstall
+    - \b/S\b
+    - \bmsiexec\s+/x\b
+    - \bStart-Process.*uninstall
 
   # 受保护路径模式：命中任一即拒绝执行
   protected_path_patterns:
     # 系统核心目录
-    - pattern: "(?i)[A-Z]:\\Windows\\"
+    - pattern: "(?i)[A-Z]:\\\\Windows\\\\"
       desc: "Windows 系统目录"
-    - pattern: "(?i)[A-Z]:\\Program Files\\"
-      desc: "Program Files 目录"
-    - pattern: "(?i)[A-Z]:\\Program Files \\(x86\\)\\"
-      desc: "Program Files (x86) 目录"
-    - pattern: "(?i)[A-Z]:\\ProgramData\\"
+    - pattern: "(?i)[A-Z]:\\\\ProgramData\\\\"
       desc: "ProgramData 目录"
     # 聊天记录数据库
-    - pattern: "(?i)WeChat Files\\.+?\\Msg[\\\\.]"
+    - pattern: "(?i)WeChat Files\\\\.+?\\\\Msg[\\\\.]"
       desc: "微信聊天记录数据库"
-    - pattern: "(?i)Tencent Files\\.+?\\Msg[0-9]"
+    - pattern: "(?i)Tencent Files\\\\.+?\\\\Msg[0-9]"
       desc: "QQ 聊天记录数据库"
-    - pattern: "(?i)DingTalk\\.+?\\db[\\\\.]"
+    - pattern: "(?i)DingTalk\\\\.+?\\\\db[\\\\.]"
       desc: "钉钉聊天记录数据库"
     # 安全凭据
-    - pattern: "(?i)\\\\.ssh\\"
+    - pattern: "(?i)\\\\\\\\.ssh\\\\"
       desc: "SSH 密钥目录"
-    - pattern: "(?i)\\\\.aws\\"
+    - pattern: "(?i)\\\\\\\\.aws\\\\"
       desc: "AWS 凭据目录"
-    - pattern: "(?i)\\\\.kube\\"
+    - pattern: "(?i)\\\\\\\\.kube\\\\"
       desc: "Kubernetes 配置目录"
-    - pattern: "(?i)\\\\.env$"
+    - pattern: "(?i)\\\\\\\\.env$"
       desc: "环境变量配置文件"
-    - pattern: "(?i)\\\\.git\\"
+    - pattern: "(?i)\\\\\\\\.git\\\\"
       desc: "Git 仓库数据"
 
   # 挑战短语
@@ -58,24 +62,21 @@ safe_exec:
       desc: "写入系统级注册表 (HKLM)"
       level: challenge
 
+  # 危险路径模式 — L2 挑战层
+  # 这些路径不再硬拦截，而是触发 challenge 授权弹窗
+  danger_path_patterns:
+    - pattern: "(?i)[A-Z]:\\\\Program Files\\\\"
+      desc: "修改 Program Files 目录"
+    - pattern: "(?i)[A-Z]:\\\\Program Files \\(x86\\)\\\\"
+      desc: "修改 Program Files (x86) 目录"
+
   # 这些模式始终拦截，不进入确认流程（Layer 1 硬拦截）
   always_blocked:
     - \bformat\s+\w:\b
     - \bformat\b
-    - \bdel\b
     - \bdel\s+/[fF]\s+/[sS]
-    - \brm\b
     - \brm\s+-rf\s+/
-    - \brmdir\b
-    - \brmdir\s+/[sS]\s+C:\\
-    - \brmtree\b
-    - \bshutil\.rmtree
-    - \bRemove-Item\b
-    - \bRemove-Item\b.*-Recurse
-    - \breg\s+delete\b
-    - \breg\s+delete\s+.*HKLM\b
-    - \breg\s+delete\s+.*HKEY_LOCAL_MACHINE\b
-    - \bClear-RecycleBin\b
+    - \brmdir\s+/[sS]\s+C:\\\\
     - \bdiskpart\s+clean\b
     - \bshutdown\s+/[sSrR]\s+/t\s+0\b
     - \bStop-Computer\b
@@ -137,6 +138,25 @@ file_tools:
     - Get-WmiObject
     - Get-CimInstance
     - Get-Content
+    # 常见开发工具命令（包管理 / 构建 / 编译）
+    - pip
+    - pip3
+    - npm
+    - pnpm
+    - cargo
+    - go
+    - dotnet
+    - mvn
+    - gradle
+    - make
+    - cmake
+    - gcc
+    - g++
+    - cl
+    - java
+    - javac
+    - jar
+    - rustc
 
   # 只读命令/PowerShell cmdlet 集合：不触发确认，直接执行
   readonly_patterns:
@@ -191,14 +211,39 @@ file_tools:
       - ping
       - tracert
       - nslookup
+      - powercfg
     # 文件比较 / 校验
     file_compare:
       - fc
       - comp
       - certutil
+    # 系统配置命令（低风险修改操作）
+    sys_config:
+      - powercfg
     # 其他
     other:
       - wmic
+      # 常见开发工具命令（包管理 / 构建 / 编译）
+      - pip
+      - pip3
+      - npm
+      - npx
+      - yarn
+      - pnpm
+      - cargo
+      - go
+      - dotnet
+      - mvn
+      - gradle
+      - make
+      - cmake
+      - gcc
+      - g++
+      - cl
+      - java
+      - javac
+      - jar
+      - rustc
 
   # 低风险注册表操作关键词：用户偏好类（桌面图标/任务栏/资源管理器外观）直接放行
   low_risk_registry_patterns:

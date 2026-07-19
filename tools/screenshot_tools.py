@@ -10,8 +10,11 @@ from . import register_tool
 
 def _get_screenshot_dir():
     """截图保存目录"""
-    project_dir = Path(__file__).parent.parent
-    ss_dir = project_dir / "workspace" / "screenshots"
+    try:
+        from config.settings import DATA_DIR
+    except ImportError:
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+    ss_dir = Path(DATA_DIR) / "workspace" / "screenshots"
     os.makedirs(ss_dir, exist_ok=True)
     return str(ss_dir)
 

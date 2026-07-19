@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- VERSION: 2026-07-11-12:25 — Ollama路由防御 + model_choice完整日志 -->
     <title>Tank_桌面前端</title>
     <style>
         /* --- 基础样式 --- */
@@ -272,6 +273,16 @@
             text-align: right;
             opacity: 0.6;
         }
+        .unsaved-badge {
+            display: inline-block;
+            background: #fef2f2;
+            color: #dc2626;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-top: 6px;
+            border: 1px solid #fecaca;
+        }
         
         .typing-indicator {
             display: none;
@@ -351,7 +362,7 @@
             100% { transform: translateX(-100%); }
         }
 
-        /* ── 命令确认卡片 ── */
+        /* ── 命令确认卡片（聊天流内横条模式）── */
         .confirm-card {
             padding: 14px 16px; margin-bottom: 10px;
             background: #fff8e1; border: 1px solid #ffc107;
@@ -395,6 +406,37 @@
         }
         .confirm-card .confirm-detail-val {
             color: #333; word-break: break-all;
+        }
+        .confirm-card .confirm-desc {
+            font-size: 13px; color: #666; margin-bottom: 12px;
+        }
+        .confirm-challenge-box {
+            background: #fff3e0; border: 1px solid #ffb74d;
+            border-radius: 6px; padding: 12px; margin-bottom: 12px;
+        }
+        .confirm-challenge-box .challenge-label {
+            font-size: 12px; color: #e65100; font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .confirm-challenge-box .challenge-phrase {
+            font-family: 'Consolas',monospace; font-size: 14px;
+            color: #bf360c; font-weight: bold;
+            padding: 8px 12px; background: #fff;
+            border-radius: 4px; border: 2px dashed #ff8a65;
+            text-align: center; margin-bottom: 10px;
+        }
+        .confirm-challenge-box .challenge-input {
+            width: 100%; padding: 10px 12px;
+            border: 1px solid #ffb74d; border-radius: 6px;
+            font-size: 14px; box-sizing: border-box;
+        }
+        .confirm-challenge-box .challenge-input:focus {
+            outline: none; border-color: #ff9800;
+            box-shadow: 0 0 0 3px rgba(255,152,0,0.2);
+        }
+        .confirm-challenge-box .challenge-input.error {
+            border-color: #f44336;
+            box-shadow: 0 0 0 3px rgba(244,67,54,0.2);
         }
 
         /* 可操作错误气泡 */
@@ -826,58 +868,6 @@
 
         <!-- 2. 右侧：聊天主界面 -->
         <div class="main-content">
-            <!-- 系统控制面板 -->
-            <div id="systemPanel" class="control-panel" style="
-                position: fixed;
-                top: 10px;
-                right: 10px;
-                background: white;
-                border: 1px solid #ddd;
-                border-radius: 8px;
-                padding: 15px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                z-index: 1000;
-                width: 250px;
-            ">
-                <h4 style="margin: 0 0 15px 0; color: #333; font-size: 16px;">系统控制中心</h4>
-                
-                <!-- 音量控制 -->
-                <div class="control-group" style="margin-bottom: 15px;">
-                    <label style="display: block; margin-bottom: 5px; font-size: 14px;">音量: <span id="volumeValue">50</span>%</label>
-                    <input type="range" id="volumeSlider" min="0" max="100" value="50" 
-                           style="width: 100%; margin-bottom: 5px;">
-                    <button onclick="setVolume('set_volume', 50)" style="width: 48%; margin-right: 2%; padding: 4px; font-size: 12px;">设为50%</button>
-                    <button onclick="setVolume('toggle_mute')" style="width: 48%; margin-left: 2%; padding: 4px; font-size: 12px;">静音</button>
-                </div>
-                
-                <!-- 亮度控制 -->
-                <div class="control-group" style="margin-bottom: 15px;">
-                    <label style="display: block; margin-bottom: 5px; font-size: 14px;">亮度: <span id="brightnessValue">80</span>%</label>
-                    <input type="range" id="brightnessSlider" min="10" max="100" value="80"
-                           style="width: 100%; margin-bottom: 5px;">
-                    <button onclick="setBrightness(80)" style="width: 100%; padding: 4px; font-size: 12px;">恢复默认</button>
-                </div>
-                
-                <!-- 快捷按钮 -->
-                <div class="control-group">
-                    <button onclick="takeScreenshot()" style="width: 100%; padding: 6px; margin-bottom: 8px; font-size: 14px;">截图保存</button>
-                    <button onclick="openTaskManager()" style="width: 48%; margin-right: 2%; padding: 6px; font-size: 14px;">任务管理</button>
-                    <button onclick="showSystemInfo()" style="width: 48%; margin-left: 2%; padding: 6px; font-size: 14px;">系统信息</button>
-                </div>
-                
-                <button onclick="toggleSystemPanel()" style="
-                    position: absolute;
-                    top: 5px;
-                    right: 5px;
-                    background: #f0f0f0;
-                    border: 1px solid #ccc;
-                    border-radius: 3px;
-                    width: 20px;
-                    height: 20px;
-                    font-size: 12px;
-                    cursor: pointer;
-                ">×</button>
-            </div>
             
             <div class="header">
                 <h1>🤖 AI Agent</h1>
@@ -885,34 +875,6 @@
             </div>
             
             <div class="chat-area" id="chatArea">
-                <!-- Office文件拖放区 -->
-                <div id="officeDropZone" class="drop-zone" style="
-                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-                    border: 3px dashed #4CAF50;
-                    border-radius: 12px;
-                    padding: 30px;
-                    text-align: center;
-                    margin: 20px 0;
-                    cursor: pointer;
-                    transition: all 0.3s ease;
-                ">
-                    <div style="font-size: 48px; margin-bottom: 15px;">📄</div>
-                    <h3 style="color: #333; margin: 0 0 10px 0;">Office文档智能处理</h3>
-                    <p style="color: #666; margin: 0 0 20px 0;">拖放Excel、Word、PPT文件到此处，我将为您：</p>
-                    
-                    <div style="display: flex; justify-content: space-around; margin: 20px 0; font-size: 14px;">
-                        <div>📊 Excel分析图表</div>
-                        <div>📝 Word内容提取</div>
-                        <div>🎯 PPT内容总结</div>
-                    </div>
-                    
-                    <div id="dropZoneText" style="color: #4CAF50; font-weight: bold;">
-                        拖放文件到此处或点击选择文件
-                    </div>
-                    
-                    <input type="file" id="fileInput" multiple accept=".xlsx,.xls,.docx,.doc,.pptx,.ppt,.txt" 
-                           style="display: none;">
-                </div>
                 
                 <!-- 文件处理结果展示 -->
                 <div id="processingResults" style="
@@ -1088,17 +1050,26 @@
 			return `${hh}:${mm}:${ss}`;
 		}
 
-		function appendMessage(sender, text, msgType = 'chat', timestamp = null) {
+		function cleanAIResponse(text) {
+			let cleaned = text || '';
+			cleaned = cleaned.replace(/```reasoning\s*[\s\S]*?\s*```/g, '').trim();
+			cleaned = cleaned.replace(/```action\s*[\s\S]*?\s*```/g, '').trim();
+			cleaned = cleaned.replace(/```json\s*[\s\S]*?\s*```/g, '').trim();
+			return cleaned;
+		}
+
+		function appendMessage(sender, text, msgType = 'chat', timestamp = null, unsaved = false) {
 			if (msgType === 'think') {
-				// 折叠思考块
 				const block = document.createElement('div');
 				block.className = 'think-block';
+				const cleanedText = cleanAIResponse(text);
+				const escaped = escapeHtml(cleanedText).replace(/\n/g, '<br>');
 				block.innerHTML = `
 					<div class="think-header" onclick="this.parentElement.classList.toggle('open')">
 						<span class="think-arrow">&#9654;</span>
 						<span>AI 思考过程</span>
 					</div>
-					<div class="think-body">${escapeHtml(text)}</div>
+					<div class="think-body">${escaped}</div>
 				`;
 				chatContainer.insertBefore(block, typingIndicator);
 				chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -1108,7 +1079,11 @@
 			msgDiv.className = `message ${sender}-message`;
 			const bubble = document.createElement('div');
 			bubble.className = 'bubble';
-			bubble.innerHTML = renderMarkdown(text);
+			let displayText = text;
+			if (sender === 'ai') {
+				displayText = cleanAIResponse(text);
+			}
+			bubble.innerHTML = renderMarkdown(displayText);
 			const timeSpan = document.createElement('div');
 			timeSpan.className = 'message-time';
 			timeSpan.textContent = formatTime(timestamp || new Date());
@@ -1122,6 +1097,14 @@
 			} else {
 				msgDiv.appendChild(avatar);
 				msgDiv.appendChild(bubble);
+				// 未持久化标记：仅实时 SSE 消息标记，历史加载消息不标记
+				if (unsaved) {
+					msgDiv.dataset.unsaved = 'true';
+					const badge = document.createElement('span');
+					badge.className = 'unsaved-badge';
+					badge.textContent = '数据异常';
+					bubble.appendChild(badge);
+				}
 			}
 			chatContainer.insertBefore(msgDiv, typingIndicator);
 			chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -1172,7 +1155,53 @@
 
 		function renderChatHistory(messages) {
 			clearChatArea();
-			messages.forEach(msg => appendMessage(msg.sender, msg.text, msg.msgType || 'chat', msg.timestamp));
+			// 不做去重：同内容消息（如连续发送相同文本）应全部展示
+			const unique = messages;
+			
+			const groups = [];
+			let currentGroup = { user: null, thinks: [], replies: [] };
+			
+			for (let i = 0; i < unique.length; i++) {
+				const msg = unique[i];
+				if (msg.msgType === 'chat' && msg.sender === 'user') {
+					if (currentGroup.user || currentGroup.thinks.length > 0 || currentGroup.replies.length > 0) {
+						groups.push(currentGroup);
+					}
+					currentGroup = { user: msg, thinks: [], replies: [] };
+				} else if (msg.msgType === 'think') {
+					currentGroup.thinks.push(msg);
+				} else if (msg.msgType === 'chat' && msg.sender === 'ai') {
+					currentGroup.replies.push(msg);
+				}
+			}
+			if (currentGroup.user || currentGroup.thinks.length > 0 || currentGroup.replies.length > 0) {
+				groups.push(currentGroup);
+			}
+			
+			for (let g = 0; g < groups.length; g++) {
+				const group = groups[g];
+				if (group.user) {
+					appendMessage(group.user.sender, group.user.text, group.user.msgType, group.user.timestamp);
+				}
+				if (group.thinks.length > 0) {
+					let combinedThink = '';
+					for (let t = 0; t < group.thinks.length; t++) {
+						const thinkText = group.thinks[t].text.trim();
+						if (thinkText && !combinedThink.includes(thinkText)) {
+							if (combinedThink) combinedThink += '\n';
+							combinedThink += thinkText;
+						}
+					}
+					if (combinedThink) {
+						const firstThinkTs = group.thinks[0].timestamp;
+						appendMessage('ai', combinedThink, 'think', firstThinkTs);
+					}
+				}
+				for (let r = 0; r < group.replies.length; r++) {
+					const reply = group.replies[r];
+					appendMessage(reply.sender, reply.text, reply.msgType, reply.timestamp);
+				}
+			}
 		}
 
 		function renderSessionList() {
@@ -1281,7 +1310,7 @@
 					sessions[sess.id] = {
 						id: sess.id,
 						title: sess.title || '未命名',
-						messages: sess.messages || [],
+						messages: [],
 						createdAt: sess.created_at ? new Date(sess.created_at) : new Date()
 					};
 				}
@@ -1300,6 +1329,10 @@
 				}
 			} catch (error) {
 				console.error("加载会话失败:", error);
+				// 如果加载失败，创建一个新会话
+				if (!currentSessionId) {
+					await createNewSession();
+				}
 			}
 		}
 
@@ -1342,15 +1375,22 @@
 		async function saveSessionToBackend(sessionId) {
 			try {
 				const sessionData = sessions[sessionId];
+				const allMessages = sessionData.messages.filter(m => m.text && m.text.trim());
 				await fetch('/api/sessions', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
 						id: sessionData.id,
 						title: sessionData.title,
-						messages: sessionData.messages,
+						messages: allMessages,
 						created_at: sessionData.createdAt.toISOString()
 					})
+				});
+				// 持久化成功，清除当前会话所有"数据异常"标记
+				document.querySelectorAll('[data-unsaved="true"]').forEach(el => {
+					delete el.dataset.unsaved;
+					const badge = el.querySelector('.unsaved-badge');
+					if (badge) badge.remove();
 				});
 			} catch (error) {
 				console.error('保存会话失败:', error);
@@ -1495,7 +1535,11 @@
 
 		async function sendMessage() {
 			const text = messageInput.value.trim();
-			if ((!text && pendingFiles.length === 0) || !currentSessionId || isSending) return;
+			console.log('[DEBUG] sendMessage called, text:', text, 'currentSessionId:', currentSessionId, 'isSending:', isSending);
+			if ((!text && pendingFiles.length === 0) || !currentSessionId || isSending) {
+				console.log('[DEBUG] sendMessage returning early');
+				return;
+			}
 
 			if (hasActiveSession && activeSessionId !== currentSessionId) {
 				alert(`会话 "${activeSessionId}" 正在运行中，请等待它完成后再发送新消息。`);
@@ -1529,11 +1573,18 @@
 
 			try {
 			const userTimestamp = new Date().toISOString();
+			const msgId = generateUUID();
 			appendMessage('user', finalMessage, 'chat', userTimestamp);
-			// 立即保存用户消息到本地缓存，避免流式过程中丢失
 			if (sessions[requestSessionId]) {
-				sessions[requestSessionId].messages.push({ sender: 'user', text: finalMessage, msgType: 'chat', timestamp: userTimestamp, msgId: generateUUID() });
+				sessions[requestSessionId].messages.push({
+					sender: 'user',
+					text: finalMessage,
+					msgType: 'chat',
+					timestamp: userTimestamp,
+					msgId: msgId
+				});
 			}
+			saveSessionToBackend(requestSessionId);
 
 			// 问题3：显示脉冲加载动画（替代纯文字 typing indicator）
 			typingIndicator.style.display = 'none';
@@ -1547,21 +1598,12 @@
 					slowHint.style.display = 'flex';
 				}
 			}, 3000);
+			
+			let timeoutTimer = null;
 
-			// 创建思考过程折叠块（等待流式填充）
-			const thinkBlock = document.createElement('div');
-			thinkBlock.className = 'think-block';
-			thinkBlock.innerHTML = `
-				<div class="think-header" onclick="this.parentElement.classList.toggle('open')">
-					<span class="think-arrow">&#9654;</span>
-					<span>AI 思考过程</span>
-				</div>
-				<div class="think-body"></div>
-			`;
-			chatContainer.insertBefore(thinkBlock, typingIndicator);
-			const thinkBody = thinkBlock.querySelector('.think-body');
 			let hasThinking = false;
 			let thinkContent = '';
+			let currentThinkBlockId = 'think-' + generateUUID();
 
 			try {
 				const modelValue = modelSelect.value;
@@ -1570,15 +1612,40 @@
 				if (modelValue) {
 					try {
 						const parsed = JSON.parse(modelValue);
-						modelChoice = { display: parsed.display };
+						modelChoice = { display: parsed.display, provider: parsed.provider, model: parsed.model, id: parsed.id, base_url: parsed.base_url };
 						modelId = parsed.id || null;
+						// 防御：如果选项中缺 provider/model（Stale page），记警告并由后端补全
+						if (!modelChoice.provider || !modelChoice.model) {
+							console.warn('[MODEL] 下拉选项缺 provider/model，将由后端补全：', modelChoice);
+						}
 					} catch(e) {
+						console.warn('[MODEL] modelSelect.value 不是合法 JSON：', modelValue, e);
 						modelChoice = { display: modelValue };
 					}
 				}
 
 				// 问题4：每会话独立的 AbortController
 				sessionAbortControllers[requestSessionId] = new AbortController();
+				const abortCtrl = sessionAbortControllers[requestSessionId];
+				
+				// 全局请求超时：600秒没有任何响应则自动取消（包含工具执行和确认等待时间）
+				timeoutTimer = setTimeout(() => {
+					if (abortCtrl.signal.aborted) return;
+					abortCtrl.abort();
+					console.warn('[TIMEOUT] Request timed out after 600s');
+					pulseSpinner.style.display = 'none';
+					slowHint.style.display = 'none';
+					typingIndicator.style.display = 'none';
+					appendMessage('ai', '错误: 请求超时（600s 无响应），请检查 API Key 配置或网络连接');
+				}, 600000);
+				
+				console.log('[DEBUG] About to fetch /api/chat with data:', {
+					message: finalMessage,
+					session_id: requestSessionId,
+					model_choice: modelChoice,
+					model_id: modelId
+				});
+				console.log('[DEBUG] fetch /api/chat called');
 				const response = await fetch('/api/chat', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
@@ -1586,16 +1653,20 @@
 						message: finalMessage,
 						session_id: requestSessionId,
 						model_choice: modelChoice,
-						model_id: modelId
+						model_id: modelId,
+						msg_id: msgId
 					}),
-					signal: sessionAbortControllers[requestSessionId].signal,
+					signal: abortCtrl.signal,
 					keepalive: true
 				});
+
+				console.log('[DEBUG] fetch /api/chat response received, status:', response.status, 'content-type:', response.headers.get('Content-Type'));
 
 				// 非 SSE 响应（如 JSON 错误），直接展示错误信息
 				const contentType = response.headers.get('Content-Type') || '';
 				if (!contentType.includes('text/event-stream')) {
 					clearTimeout(slowTimer);
+					clearTimeout(timeoutTimer);
 					pulseSpinner.style.display = 'none';
 					typingIndicator.style.display = 'none';
 					let errMsg = '未知错误';
@@ -1604,7 +1675,6 @@
 						errMsg = errData.message || JSON.stringify(errData);
 					} catch(e) {}
 					appendMessage('ai', '错误: ' + errMsg);
-					if (thinkBlock.parentNode) thinkBlock.remove();
 					return;
 				}
 
@@ -1624,15 +1694,40 @@
 						if (!line.startsWith('data: ')) continue;
 						try {
 							const data = JSON.parse(line.slice(6));
+							console.log('[SSE] received:', data.type, data);
 							switch (data.type) {
-								case 'thinking':
+								case 'heartbeat':
+									console.log('[SSE] heartbeat received, hasThinking:', hasThinking, 'status:', data.status);
+									clearTimeout(slowTimer);
+									clearTimeout(timeoutTimer);
+									break;
+								case 'reasoning':
 									clearTimeout(slowTimer);
 									pulseSpinner.style.display = 'none';
 									slowHint.style.display = 'none';
 									hasThinking = true;
 									thinkContent += data.text;
-									thinkBody.style.display = 'block';
-									thinkBody.textContent = thinkContent;
+									let existingThinkBlock = document.getElementById(currentThinkBlockId);
+									if (existingThinkBlock) {
+										const thinkBody = existingThinkBlock.querySelector('.think-body');
+										if (thinkBody) {
+											thinkBody.innerHTML = escapeHtml(thinkContent).replace(/\n/g, '<br>');
+											existingThinkBlock.classList.add('open');
+										}
+									} else {
+										const block = document.createElement('div');
+										block.id = currentThinkBlockId;
+										block.className = 'think-block open';
+										const escaped = escapeHtml(thinkContent).replace(/\n/g, '<br>');
+										block.innerHTML = `
+											<div class="think-header" onclick="this.parentElement.classList.toggle('open')">
+												<span class="think-arrow">&#9654;</span>
+												<span>AI 思考过程</span>
+											</div>
+											<div class="think-body">${escaped}</div>
+										`;
+										chatContainer.insertBefore(block, typingIndicator);
+									}
 									autoScrollToBottom();
 									break;
 								case 'step':
@@ -1642,8 +1737,29 @@
 									hasThinking = true;
 									const stepText = '\n【' + data.status + '】' + data.text;
 									thinkContent += stepText;
-									thinkBody.style.display = 'block';
-									thinkBody.textContent = thinkContent;
+									
+									let stepThinkBlock = document.getElementById(currentThinkBlockId);
+									if (stepThinkBlock) {
+										const stepThinkBody = stepThinkBlock.querySelector('.think-body');
+										if (stepThinkBody) {
+											stepThinkBody.innerHTML = escapeHtml(thinkContent).replace(/\n/g, '<br>');
+											stepThinkBlock.classList.add('open');
+										}
+									} else {
+										const block = document.createElement('div');
+										block.id = currentThinkBlockId;
+										block.className = 'think-block open';
+										const escaped = escapeHtml(thinkContent).replace(/\n/g, '<br>');
+										block.innerHTML = `
+											<div class="think-header" onclick="this.parentElement.classList.toggle('open')">
+												<span class="think-arrow">&#9654;</span>
+												<span>AI 思考过程</span>
+											</div>
+											<div class="think-body">${escaped}</div>
+										`;
+										chatContainer.insertBefore(block, typingIndicator);
+									}
+									
 									// 工具执行进度（CSS 不定长动画，不依赖超时预测）
 									if (data.tool_name) {
 										tpName.textContent = data.tool_name;
@@ -1652,18 +1768,24 @@
 									autoScrollToBottom();
 									break;
 								case 'confirm':
-									// 通用确认卡片：标题 + 详情（命令/下载等均可）
 									clearTimeout(slowTimer);
 									pulseSpinner.style.display = 'none';
 									slowHint.style.display = 'none';
 									resetToolProgress();
+									hasThinking = true;
+									thinkContent += '\n⚠️ 等待用户确认操作...';
 									{
+										const token = data.confirmation_token;
+										const challengePhrase = data.challenge_phrase;
+										const isHighRisk = !!challengePhrase;
+										
 										const card = document.createElement('div');
 										card.className = 'confirm-card';
-										card.id = 'confirm-' + data.confirmation_token;
-										const title = data.title || '⚠ 操作需要确认';
+										card.id = 'confirm-' + token;
+										const title = data.title || (isHighRisk ? '🔴 高危操作需要授权' : '⚠️ 操作需要确认');
+										const desc = data.message || (isHighRisk ? '此操作存在较高风险，请完整输入授权文字以确认执行。' : '请确认是否执行此操作。');
 										const isDownload = data.tool_name === 'web_download';
-										const btnText = isDownload ? '确认下载' : '确认执行';
+										const btnText = isDownload ? '确认下载' : (isHighRisk ? '确认授权' : '确认执行');
 										let bodyHtml = '';
 										if (data.details && Object.keys(data.details).length > 0) {
 											bodyHtml = '<div class="confirm-details">';
@@ -1674,68 +1796,170 @@
 										} else if (data.command) {
 											bodyHtml = `<div class="confirm-cmd">${escapeHtml(data.command)}</div>`;
 										}
+										const challengeHtml = isHighRisk ? `
+											<div class="confirm-challenge-box">
+												<div class="challenge-label">🔴 请输入授权文字确认此高危操作</div>
+												<div class="challenge-phrase">${escapeHtml(challengePhrase)}</div>
+												<input type="text" id="challenge-${token}" class="challenge-input" placeholder="在此输入授权文字..." autocomplete="off">
+											</div>` : '';
 										card.innerHTML = `
 											<div class="confirm-header">${escapeHtml(title)}</div>
+											<div class="confirm-desc">${escapeHtml(desc)}</div>
 											${bodyHtml}
+											${challengeHtml}
 											<div class="confirm-actions">
 												<button class="btn-confirm-ok" data-action="confirm">${btnText}</button>
 												<button class="btn-confirm-cancel" data-action="cancel">取消</button>
 											</div>
 										`;
-										chatContainer.insertBefore(card, typingIndicator);
+										
+										const msgDiv = document.createElement('div');
+										msgDiv.className = 'message ai-message';
+										const bubble = document.createElement('div');
+										bubble.className = 'bubble';
+										bubble.appendChild(card);
+										const avatar = document.createElement('div');
+										avatar.className = 'avatar ai-avatar';
+										avatar.textContent = 'AI';
+										msgDiv.appendChild(avatar);
+										msgDiv.appendChild(bubble);
+										chatContainer.insertBefore(msgDiv, typingIndicator);
 										autoScrollToBottom();
-										const token = data.confirmation_token;
+										
 										card.querySelector('.btn-confirm-ok').addEventListener('click', async () => {
-											card.querySelector('.confirm-actions').innerHTML = '<span style="color:#888;font-size:12px">正在执行...</span>';
+											if (isHighRisk) {
+												const challengeInput = document.getElementById('challenge-' + token);
+												const challengeResp = challengeInput ? challengeInput.value.trim() : '';
+												if (!challengeResp) {
+													challengeInput.classList.add('error');
+													challengeInput.placeholder = '请输入授权文字';
+													return;
+												}
+												if (challengeResp !== challengePhrase) {
+													challengeInput.classList.add('error');
+													challengeInput.value = '';
+													challengeInput.placeholder = '授权文字不匹配，请重新输入';
+													return;
+												}
+											}
+											const okBtn = card.querySelector('.btn-confirm-ok');
+											okBtn.disabled = true;
+											okBtn.textContent = '正在执行...';
+											okBtn.style.background = '#ccc';
+											const challengeInput = document.getElementById('challenge-' + token);
+											const challengeResp = challengeInput ? challengeInput.value.trim() : '';
+											const cancelBtn = card.querySelector('.btn-confirm-cancel');
+											cancelBtn.disabled = true;
 											await fetch('/api/confirm', {
 												method: 'POST',
 												headers: { 'Content-Type': 'application/json' },
-												body: JSON.stringify({ confirmation_token: token, confirmed: true })
+												body: JSON.stringify({ confirmation_token: token, confirmed: true, challenge_response: challengeResp })
 											});
-											card.remove();
+											thinkContent += `\n✅ 用户已确认${isHighRisk ? '授权' : ''}`;
+											msgDiv.remove();
 										});
 										card.querySelector('.btn-confirm-cancel').addEventListener('click', async () => {
-											card.querySelector('.confirm-actions').innerHTML = '<span style="color:#c62828;font-size:12px">已取消</span>';
-											setTimeout(() => card.remove(), 1500);
+											const cancelBtn = card.querySelector('.btn-confirm-cancel');
+											cancelBtn.disabled = true;
+											cancelBtn.textContent = '已取消';
+											cancelBtn.style.background = '#e57373';
+											cancelBtn.style.color = '#fff';
 											await fetch('/api/confirm', {
 												method: 'POST',
 												headers: { 'Content-Type': 'application/json' },
 												body: JSON.stringify({ confirmation_token: token, confirmed: false })
 											});
+											msgDiv.remove();
 										});
 									}
 									break;
-								case 'final':
+								case 'tool_call':
 									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
+									hasThinking = true;
+									thinkContent += `\n🔧 调用工具: ${data.tool_name}`;
+									tpName.textContent = data.tool_name;
+									toolProgress.style.display = 'block';
+									autoScrollToBottom();
+									break;
+							case 'tool_result':
+									clearTimeout(slowTimer);
+									pulseSpinner.style.display = 'none';
+									slowHint.style.display = 'none';
+									hasThinking = true;
+									toolProgress.style.display = 'none';
+									const toolCallPrefix = `\n🔧 调用工具: ${data.tool_name}`;
+									const toolResultPrefix = data.status === 'success' ? '✅' : '❌';
+									const toolResultMsg = data.error ? ` (${data.error})` : '';
+									if (thinkContent.includes(toolCallPrefix)) {
+										thinkContent = thinkContent.replace(toolCallPrefix, `\n${toolResultPrefix} 调用工具: ${data.tool_name} ${data.status}${toolResultMsg}`);
+									} else {
+										thinkContent += `\n${toolResultPrefix} ${data.tool_name}: ${data.status}${toolResultMsg}`;
+									}
+									autoScrollToBottom();
+									break;
+							case 'final':
+									clearTimeout(slowTimer);
+									clearTimeout(timeoutTimer);
 									pulseSpinner.style.display = 'none';
 									slowHint.style.display = 'none';
 									typingIndicator.style.display = 'none';
 									resetToolProgress();
-									appendMessage('ai', data.text, 'chat', data.timestamp);
-									// 思考区域折叠回默认状态
-									if (hasThinking) {
-										thinkBlock.classList.remove('open');
-										thinkBody.style.display = '';
-									} else {
-										thinkBlock.remove();
-									}
-									// 问题4：使用 requestSessionId 而非 currentSessionId
-									if (sessions[requestSessionId]) {
-										if (hasThinking) {
-											sessions[requestSessionId].messages.push({ sender: 'ai', text: thinkContent, msgType: 'think', timestamp: data.timestamp, msgId: generateUUID() });
+									if (hasThinking && thinkContent.trim()) {
+										const existingThink = sessions[requestSessionId].messages.find(m => m.msgType === 'think' && m.text === thinkContent);
+										if (!existingThink) {
+											const thinkMsg = { sender: 'ai', text: thinkContent, msgType: 'think', timestamp: data.timestamp, msgId: generateUUID() };
+											const lastUserMsgIndex = sessions[requestSessionId].messages.findLastIndex(m => m.sender === 'user');
+											if (lastUserMsgIndex !== -1) {
+												sessions[requestSessionId].messages.splice(lastUserMsgIndex + 1, 0, thinkMsg);
+											} else {
+												sessions[requestSessionId].messages.push(thinkMsg);
+											}
+											const existingThinkBlock = document.getElementById(currentThinkBlockId);
+											if (!existingThinkBlock) {
+												appendMessage('ai', thinkContent, 'think', data.timestamp);
+											} else {
+												const thinkBody = existingThinkBlock.querySelector('.think-body');
+												if (thinkBody) {
+													thinkBody.innerHTML = escapeHtml(thinkContent).replace(/\n/g, '<br>');
+												}
+											}
 										}
-										sessions[requestSessionId].messages.push({ sender: 'ai', text: data.text, msgType: 'chat', timestamp: data.timestamp, msgId: generateUUID() });
+									}
+									if (data.text && data.text.trim()) {
+										appendMessage('ai', data.text, 'chat', data.timestamp, true);
 									}
 									autoScrollToBottom();
 									break;
 								case 'error':
 									clearTimeout(slowTimer);
+									clearTimeout(timeoutTimer);
 									pulseSpinner.style.display = 'none';
 									slowHint.style.display = 'none';
 									typingIndicator.style.display = 'none';
 									resetToolProgress();
-									appendMessage('ai', '错误: ' + (data.text || '未知错误'));
-									thinkBlock.remove();
+									const errorText = '错误: ' + (data.text || '未知错误');
+									const existingError = sessions[requestSessionId].messages.find(m => m.msgType === 'chat' && m.text === errorText);
+									if (!existingError) {
+										if (hasThinking && thinkContent.trim()) {
+											const existingThink = sessions[requestSessionId].messages.find(m => m.msgType === 'think' && m.text === thinkContent);
+											if (!existingThink) {
+												const thinkMsg = { sender: 'ai', text: thinkContent, msgType: 'think', timestamp: new Date().toISOString(), msgId: generateUUID() };
+												const lastUserMsgIndex = sessions[requestSessionId].messages.findLastIndex(m => m.sender === 'user');
+												if (lastUserMsgIndex !== -1) {
+													sessions[requestSessionId].messages.splice(lastUserMsgIndex + 1, 0, thinkMsg);
+												} else {
+													sessions[requestSessionId].messages.push(thinkMsg);
+												}
+												const existingThinkBlock = document.getElementById(currentThinkBlockId);
+												if (!existingThinkBlock) {
+													appendMessage('ai', thinkContent, 'think', new Date().toISOString());
+												}
+											}
+										}
+										appendMessage('ai', errorText, 'chat', null, true);
+									}
 									break;
 							}
 						} catch(e) {
@@ -1745,6 +1969,7 @@
 				}
 
 				// 异常结束处理
+				clearTimeout(timeoutTimer);
 				if (pulseSpinner.style.display !== 'none') {
 					pulseSpinner.style.display = 'none';
 				}
@@ -1753,20 +1978,31 @@
 				}
 				if (typingIndicator.style.display !== 'none') {
 					typingIndicator.style.display = 'none';
-					thinkBody.style.display = '';
 				}
-				// 问题4：使用 requestSessionId
+				if (hasThinking && thinkContent.trim()) {
+					const existingThink = sessions[requestSessionId].messages.find(m => m.msgType === 'think' && m.text === thinkContent);
+					if (!existingThink) {
+						const thinkMsg = { sender: 'ai', text: thinkContent, msgType: 'think', timestamp: new Date().toISOString(), msgId: generateUUID() };
+						const lastUserMsgIndex = sessions[requestSessionId].messages.findLastIndex(m => m.sender === 'user');
+						if (lastUserMsgIndex !== -1) {
+							sessions[requestSessionId].messages.splice(lastUserMsgIndex + 1, 0, thinkMsg);
+						} else {
+							sessions[requestSessionId].messages.push(thinkMsg);
+						}
+					}
+				}
 				saveSessionToBackend(requestSessionId);
 			} catch (error) {
 				clearTimeout(slowTimer);
+				clearTimeout(timeoutTimer);
 				pulseSpinner.style.display = 'none';
 				slowHint.style.display = 'none';
 				typingIndicator.style.display = 'none';
 				resetToolProgress();
 				if (error.name !== 'AbortError') {
-					appendMessage('ai', '网络错误: ' + error.message);
+					appendMessage('ai', '网络错误: ' + error.message, 'chat', null, true);
 				}
-				if (thinkBlock.parentNode) thinkBlock.remove();
+				saveSessionToBackend(requestSessionId);
 			}
 		} catch (e) {
 			pulseSpinner.style.display = 'none';
@@ -1810,6 +2046,7 @@
 		// 6. 初始化（唯一监听器）
 		// ============================
 		window.addEventListener('DOMContentLoaded', async () => {
+			console.log('[VERSION] 2026-07-11-12:25 — Ollama路由防御 + model_choice完整日志');
 			// 加载模型列表
 			try {
 				const response = await fetch('/api/models');
@@ -1818,7 +2055,7 @@
 				modelSelect.innerHTML = '';
 				models.forEach(item => {
 					const option = document.createElement('option');
-					option.value = JSON.stringify({ display: item.display, id: item.id || '' });
+					option.value = JSON.stringify({ display: item.display, id: item.id || '', provider: item.provider, model: item.model, base_url: item.base_url });
 					option.textContent = item.display || `${item.provider} - ${item.model}`;
 					modelSelect.appendChild(option);
 				});
@@ -1852,7 +2089,9 @@
 
 			// 加载会话列表
 			await loadSessions();
+			console.log('[DEBUG] Sessions loaded, currentSessionId:', currentSessionId, 'sessions count:', Object.keys(sessions).length);
 			if (!currentSessionId) {
+				console.log('[DEBUG] No currentSessionId, creating new session');
 				await createNewSession();
 			}
 			
@@ -1863,6 +2102,7 @@
 			// 事件绑定
 			newChatBtn.addEventListener('click', () => createNewSession());
 			sendButton.addEventListener('click', () => {
+				console.log('[DEBUG] sendButton clicked, isSending:', isSending, 'currentSessionId:', currentSessionId);
 				if (isSending) {
 					// 停止当前请求
 					const ctrl = sessionAbortControllers[currentSessionId];
@@ -1989,17 +2229,17 @@
 					const isActive = m.id === modelsConfig.active_model_id;
 					const card = document.createElement('div');
 					card.className = 'model-card' + (isActive ? ' active' : '');
-					card.innerHTML = `
-						<div class="model-card-info">
-							<div class="model-card-name">${m.name || m.model}${isActive ? ' &#10003;' : ''}</div>
-							<div class="model-card-detail">${m.provider} &middot; ${m.model} &middot; temp=${m.temperature || 0.3} &middot; ${m.base_url || ''}</div>
-						</div>
-						<div class="model-card-actions">
-							${!isActive ? `<button class="set-active" onclick="setActiveModel('${m.id}')">启用</button>` : '<span style="color:#22c55e;font-size:12px">当前使用</span>'}
-							<button onclick="editModel(${i})">编辑</button>
-							<button class="danger" onclick="deleteModel(${i})">删除</button>
-						</div>
-					`;
+					card.innerHTML = '\
+						<div class="model-card-info">\
+							<div class="model-card-name">' + (m.name || m.model) + (isActive ? ' &#10003;' : '') + '</div>\
+							<div class="model-card-detail">' + m.provider + ' &middot; ' + m.model + ' &middot; temp=' + (m.temperature || 0.3) + ' &middot; ' + (m.base_url || '') + '</div>\
+						</div>\
+						<div class="model-card-actions">\
+							' + (!isActive ? '<button class="set-active" onclick="setActiveModel(\'' + m.id + '\')">启用</button>' : '<span style="color:#22c55e;font-size:12px">当前使用</span>') + '\
+							<button onclick="editModel(' + i + ')">编辑</button>\
+							<button class="danger" onclick="deleteModel(' + i + ')">删除</button>\
+						</div>\
+					';
 					modelList.appendChild(card);
 				});
 			}
@@ -2090,7 +2330,7 @@
 					modelSelect.innerHTML = '';
 					models.forEach(m => {
 						const opt = document.createElement('option');
-						opt.value = JSON.stringify({ display: m.display, id: m.id || '' });
+						opt.value = JSON.stringify({ display: m.display, id: m.id || '', provider: m.provider, model: m.model, base_url: m.base_url });
 						opt.textContent = m.display;
 						modelSelect.appendChild(opt);
 					});
@@ -2192,55 +2432,9 @@
 		});
 		});
 
-	// =====================================
-	// GUI增强功能 - 系统控制面板
-	// =====================================
 
-	// 系统控制面板JavaScript函数
 
-	// 音量控制
-	function setVolume(operation, value = 50) {
-	    const volumeSlider = document.getElementById('volumeSlider');
-	    const volumeValue = document.getElementById('volumeValue');
-	    
-	    if (operation === 'set_volume') {
-	        volumeSlider.value = value;
-	        volumeValue.textContent = value;
-	    }
-	    
-	    // 调用Agent的音量控制工具
-	    sendQuickCommand(`帮我调整音量为${value}%`);
-	    
-	    // 也可以直接调用API（如果实现了后端接口）
-	    // fetch('/api/system/volume', {
-	    //     method: 'POST',
-	    //     headers: {'Content-Type': 'application/json'},
-	    //     body: JSON.stringify({operation, value})
-	    // });
-	}
 
-	// 亮度控制
-	function setBrightness(value) {
-	    const brightnessSlider = document.getElementById('brightnessSlider');
-	    const brightnessValue = document.getElementById('brightnessValue');
-	    
-	    brightnessSlider.value = value;
-	    brightnessValue.textContent = value;
-	    
-	    // 调用Agent的亮度控制工具
-	    sendQuickCommand(`帮我调整屏幕亮度为${value}%`);
-	    
-	    console.log(`设置亮度: ${value}%`);
-	}
-
-	// 截图功能  
-	function takeScreenshot() {
-	    // 调用Agent的截图工具
-	    sendQuickCommand("请帮我截图并保存到工作空间");
-	    
-	    console.log('执行截图操作');
-	    alert('截图命令已发送，请查看Agent执行结果');
-	}
 
 	// 任务管理器
 	function openTaskManager() {
@@ -2265,64 +2459,31 @@
 	    }
 	}
 
-	// 面板显示/隐藏切换
-	function toggleSystemPanel() {
-	    const panel = document.getElementById('systemPanel');
-	    if (panel.style.display === 'none') {
-	        panel.style.display = 'block';
-	    } else {
-	        panel.style.display = 'none';
-	    }
-	}
 
 	// 绑定滑块事件
 	document.addEventListener('DOMContentLoaded', function() {
 	    const volumeSlider = document.getElementById('volumeSlider');
 	    const brightnessSlider = document.getElementById('brightnessSlider');
 	    
-	    if (volumeSlider) {
-	        volumeSlider.addEventListener('input', function() {
-	            document.getElementById('volumeValue').textContent = this.value;
-	        });
-	        
-	        volumeSlider.addEventListener('change', function() {
-	            setVolume('set_volume', parseInt(this.value));
-	        });
-	    }
+    if (volumeSlider) {
+        volumeSlider.addEventListener('input', function() {
+            document.getElementById('volumeValue').textContent = this.value;
+        });
+    }
 	    
 	    if (brightnessSlider) {
 	        brightnessSlider.addEventListener('input', function() {
 	            document.getElementById('brightnessValue').textContent = this.value;
 	        });
-	        
-	        brightnessSlider.addEventListener('change', function() {
-	            setBrightness(parseInt(this.value));
-	        });
-	    }
-	    
-	    console.log('系统控制面板加载完成');
-	});
+        
+    }
+    
+    console.log('面板加载完成');
+});
 
 	// 快捷键支持
 
 document.addEventListener('keydown', function(e) {
-	    // Ctrl+Shift+S: 截图
-	    if (e.ctrlKey && e.shiftKey && e.key === 'S') {
-	        e.preventDefault();
-	        takeScreenshot();
-	    }
-	    
-	    // Ctrl+Shift+T: 系统信息
-	    if (e.ctrlKey && e.shiftKey && e.key === 'T') {
-	        e.preventDefault();  
-	        showSystemInfo();
-	    }
-	    
-	    // Ctrl+Shift+P: 切换面板显示
-	    if (e.ctrlKey && e.shiftKey && e.key === 'P') {
-	        e.preventDefault();
-	        toggleSystemPanel();
-	    }
 });
 
 	// =====================================
@@ -2574,25 +2735,12 @@ class EnhancedUIFeatures {
     }
     
     init() {
-        this.bindSystemControls();
         this.bindOfficeDropZone();
         this.addKeyboardShortcuts();
         this.addNotificationSystem();
-        this.setupAutoHidePanel();
         console.log('GUI增强功能初始化完成');
     }
     
-    bindSystemControls() {
-        // 音量控制事件绑定
-        this.bindCustomSlider('volumeSlider', (value) => {
-            this.sendSystemCommand(`set_volume_system`, { value: value });
-        });
-        
-        // 亮度控制事件绑定
-        this.bindCustomSlider('brightnessSlider', (value) => {
-            this.sendSystemCommand(`set_brightness_system`, { value: value });
-        });
-    }
     
     bindCustomSlider(sliderId, callback) {
         const slider = document.getElementById(sliderId);
@@ -2603,7 +2751,7 @@ class EnhancedUIFeatures {
             const valueElement = document.getElementById(this.id.replace('Slider', 'Value'));
             if (valueElement) {
                 valueElement.textContent = this.value;
-                this.style.background = \`linear-gradient(to right, #4CAF50 0%, #4CAF50 \\${this.value}%, #ddd \\${this.value}%, #ddd 100%)\`;
+                this.style.background = 'linear-gradient(to right, #4CAF50 0%, #4CAF50 ' + this.value + '%, #ddd ' + this.value + '%, #ddd 100%)';
             }
         });
         
@@ -2645,10 +2793,10 @@ class EnhancedUIFeatures {
                         e.preventDefault();
                         this.showSystemInfo();
                         break;
-                    case 'p':
-                        e.preventDefault();
-                        this.toggleSystemPanel();
-                        break;
+        case 'p':
+            e.preventDefault();
+            // 系统面板快捷键已删除
+            break;
                     case 'd':
                         e.preventDefault();
                         this.focusDropZone();
@@ -2662,20 +2810,12 @@ class EnhancedUIFeatures {
         // 创建通知容器
         const notificationContainer = document.createElement('div');
         notificationContainer.id = 'gui-notifications';
-        notificationContainer.style.cssText = \\\`
-            position: fixed;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            z-index: 10000;
-            pointer-events: none;
-        \\\`;
+        notificationContainer.style.cssText = 'position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 10000; pointer-events: none;';
         document.body.appendChild(notificationContainer);
     }
     
     setupAutoHidePanel() {
-        const panel = document.getElementById('systemPanel');
-        if (!panel) return;
+        // 已删除系统面板，此方法不再需要
         
         let hideTimer;
         const hideDelay = 15000; // 15秒后开始渐隐
@@ -2689,42 +2829,9 @@ class EnhancedUIFeatures {
             }, hideDelay);
         });
         
-        // 鼠标移入时显示
-        panel.addEventListener('mouseenter', () => {
-            clearTimeout(hideTimer);
-            panel.style.opacity = '1';
-            panel.style.transform = 'translateX(0)';
-        });
-        
-        // 点击时保持显示
-        panel.addEventListener('click', () => {
-            clearTimeout(hideTimer);
-            panel.style.opacity = '1';
-            panel.style.transform = 'translateX(0)';
-        });
     }
     
-    // 快捷操作函数
-    quickScreenshot() {
-        this.sendChatCommand('请帮我截图并保存到工作空间');
-        this.showNotification('截图命令已发送', 'success');
-    }
     
-    showSystemInfo() {
-        this.sendChatCommand('请帮我显示系统信息');
-        this.showNotification('系统信息命令已发送', 'info');
-    }
-    
-    toggleSystemPanel() {
-        const panel = document.getElementById('systemPanel');
-        if (panel.style.display === 'none') {
-            panel.style.display = 'block';
-            this.showNotification('系统面板已显示', 'info');
-        } else {
-            panel.style.display = 'none';
-            this.showNotification('系统面板已隐藏', 'info');
-        }
-    }
     
     focusDropZone() {
         const dropZone = document.getElementById('officeDropZone');
@@ -2744,19 +2851,7 @@ class EnhancedUIFeatures {
         if (!container) return;
         
         const notification = document.createElement('div');
-        notification.style.cssText = \\\`
-            background: \\${this.getNotificationColor(type)};
-            color: white;
-            padding: 12px 20px;
-            margin: 5px;
-            border-radius: 6px;
-            font-size: 14px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            animation: slideIn 0.3s ease;
-            pointer-events: auto;
-            cursor: pointer;
-            z-index: 10001;
-        \\\`;
+        notification.style.cssText = 'background: ' + this.getNotificationColor(type) + '; color: white; padding: 12px 20px; margin: 5px; border-radius: 6px; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); animation: slideIn 0.3s ease; pointer-events: auto; cursor: pointer; z-index: 10001;';
         
         notification.textContent = message;
         notification.onclick = () => notification.remove();
@@ -2786,19 +2881,7 @@ class EnhancedUIFeatures {
         if (!dropZone) return;
         
         const hint = document.createElement('div');
-        hint.style.cssText = \\\`
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: \\${this.getNotificationColor(type)};
-            color: white;
-            padding: 10px 20px;
-            border-radius: 20px;
-            font-size: 14px;
-            z-index: 10;
-            animation: pulse 1s ease-in-out infinite;
-        \\\`;
+        hint.style.cssText = 'position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: ' + this.getNotificationColor(type) + '; color: white; padding: 10px 20px; border-radius: 20px; font-size: 14px; z-index: 10; animation: pulse 1s ease-in-out infinite;';
         hint.textContent = message;
         hint.id = 'dropHint';
         
@@ -2824,7 +2907,7 @@ class EnhancedUIFeatures {
     
     sendSystemCommand(operation, params = {}) {
         // 发送到Agent处理
-        const command = \\\`系统命令: \\${operation} \\${JSON.stringify(params)}\\\`;
+        const command = '系统命令: ' + operation + ' ' + JSON.stringify(params);
         this.sendChatCommand(command);
     }
 }

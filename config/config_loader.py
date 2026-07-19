@@ -41,6 +41,7 @@ class SafetyConfig:
     protected_path_patterns: list = field(default_factory=list)  # list[(pattern, desc)]
     danger_challenge_phrase: str = ""
     danger_patterns: list = field(default_factory=list)          # list[(pattern, desc, level)]
+    danger_path_patterns: list = field(default_factory=list)     # list[(pattern, desc)] — L2 挑战路径
     always_blocked: list = field(default_factory=list)
 
     # file_tools
@@ -89,6 +90,10 @@ def _parse_yaml() -> SafetyConfig:
     cfg.danger_patterns = [
         (item["pattern"], item["desc"], item["level"])
         for item in se.get("danger_patterns", [])
+    ]
+    cfg.danger_path_patterns = [
+        (item["pattern"], item["desc"])
+        for item in se.get("danger_path_patterns", [])
     ]
     cfg.always_blocked = se.get("always_blocked", [])
 
