@@ -4,7 +4,6 @@ import re
 import json
 import time
 import uuid
-import threading
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 
@@ -13,12 +12,15 @@ import requests
 from . import register_tool
 from config.config_loader import get_safety_config
 
-# 注意：web_download 使用独立的 _pending_confirmations 字典
-# 与 backend/chat.py 的 _pending_confirmations 完全分离，避免数据格式冲突
-# - backend/chat.py 格式: {token: {"event": evt, "result": result_holder}}
-# - web_download.py 格式: {token: {"url": ..., "output_dir": ..., "filename": ..., "expiry": ...}}
-_pending_confirmations: dict = {}
-_pending_lock = threading.Lock()
+# 惰性导入：避免 tools → core → tools 循环导入
+_confirmation_manager = None
+
+def _get_confirmation_manager():
+    global _confirmation_manager
+    if _confirmation_manager is None:
+        from core.confirmation_manager import confirmation_manager as _cm
+        _confirmation_manager = _cm
+    return _confirmation_manager
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -90,17 +92,19 @@ def _probe_url(url: str) -> dict:
 
 
 @register_tool(timeout=120)
-def web_download(url: str, output_dir: str = None, confirmed: bool = False, confirmation_token: str = ""):
+def web_download(url: str, output_dir: str = None, **kwargs):
     """
     从 URL 下载文件到本地。除可执行文件需要用户确认外，无文件类型限制。
 
     - url: 要下载的文件直链 URL
     - output_dir: 保存目录，默认下载到用户的 Downloads 文件夹
-    - confirmed: 内部标志，LLM 勿传
-    - confirmation_token: 内部标志，LLM 勿传
 
     可执行文件（.exe/.msi/.bat 等）下载前会弹出确认卡片让用户判断来源是否可信。
     """
+    # 内部确认标志：由 react_engine Path B 确认通过后带 token 重调注入，
+    # 不出现在 LLM 可见的 JSON Schema 中，LLM 不应也无法传这些参数。
+    confirmed = bool(kwargs.get("confirmed"))
+    confirmation_token = kwargs.get("confirmation_token") or ""
     try:
         from config.settings import DATA_DIR
     except ImportError:
@@ -142,77 +146,67 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
     file_size = int(content_length_str) if content_length_str and content_length_str.isdigit() else None
     size_display = f"{file_size / 1024 / 1024:.1f} MB" if file_size else "未知大小"
 
-    # 可执行文件：未确认时返回确认请求
-    if ext in get_safety_config().risky_extensions:
-        if not confirmed:
-            token = uuid.uuid4().hex
-            download_info = {
-                "url": url,
-                "output_dir": output_dir,
-                "filename": filename,
-                "expiry": time.time() + 300,
-            }
-            with _pending_lock:
-                _pending_confirmations[token] = download_info
-            return json.dumps({
-                "confirmation_required": True,
-                "confirmation_token": token,
-                "title": "下载可执行文件确认",
-                "message": f"即将下载 {filename}（{size_display}）",
-                "details": {
-                    "文件名": filename,
-                    "类型": f"{ext} 可执行文件",
-                    "来源URL": final_url,
-                    "大小": size_display,
-                    "风险提示": "可执行文件可能包含恶意代码，请确认来源可信后再下载",
-                },
-                "url": url,
-                "output_dir": output_dir,
-            }, ensure_ascii=False)
-
-        # confirmed=True 时，校验 token 有效性
+    # 可执行文件：需要确认（react_engine 层弹出确认卡片）
+    if ext in get_safety_config().risky_extensions and not confirmed:
         if not confirmation_token:
+            # 无确认令牌 → 返回 confirmation_required，触发 react_engine Path B 确认流程
+            token = uuid.uuid4().hex
+            _get_confirmation_manager().store(token, {
+                "type": "download",
+                "url": url,
+                "output_dir": output_dir,
+            })
             return json.dumps({
                 "success": False,
-                "error": "请提供有效的确认令牌"
+                "error": "下载可执行文件需要预先授权",
+                "confirmation_required": True,
+                "confirmation_token": token,
+                "message": f"确认下载可执行文件 {filename}（{size_display}）？来源: {url}",
+                "details": {"filename": filename, "ext": ext, "url": url, "size": size_display},
             }, ensure_ascii=False)
 
-        stored_info = None
-        with _pending_lock:
-            if confirmation_token in _pending_confirmations:
-                stored_info = _pending_confirmations[confirmation_token]
-                del _pending_confirmations[confirmation_token]
-
-        if not stored_info:
+        # 有确认令牌 → 校验（一次性 pop；引擎确认通过后预注册，主进程执行时可见）
+        stored_info = _get_confirmation_manager().pop(confirmation_token)
+        if not stored_info or stored_info.get("type") != "download":
             return json.dumps({
                 "success": False,
                 "error": "确认令牌无效或已过期"
             }, ensure_ascii=False)
-
-        if time.time() > stored_info.get("expiry", 0):
+        if time.time() > stored_info.get("_expiry", 0):
             return json.dumps({
                 "success": False,
                 "error": "确认令牌已过期"
             }, ensure_ascii=False)
-
-        if stored_info.get("url") != url or stored_info.get("output_dir") != output_dir:
+        if stored_info.get("url") != url or (stored_info.get("output_dir") or None) != (output_dir or None):
             return json.dumps({
                 "success": False,
                 "error": "确认令牌与请求不匹配"
             }, ensure_ascii=False)
+        confirmed = True
 
-    # 去重：如果文件已存在，加序号（带文件锁防止竞态条件）
+    # 去重：如果文件已存在，加序号（O_EXCL 原子创建占位文件防止竞态条件）
     save_path = dl_dir / filename
     counter = 1
     stem, file_ext = os.path.splitext(filename)
-    while True:
+    max_retries = 100
+    fd = None  # 占位文件 fd：创建后保持打开，后续流式写入复用同一 fd，消除 close/re-open 竞态窗口
+    while counter <= max_retries:
         try:
             fd = os.open(str(save_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
             break
         except FileExistsError:
             save_path = dl_dir / f"{stem} ({counter}){file_ext}"
             counter += 1
+        except (PermissionError, OSError) as e:
+            return json.dumps({
+                "success": False,
+                "error": f"无法创建下载文件: {e}"
+            }, ensure_ascii=False)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": f"无法生成唯一文件名，已达最大重试次数 ({max_retries})"
+        }, ensure_ascii=False)
 
     # 流式下载（带总时长限制）
     try:
@@ -236,6 +230,15 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
             actual_ext = os.path.splitext(actual_filename)[1].lower()
 
             if actual_ext in get_safety_config().risky_extensions and not confirmed:
+                # 未开始写入：关闭占位 fd 并清理空占位文件
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+                if save_path.exists():
+                    save_path.unlink()
                 return json.dumps({
                     "success": False,
                     "error": "实际下载的文件为可执行文件，请重新确认后下载",
@@ -243,7 +246,8 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
                     "actual_ext": actual_ext,
                 }, ensure_ascii=False)
 
-            with open(save_path, "wb") as f:
+            # 复用 O_EXCL 创建的占位 fd 直接写入（os.fdopen 接管 fd，with 退出时关闭）
+            with os.fdopen(fd, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
@@ -273,16 +277,27 @@ def web_download(url: str, output_dir: str = None, confirmed: bool = False, conf
         }, ensure_ascii=False)
 
     except requests.exceptions.Timeout:
-        # 清理不完整文件
+        # 关闭占位 fd（若尚未被 os.fdopen 接管），并清理不完整文件
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if save_path.exists():
             save_path.unlink()
-        return json.dumps({"success": False, "error": f"下载超时（300s），文件可能过大或网络不稳定"}, ensure_ascii=False)
+        return json.dumps({"success": False, "error": f"下载超时（{total_timeout}s），文件可能过大或网络不稳定"}, ensure_ascii=False)
     except Exception as e:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if save_path.exists():
             save_path.unlink()
         return json.dumps({"success": False, "error": f"下载失败: {str(e)[:200]}"}, ensure_ascii=False)
 
 
+@register_tool
 def is_downloadable(content_type: str) -> bool:
     """
     判断 Content-Type 是否为可下载的二进制文件类型。

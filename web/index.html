@@ -1155,22 +1155,35 @@
 
 		function renderChatHistory(messages) {
 			clearChatArea();
-			// 不做去重：同内容消息（如连续发送相同文本）应全部展示
-			const unique = messages;
+			// 去重：同内容的 AI 回复（如旧版因 msg_type 不一致导致的 text/chat 双记录）只保留一条
+			const seenKeys = new Set();
+			const unique = [];
+			for (let i = 0; i < messages.length; i++) {
+				const m = messages[i];
+				// 仅对 AI 消息做内容级去重，防止同内容重复渲染
+				if (m.sender === 'ai' && m.text) {
+					const key = m.text.trim();
+					if (seenKeys.has(key)) {
+						continue;  // 跳过重复的 AI 回复
+					}
+					seenKeys.add(key);
+				}
+				unique.push(m);
+			}
 			
 			const groups = [];
 			let currentGroup = { user: null, thinks: [], replies: [] };
 			
 			for (let i = 0; i < unique.length; i++) {
 				const msg = unique[i];
-				if (msg.msgType === 'chat' && msg.sender === 'user') {
+				if ((msg.msgType === 'chat' || msg.msgType === 'text') && msg.sender === 'user') {
 					if (currentGroup.user || currentGroup.thinks.length > 0 || currentGroup.replies.length > 0) {
 						groups.push(currentGroup);
 					}
 					currentGroup = { user: msg, thinks: [], replies: [] };
 				} else if (msg.msgType === 'think') {
 					currentGroup.thinks.push(msg);
-				} else if (msg.msgType === 'chat' && msg.sender === 'ai') {
+				} else if ((msg.msgType === 'chat' || msg.msgType === 'text' || msg.msgType === 'final_answer') && msg.sender === 'ai') {
 					currentGroup.replies.push(msg);
 				}
 			}
@@ -1368,7 +1381,12 @@
 				typingIndicator.style.display = 'none';
 			} catch (error) {
 				console.error("切换会话失败:", error);
-				appendMessage('ai', `加载会话失败：${error.message}`);
+				if (error.message && !error.message.includes('429') && !error.message.includes('Too Many Requests')) {
+					appendMessage('ai', `加载会话失败：${error.message}`);
+				} else {
+					console.warn("会话加载被限流，自动重试中...");
+					setTimeout(() => switchSession(sessionId), 2000);
+				}
 			}
 		}
 
@@ -1584,7 +1602,7 @@
 					msgId: msgId
 				});
 			}
-			saveSessionToBackend(requestSessionId);
+			// 用户消息已由 api_chat 后端持久化，删除冗余调用
 
 			// 问题3：显示脉冲加载动画（替代纯文字 typing indicator）
 			typingIndicator.style.display = 'none';
@@ -1600,6 +1618,8 @@
 			}, 3000);
 			
 			let timeoutTimer = null;
+			// 防重复渲染：收到首个 final 后忽略后续 final/兜底事件
+			let finalReceived = false;
 
 			let hasThinking = false;
 			let thinkContent = '';
@@ -1900,6 +1920,9 @@
 									autoScrollToBottom();
 									break;
 							case 'final':
+									// 首个 final 到达后忽略后续 final（后端偶发双 final 时避免重复渲染/重复兜底）
+									if (finalReceived) break;
+									finalReceived = true;
 									clearTimeout(slowTimer);
 									clearTimeout(timeoutTimer);
 									pulseSpinner.style.display = 'none';
@@ -1929,10 +1952,17 @@
 									}
 									if (data.text && data.text.trim()) {
 										appendMessage('ai', data.text, 'chat', data.timestamp, true);
+										// 推入 sessions.messages，确保 refresh 后 AI 回复不丢失
+										sessions[requestSessionId].messages.push({
+											sender: 'ai', text: data.text, msgType: 'chat',
+											timestamp: data.timestamp, msgId: generateUUID()
+										});
 									}
 									autoScrollToBottom();
 									break;
 								case 'error':
+									// 任务已完成（final 已收到）后忽略后续 error，避免"已完成后仍弹错误兜底"
+									if (finalReceived) break;
 									clearTimeout(slowTimer);
 									clearTimeout(timeoutTimer);
 									pulseSpinner.style.display = 'none';

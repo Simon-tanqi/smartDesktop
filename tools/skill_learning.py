@@ -16,6 +16,8 @@ import shutil
 from pathlib import Path
 import yaml
 
+from . import register_tool
+
 # 技能保存目录（与内置技能分离）
 AGENT_SKILLS_DIR = Path(__file__).parent.parent / "agent_skills"
 
@@ -37,6 +39,7 @@ PREFIX_TRIGGER_KEYWORDS = [
 QUICK_FILTER_KEYWORDS = ["技能", "经验", "学习", "skill", "learn"]
 
 
+@register_tool
 def is_skill_learning_request(user_message: str) -> bool:
     """
     检测用户消息是否包含经验内化意图（优化版：正则 + 词边界）
@@ -75,6 +78,7 @@ def is_skill_learning_request(user_message: str) -> bool:
     return False
 
 
+@register_tool
 def extract_task_steps_from_history(messages: list[dict]) -> dict:
     """
     从对话历史中提取任务处理步骤（优化版）。
@@ -279,6 +283,7 @@ def _extract_task_description(messages: list[dict]) -> str:
     return "未知任务"
 
 
+@register_tool
 def generate_skill_with_llm(task_info: dict, llm_call_func) -> str:
     """
     使用 LLM 将任务处理步骤生成 Skill Markdown 内容（优化版）。
@@ -528,33 +533,20 @@ def _extract_keywords_from_skill(content: str) -> list[str]:
     """
     keywords = []
     
-    # 方法 1：从 YAML frontmatter 提取（只匹配文件开头的 frontmatter）
-    # 使用更精确的正则：content 必须以 --- 开头，中间不能有 markdown 标题
-    # 匹配：---\n(yaml内容)\n---\n(KEYWORDS: ...)\n# 标题
+    # 方法 1：从 YAML frontmatter 提取（使用 yaml.safe_load 代替脆弱的正则）
     yaml_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
     if yaml_match:
-        yaml_content = yaml_match.group(1)
-        # 尝试解析 keywords 字段（支持多种格式）
-        
-        # 格式 1：列表格式
-        # keywords:
-        #   - 关键词1
-        #   - 关键词2
-        keywords_match = re.search(r'keywords:\s*\n((?:\s*-\s*[^\n]+\n?)+)', yaml_content)
-        if keywords_match:
-            keywords_text = keywords_match.group(1)
-            for line in keywords_text.strip().split('\n'):
-                match = re.search(r'^\s*-\s*(.+)$', line.strip())
-                if match:
-                    keywords.append(match.group(1).strip())
-        
-        # 格式 2：行内格式
-        # keywords: ["关键词1", "关键词2"]
-        if not keywords:
-            keywords_match = re.search(r'keywords:\s*\[([^\]]+)\]', yaml_content)
-            if keywords_match:
-                keywords_text = keywords_match.group(1)
-                keywords = [kw.strip().strip('"\'') for kw in keywords_text.split(',') if kw.strip()]
+        yaml_text = yaml_match.group(1)
+        try:
+            frontmatter = yaml.safe_load(yaml_text)
+            if isinstance(frontmatter, dict) and 'keywords' in frontmatter:
+                kw_value = frontmatter['keywords']
+                if isinstance(kw_value, list):
+                    keywords = [str(k).strip() for k in kw_value if k]
+                elif isinstance(kw_value, str):
+                    keywords = [k.strip() for k in kw_value.split(',') if k.strip()]
+        except yaml.YAMLError:
+            pass  # YAML 解析失败时回退到后续方法
     
     # 方法 2：从 KEYWORDS 行提取（独立一行，不在 yaml 内）
     if not keywords:
@@ -588,6 +580,7 @@ def _extract_keywords_from_skill(content: str) -> list[str]:
     return cleaned_keywords[:10]  # 最多返回 10 个关键词
 
 
+@register_tool
 def save_skill(skill_name: str, content: str, version: str = "1.0", merge: bool = True) -> dict:
     """
     保存 Skill 到文件（优化版）。
@@ -648,6 +641,7 @@ def save_skill(skill_name: str, content: str, version: str = "1.0", merge: bool 
         }
 
 
+@register_tool
 def register_skill_to_yaml(skill_name: str, description: str, keywords: list[str], version: str = "1.0") -> dict:
     """
     将新技能注册到 agent_tools.yaml 的 domains 中。
@@ -687,6 +681,7 @@ def register_skill_to_yaml(skill_name: str, description: str, keywords: list[str
         return {"success": False, "message": f"注册失败: {str(e)}"}
 
 
+@register_tool
 def load_agent_tools_config() -> dict:
     """加载 agent_tools.yaml 配置"""
     if not AGENT_TOOLS_YAML.exists():
@@ -712,6 +707,7 @@ def load_agent_tools_config() -> dict:
         return {"domains": {}, "management": {}}
 
 
+@register_tool
 def suggest_skill_name(task_info: dict, llm_call_func) -> str:
     """
     使用 LLM 建议一个技能名称。
@@ -754,6 +750,7 @@ def suggest_skill_name(task_info: dict, llm_call_func) -> str:
 
 
 # 预留接口：删除技能
+@register_tool
 def delete_skill(skill_name: str) -> dict:
     """
     删除技能（预留接口）
@@ -786,6 +783,7 @@ def delete_skill(skill_name: str) -> dict:
 
 
 # 预留接口：更新技能
+@register_tool
 def update_skill(skill_name: str, content: str, new_version: str = None) -> dict:
     """
     更新技能（预留接口）

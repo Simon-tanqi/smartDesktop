@@ -104,7 +104,8 @@ def _get_conn(db_path, row_factory=False):
                 print(f"[DEBUG] Parent dir: {os.path.exists(os.path.dirname(db_path))}")
                 conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA synchronous=NORMAL")
                 pool[db_path] = conn
                 with _global_conn_lock:
                     _global_conns.setdefault(db_path, []).append(conn)
@@ -117,10 +118,17 @@ def _get_conn(db_path, row_factory=False):
             break
             
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            err_str = str(e)
             print(f"[DEBUG] SQLite error on attempt {attempt+1}: {e}")
-            if attempt < 2:
+            is_locked = "database is locked" in err_str or "BUSY" in err_str.upper()
+            max_retry = 5 if is_locked else 2
+            if attempt < max_retry:
                 import time
-                time.sleep(0.1 * (attempt + 1))
+                if is_locked:
+                    delay = 0.5 * (2 ** attempt)  # 指数退避: 0.5s, 1s, 2s, 4s, 8s
+                else:
+                    delay = 0.1 * (attempt + 1)
+                time.sleep(delay)
                 continue
             else:
                 # 所有重试都失败，重新抛出异常
@@ -144,7 +152,11 @@ def _get_conn(db_path, row_factory=False):
 
 @contextmanager
 def _get_conn_simple(db_path, row_factory=False):
-    """简单连接：每次创建关闭，用于低频操作（trace / oplog）。"""
+    """简单连接：每次创建关闭，用于低频操作（trace / oplog / per-session DB）。
+
+    关闭前执行 wal_checkpoint(PASSIVE)，促进 WAL 合并到主库，
+    避免连接常驻导致 WAL 无限增长和 -shm 损坏。
+    """
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -153,6 +165,10 @@ def _get_conn_simple(db_path, row_factory=False):
     try:
         yield conn
     finally:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
         conn.close()
 
 
@@ -293,7 +309,8 @@ def add_chat_message(session_id, role, content, msg_type="chat",
     if role not in ("user", "assistant", "system"):
         return
     db_path = get_session_messages_db(session_id)
-    with _get_conn(db_path) as conn:
+    # 使用 _get_conn_simple：每次操作后关闭连接，允许 WAL checkpoint 合并
+    with _get_conn_simple(db_path) as conn:
         _init_chat_tables(conn)
         if timestamp:
             conn.execute(
@@ -318,7 +335,7 @@ def get_chat_messages(session_id, limit=200, offset=0):
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content, msg_type, msg_id, is_temporary, created_at FROM chat_history "
-            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type = '' OR msg_type IS NULL OR msg_type = 'think') "
+            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type = '' OR msg_type IS NULL OR msg_type = 'think' OR msg_type = 'text') "
             "ORDER BY id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
@@ -327,25 +344,36 @@ def get_chat_messages(session_id, limit=200, offset=0):
             result.append({"role": r[0], "content": r[1], "msg_type": r[2] or "chat",
                      "msg_id": r[3], "is_temporary": bool(r[4]), "created_at": r[5]})
         return result
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] get_chat_messages 读取失败: {e}, session={session_id}")
+        return []
     finally:
         if conn:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                pass
             conn.close()
 
 
 def get_session_messages(session_id, limit=500):
-    """获取用于 LLM 上下文的消息（仅 chat 类型）。"""
+    """获取用于 LLM 上下文的消息（仅 chat/text 类型）。"""
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
-    with _get_conn(db_path, row_factory=True) as conn:
-        _init_chat_tables(conn)
-        rows = conn.execute(
-            "SELECT role, content FROM chat_history "
-            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type IS NULL OR msg_type = '') AND is_temporary = 0 "
-            "ORDER BY id ASC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
-    return [{"role": r[0], "content": r[1]} for r in rows]
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT role, content FROM chat_history "
+                "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type IS NULL OR msg_type = '' OR msg_type = 'text') AND is_temporary = 0 "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [{"role": r[0], "content": r[1]} for r in rows]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] get_session_messages 读取失败: {e}, session={session_id}")
+        return []
 
 
 def get_full_session_messages(session_id, limit=500):
@@ -353,15 +381,19 @@ def get_full_session_messages(session_id, limit=500):
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
-    with _get_conn(db_path, row_factory=True) as conn:
-        _init_chat_tables(conn)
-        rows = conn.execute(
-            "SELECT role, content, msg_type FROM chat_history "
-            "WHERE session_id = ? AND is_temporary = 0 "
-            "ORDER BY id ASC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
-    return [{"role": r[0], "content": r[1], "msg_type": r[2] or "chat"} for r in rows]
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT role, content, msg_type FROM chat_history "
+                "WHERE session_id = ? AND is_temporary = 0 "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [{"role": r[0], "content": r[1], "msg_type": r[2] or "chat"} for r in rows]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] get_full_session_messages 读取失败: {e}, session={session_id}")
+        return []
 
 
 def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
@@ -369,39 +401,49 @@ def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
-    with _get_conn(db_path, row_factory=True) as conn:
-        _init_chat_tables(conn)
-        rows = conn.execute(
-            "SELECT id, role, content FROM chat_history "
-            "WHERE session_id = ? AND (msg_type = ? OR msg_type IS NULL OR msg_type = '') "
-            "ORDER BY id ASC",
-            (session_id, msg_type_filter),
-        ).fetchall()
-    return [{"id": r[0], "role": r[1], "content": r[2]} for r in rows]
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT id, role, content FROM chat_history "
+                "WHERE session_id = ? AND (msg_type = ? OR msg_type IS NULL OR msg_type = '') "
+                "ORDER BY id ASC",
+                (session_id, msg_type_filter),
+            ).fetchall()
+        return [{"id": r[0], "role": r[1], "content": r[2]} for r in rows]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] _get_chat_messages_with_ids 读取失败: {e}, session={session_id}")
+        return []
 
 
 def delete_chat_messages_before(session_id, before_id):
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return
-    with _get_conn(db_path) as conn:
-        _init_chat_tables(conn)
-        conn.execute(
-            "DELETE FROM chat_history WHERE session_id = ? AND id < ?",
-            (session_id, before_id),
-        )
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_chat_tables(conn)
+            conn.execute(
+                "DELETE FROM chat_history WHERE session_id = ? AND id < ?",
+                (session_id, before_id),
+            )
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] delete_chat_messages_before 失败: {e}, session={session_id}")
 
 
 def count_chat_messages(session_id):
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return 0
-    with _get_conn(db_path) as conn:
-        _init_chat_tables(conn)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM chat_history WHERE session_id = ?", (session_id,)
-        ).fetchone()[0]
-    return count
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_chat_tables(conn)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM chat_history WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+        return count
+    except sqlite3.DatabaseError:
+        return 0
 
 
 def delete_chat_session(session_id):
@@ -438,6 +480,34 @@ def delete_chat_session(session_id):
         shutil.rmtree(sess_dir, ignore_errors=True)
 
 
+def clear_session_messages(session_id: str, keep_system: bool = True):
+    """清空会话历史消息，可选保留 system 角色消息。
+
+    Args:
+        session_id: 会话 ID
+        keep_system: True 时只清除 user/assistant/tool 消息，保留 system 消息
+    """
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_chat_tables(conn)
+            if keep_system:
+                conn.execute(
+                    "DELETE FROM chat_history WHERE session_id = ? AND role != 'system'",
+                    (session_id,)
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM chat_history WHERE session_id = ?",
+                    (session_id,)
+                )
+            conn.commit()
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] clear_session_messages 失败: {e}, session={session_id}")
+
+
 # ═══════════════════════════════════════════════
 # 压缩摘要（per-session summaries.db）
 # ═══════════════════════════════════════════════
@@ -462,13 +532,16 @@ def add_summary(session_id, summary_text, cover_turn_start=None,
                 cover_turn_end=None, token_est=0):
     """写入一条压缩摘要到 per-session summaries.db。"""
     db_path = get_session_summaries_db(session_id)
-    with _get_conn(db_path) as conn:
-        _init_summary_tables(conn)
-        conn.execute(
-            "INSERT INTO summaries (session_id, cover_turn_start, cover_turn_end, summary_text, token_est) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, cover_turn_start, cover_turn_end, summary_text, token_est),
-        )
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_summary_tables(conn)
+            conn.execute(
+                "INSERT INTO summaries (session_id, cover_turn_start, cover_turn_end, summary_text, token_est) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, cover_turn_start, cover_turn_end, summary_text, token_est),
+            )
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] add_summary 失败: {e}, session={session_id}")
 
 
 def get_latest_summary(session_id):
@@ -476,14 +549,17 @@ def get_latest_summary(session_id):
     db_path = get_session_summaries_db(session_id)
     if not os.path.exists(db_path):
         return ""
-    with _get_conn(db_path, row_factory=True) as conn:
-        _init_summary_tables(conn)
-        row = conn.execute(
-            "SELECT summary_text FROM summaries WHERE session_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-    return row[0] if row else ""
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_summary_tables(conn)
+            row = conn.execute(
+                "SELECT summary_text FROM summaries WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row[0] if row else ""
+    except sqlite3.DatabaseError:
+        return ""
 
 
 def get_summaries(session_id, limit=5):
@@ -491,15 +567,18 @@ def get_summaries(session_id, limit=5):
     db_path = get_session_summaries_db(session_id)
     if not os.path.exists(db_path):
         return []
-    with _get_conn(db_path, row_factory=True) as conn:
-        _init_summary_tables(conn)
-        rows = conn.execute(
-            "SELECT summary_text, cover_turn_start, cover_turn_end, token_est "
-            "FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
-    return [{"text": r[0], "cover_start": r[1], "cover_end": r[2],
-             "token_est": r[3]} for r in rows]
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_summary_tables(conn)
+            rows = conn.execute(
+                "SELECT summary_text, cover_turn_start, cover_turn_end, token_est "
+                "FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [{"text": r[0], "cover_start": r[1], "cover_end": r[2],
+                 "token_est": r[3]} for r in rows]
+    except sqlite3.DatabaseError:
+        return []
 
 
 # ═══════════════════════════════════════════════
@@ -534,7 +613,7 @@ def migrate_old_chat_db():
                 continue
 
             db_path = get_session_messages_db(sid)
-            with _get_conn(db_path) as new_conn:
+            with _get_conn_simple(db_path) as new_conn:
                 _init_chat_tables(new_conn)
                 for m in msgs:
                     new_conn.execute(

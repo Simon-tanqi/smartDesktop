@@ -3,7 +3,7 @@ import hashlib
 import difflib
 import tempfile
 import os
-import re
+import re as _re
 import time
 import threading
 from tools import TOOL_REGISTRY
@@ -19,6 +19,7 @@ _CACHED_ACTIONS_MAX_ENTRIES = 1000
 _CACHED_ACTIONS_MIN_SUCCESS = 6
 
 # 禁止参与高频固化的工具：任何会修改系统状态、或只是"任务中间步骤"的工具都不能直接固化命中。
+# 修复时间：2026-07-27 - 修复re模块闭包和作用域问题
 # 这些工具要么会真正破坏系统（卸载/删除/修改），要么只是查询/半步动作（get_uninstall_string 只查不卸）。
 # 用户报问题："帮我把软件Qorder卸载一下" → 命中了 get_uninstall_string（success_count=9），
 # 执行到"找到软件"就停了，卸载动作没发生。
@@ -171,7 +172,7 @@ def _extract_user_name(messages: list) -> str | None:
     for msg in reversed(messages[-10:]):
         content = msg.get('content', '').lower()
         if '我叫' in content:
-            match = re.search(r'我叫(.+?)(?:[:：，,\.\!！\s]|$)', content)
+            match = _re.search(r'我叫(.+?)(?:[:：，,\.\!！\s]|$)', content)
             if match:
                 name = match.group(1).strip()
                 if name and len(name) <= 10:
@@ -206,8 +207,8 @@ _WORKFLOW_MAX_FAIL = 2
 
 def _msg_hash(user_message: str) -> str:
     normalized = user_message.strip().lower()
-    normalized = re.sub(r'[^\w\s]', '', normalized)
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    normalized = _re.sub(r'[^\w\s]', '', normalized)
+    normalized = _re.sub(r'\s+', ' ', normalized).strip()
     if not normalized:
         normalized = user_message.strip()[:100]
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
@@ -223,12 +224,36 @@ def _extract_variables(user_message: str, extractor: dict) -> dict:
         if not pattern:
             continue
         try:
-            m = re.search(pattern, user_message, re.IGNORECASE)
+            m = _re.search(pattern, user_message, _re.IGNORECASE)
             if m:
                 variables[var_name] = m.group(1) if m.groups() else m.group(0)
-        except re.error as e:
+        except _re.error as e:
             logger.warning(f"变量 {var_name!r} 正则编译失败: {e}")
     return variables
+
+
+def _to_skeleton(msg: str) -> str:
+    """将消息中的数字、端口号、文件路径替换为通用占位符，用于骨架匹配。
+
+    骨架匹配允许用户稍微改变参数（如"查端口8080"→"查端口9090"）时，
+    仍然命中已缓存的固定工作流记录，而不需要精确哈希匹配。
+    """
+    skeleton = msg
+    # 端口号：前面有"端口"或"port"上下文的数字
+    skeleton = _re.sub(r'(端口|port)\s*[：:=]?\s*\d+', r'\1 {PORT}', skeleton, flags=_re.IGNORECASE)
+    # 文件路径：Windows 风格 (如 C:\Users\...)
+    skeleton = _re.sub(r'[A-Za-z]:\\[^\s,，。；;]+', '{WINPATH}', skeleton)
+    # 文件路径：Unix 风格 (如 /home/user/...)
+    skeleton = _re.sub(r'/[^\s,，。；;]+/[^\s,，。；;]+(?:/[^\s,，。；;]*)*', '{UNIXPATH}', skeleton)
+    # IP 地址（含端口）
+    skeleton = _re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d{1,5})?', '{IP}', skeleton)
+    # URL
+    skeleton = _re.sub(r'https?://[^\s,，。；;]+', '{URL}', skeleton, flags=_re.IGNORECASE)
+    # 独立数字（含千分位逗号和小数）：不跟在字母后面
+    skeleton = _re.sub(r'(?<![a-zA-Z])\b\d[\d,]*(?:\.\d+)?\b', '{NUMBER}', skeleton)
+    # 压缩多余空白
+    skeleton = _re.sub(r'\s+', ' ', skeleton).strip()
+    return skeleton
 
 
 def _resolve_param_value(value, variables: dict, step_captures: dict) -> object:
@@ -261,8 +286,14 @@ def _resolve_param_value(value, variables: dict, step_captures: dict) -> object:
                 return "" if v is None else str(v)
             return ""
         try:
-            return re.sub(r'\$\{([^}]+)\}', _replace, value)
-        except Exception:
+            value_preview = (value[:100] if isinstance(value, str) else str(value)[:100])
+            get_logger().debug(f"_resolve_param_value calling _re.sub with value: {value_preview}", trace_id="debug")
+            result = _re.sub(r'\$\{([^}]+)\}', _replace, value)
+            result_preview = (result[:100] if isinstance(result, str) else str(result)[:100])
+            get_logger().debug(f"_resolve_param_value _re.sub success: {result_preview}", trace_id="debug")
+            return result
+        except Exception as e:
+            get_logger().error(f"_resolve_param_value _re.sub failed: {e}", trace_id="debug", exc_info=True)
             return value
     elif isinstance(value, dict):
         return {k: _resolve_param_value(v, variables, step_captures) for k, v in value.items()}
@@ -310,9 +341,10 @@ def _trim_cached_actions(data: dict) -> dict:
 
 def check_frequent_cache(user_message: str) -> tuple[bool, str | None]:
     try:
-        cache = _load_cached_actions()
-        records = cache.get("固化记录", {})
-        msg_hash_val = _msg_hash(user_message)
+        with _CACHED_ACTIONS_LOCK:
+            cache = _load_cached_actions()
+            records = cache.get("固化记录", {})
+            msg_hash_val = _msg_hash(user_message)
 
         for label, record in records.items():
             if record.get("query_hash") != msg_hash_val:
@@ -339,6 +371,59 @@ def check_frequent_cache(user_message: str) -> tuple[bool, str | None]:
                     return True, reply
                 else:
                     _increment_fail_count(label, record)
+
+        # ── 骨架匹配 fallback：精确哈希未命中时，尝试将变量替换为占位符后匹配 ──
+        user_skeleton = _to_skeleton(user_message)
+        for label, record in records.items():
+            if record.get("version", 1) < _WORKFLOW_VERSION:
+                continue
+            if record.get("success_count", 0) < _WORKFLOW_MIN_SUCCESS:
+                continue
+            extractor = record.get("variable_extractor", {})
+            if not extractor:
+                continue
+            # 尝试从用户消息中提取变量——若所有 extractor 定义的变量都能提取到，视为骨架匹配
+            variables = _extract_variables(user_message, extractor)
+            if not variables:
+                continue
+            all_extracted = True
+            for var_name in extractor.keys():
+                if var_name not in variables:
+                    all_extracted = False
+                    break
+            if not all_extracted:
+                continue
+            # 骨架匹配成功，执行固化工作流
+            success, reply = _execute_workflow(record, user_message)
+            if success:
+                logger.info(f"[ROUTE L2 skeleton] 骨架命中: skeleton={user_skeleton[:80]!r} "
+                            f"scenario={record.get('scenario_id')}")
+                return True, reply
+            else:
+                _increment_fail_count(label, record)
+
+        # ── 签名模糊匹配 fallback：哈希与骨架均未命中时，用 difflib 对 query_patterns 做模糊匹配 ──
+        for label, record in records.items():
+            if record.get("version", 1) < _WORKFLOW_VERSION:
+                continue
+            if record.get("success_count", 0) < _WORKFLOW_MIN_SUCCESS:
+                continue
+            patterns = record.get("query_patterns", [])
+            if not patterns:
+                continue
+            for pattern in patterns:
+                if not isinstance(pattern, str) or len(pattern) < 3:
+                    continue
+                ratio = difflib.SequenceMatcher(None, user_message.lower(), pattern.lower()).ratio()
+                if ratio >= 0.75:
+                    success, reply = _execute_workflow(record, user_message)
+                    if success:
+                        logger.info(f"[ROUTE L2 fuzzy] 模糊命中: ratio={ratio:.2f} "
+                                    f"scenario={record.get('scenario_id')}")
+                        return True, reply
+                    else:
+                        _increment_fail_count(label, record)
+                    break
 
         return False, None
     except Exception as e:
@@ -370,12 +455,12 @@ def _execute_workflow(record: dict, user_message: str) -> tuple[bool, str | None
                 logger.info(f"工作流 step{idx} 工具 {tool_name!r} 不存在或未注册")
                 return False, None
             if _is_unsafe_for_cache(tool_name) and not step.get("require_confirm"):
-                # 危险工具必须显式 require_confirm
+                # 危险工具必须显式 require_confirm（记录时已设），未设置的拒绝执行
                 logger.warning(f"工作流 step{idx} 危险工具 {tool_name!r} 未标 require_confirm，拒绝执行")
                 return False, None
             if step.get("require_confirm"):
-                # 危险步骤：这里返回 False 走完整 agent，由 agent 自身发确认卡
-                logger.info(f"工作流 step{idx} {tool_name!r} require_confirm，降级为完整agent")
+                # 危险步骤：不走缓存静默执行，降级到完整 Agent 并触发确认流程
+                logger.info(f"工作流 step{idx} {tool_name!r} require_confirm，降级为完整Agent")
                 return False, None
 
             raw_params = step.get("params", {})
@@ -383,15 +468,29 @@ def _execute_workflow(record: dict, user_message: str) -> tuple[bool, str | None
             tool_info = TOOL_REGISTRY[tool_name]
             tool_fn = tool_info["function"]
 
-            # 过滤有效参数
+            # 过滤有效参数（兼容 parameters 为 list 的工具）
             valid_params = {}
             tool_params_spec = tool_info.get("parameters", {})
-            for param_name, param_spec in tool_params_spec.items():
-                if param_name in resolved_params:
-                    valid_params[param_name] = resolved_params[param_name]
-                elif param_spec.get("required"):
-                    logger.info(f"工作流 step{idx} 缺必需参数 {param_name!r}")
-                    return False, None
+            if isinstance(tool_params_spec, dict):
+                for param_name, param_spec in tool_params_spec.items():
+                    if param_name in resolved_params:
+                        valid_params[param_name] = resolved_params[param_name]
+                    elif param_spec.get("required"):
+                        logger.info(f"工作流 step{idx} 缺必需参数 {param_name!r}")
+                        return False, None
+            elif isinstance(tool_params_spec, list):
+                # list 型 parameters：按位置匹配
+                for param_spec in tool_params_spec:
+                    if not isinstance(param_spec, dict):
+                        continue
+                    param_name = param_spec.get("name", "")
+                    if not param_name:
+                        continue
+                    if param_name in resolved_params:
+                        valid_params[param_name] = resolved_params[param_name]
+                    elif param_spec.get("required"):
+                        logger.info(f"工作流 step{idx} 缺必需参数 {param_name!r}")
+                        return False, None
 
             try:
                 result = tool_fn(**valid_params)
@@ -702,16 +801,30 @@ def _guess_variables(user_message: str) -> dict:
     """从用户输入里启发式猜测变量名，常见值用 ${var} 引用"""
     variables = {}
     # 软件名
-    m = re.search(r"(?:软件|卸载)\s*([\w一-龥]+)", user_message)
+    m = _re.search(r"(?:软件|卸载)\s*([\w一-龥]+)", user_message)
     if m:
         variables["sw_name"] = {"regex": r"(?:软件|卸载)\s*([\w一-龥]+)"}
     # 路径
-    if re.search(r"[A-Za-z]:\\", user_message) or "/" in user_message:
+    if _re.search(r"[A-Za-z]:\\", user_message) or "/" in user_message:
         variables["path"] = {"regex": r"([A-Za-z]:\\[^\s]+|/[\w/.-]+)"}
     # 端口
-    m = re.search(r"端口\s*(\d+)", user_message)
+    m = _re.search(r"端口\s*(\d+)", user_message)
     if m:
         variables["port"] = {"regex": r"端口\s*(\d+)"}
+    # 文件名（含扩展名）
+    m = _re.search(r"(?:文件|文档|图片|视频|报告|报表|发票|合同)(?:[名为是]|[：:]\s*)([\w一-龥.\-]+)", user_message)
+    if m:
+        variables["filename"] = {"regex": r"(?:文件|文档|图片|视频|报告|报表|发票|合同)(?:[名为是]|[：:]\s*)([\w一-龥.\-]+)"}
+    # 日期
+    # 匹配 "日期: 2025-01-15"、"截止2025/01/15" 等形式
+    _date_regex = _re.compile(r"(?:日期|时间|截止|到期|开始)\s*[：: ]?(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
+    _date_match = _date_regex.search(user_message)
+    if _date_match:
+        variables["date"] = {"regex": r"(?:日期|时间|截止|到期|开始)\s*[：: ]?(\d{4}[-/]\d{1,2}[-/]\d{1,2})"}
+    # 数量
+    m = _re.search(r"(\d+)\s*(?:页|个|张|条|份|次|篇|项)", user_message)
+    if m:
+        variables["count"] = {"regex": r"(\d+)\s*(?:页|个|张|条|份|次|篇|项)"}
     return variables
 
 
@@ -727,11 +840,29 @@ def _param_to_template(params: dict, variables_hint: dict) -> dict:
         replaced = False
         for var_name in variables_hint.keys():
             # 启发式：如果值是字母数字组成的短词 并且 出现在 user_message 上下文里
-            if var_name == "sw_name" and re.fullmatch(r"[\w一-龥]+", v) and 1 < len(v) < 30:
+            if var_name == "sw_name" and _re.fullmatch(r"[\w一-龥]+", v) and 1 < len(v) < 30:
                 result[k] = f"${{{var_name}}}"
                 replaced = True
                 break
-            if var_name == "port" and re.fullmatch(r"\d+", v):
+            if var_name == "port" and _re.fullmatch(r"\d+", v):
+                result[k] = f"${{{var_name}}}"
+                replaced = True
+                break
+            if var_name == "filename" and _re.search(r"[\w一-龥.\-]+\.[a-zA-Z]{2,5}", v):
+                result[k] = f"${{{var_name}}}"
+                replaced = True
+                break
+            if var_name == "date" and _re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", v):
+                result[k] = f"${{{var_name}}}"
+                replaced = True
+                break
+            if var_name == "count" and _re.fullmatch(r"\d+", v):
+                # 只有当 port 没有同时被 hint 包含时才处理 count，避免端口数字被误变量化为 count
+                if "port" in variables_hint:
+                    # 如果同时有 port 和 count 变量，优先让 port 匹配（数字更可能是端口）
+                    if not replaced:
+                        result[k] = v
+                    continue
                 result[k] = f"${{{var_name}}}"
                 replaced = True
                 break
@@ -761,7 +892,11 @@ def check_complexity(user_message: str, model_choice: dict, context: dict = None
             else:
                 del _complexity_cache[cache_key]
         
+        # 每次写入时触发大小限制 + 过期清理
         if len(_complexity_cache) > _COMPLEXITY_CACHE_MAX_SIZE:
+            _cleanup_complexity_cache()
+        # 即使未到上限，也每 50 次插入触发一次 TTL 过期清理，避免过期条目长期占用内存
+        if len(_complexity_cache) % 50 == 0 and len(_complexity_cache) > 0:
             _cleanup_complexity_cache()
     
     msg = user_message.strip()
@@ -818,7 +953,15 @@ def check_complexity(user_message: str, model_choice: dict, context: dict = None
     elif complexity_score <= 0.3:
         result = "简单"
     else:
-        result = _llm_complexity_judgment(user_message, model_choice, complexity_score)
+        # 0.3 < score < 0.7: 规则不确定，调用 LLM 做加权融合
+        # LLM 判断不再是最终决策，而是与规则分加权融合，避免局部冲突
+        llm_result = _llm_complexity_judgment(user_message, model_choice, complexity_score)
+        llm_score = 0.8 if llm_result == "复杂" else 0.2
+        final_score = complexity_score * 0.6 + llm_score * 0.4
+        result = "复杂" if final_score >= 0.55 else "简单"
+        logger.info(
+            f"复杂度加权融合: rule={complexity_score:.2f} llm={llm_score:.2f} → final={final_score:.2f} → {result}"
+        )
     
     with _complexity_cache_lock:
         _complexity_cache[cache_key] = {
@@ -835,9 +978,13 @@ def _llm_complexity_judgment(user_message: str, model_choice: dict, base_score: 
     provider = model_choice.get("provider", "")
     if provider != "ollama":
         model_id = model_choice.get("id")
-        api_key = get_api_key(model_id)
-        if not api_key:
-            logger.info(f"API Key 未配置，跳过 LLM 复杂度判断，使用规则结果: {'复杂' if base_score > 0.3 else '简单'}")
+        if model_id:
+            api_key = get_api_key(model_id)
+            if not api_key:
+                logger.info(f"API Key 未配置，跳过 LLM 复杂度判断，使用规则结果: {'复杂' if base_score > 0.3 else '简单'}")
+                return "复杂" if base_score > 0.3 else "简单"
+        else:
+            # model_id 为空时无法获取 API Key，跳过 LLM 判断
             return "复杂" if base_score > 0.3 else "简单"
 
     judge_prompt = (
@@ -905,6 +1052,15 @@ def _cleanup_complexity_cache():
         ]
         for key in expired_keys:
             del _complexity_cache[key]
+
+
+def get_max_turns(complexity: str) -> int:
+    """根据复杂度返回快速 ReAct 模式下的最大执行轮次。
+    简单 → 最多 3 轮，复杂 → 最多 8 轮（0=不限制已废弃，避免无限循环风险）。
+    """
+    if complexity == "复杂":
+        return 8  # 复杂任务给足够的轮次，但仍有安全上限
+    return 3
 
 
 # ============================================================

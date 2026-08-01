@@ -15,9 +15,46 @@ try:
     PPT_AVAILABLE = True
 except ImportError:
     PPT_AVAILABLE = False
+    
+    
+# 在 generate_ppt 的 tool schema 中，强制要求每个 slide 携带 source 字段
+
+PPT_SLIDE_SCHEMA = {
+    "type": "object",
+    "required": ["slide_type", "title", "content", "data_source"],
+    "properties": {
+        "slide_type": {"type": "string", "enum": ["cover", "content", "section", "chart", "table", "comparison"]},
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+        "data_source": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["search_verified", "model_knowledge", "user_provided", "estimated"]
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "数据来源URL（type=search_verified时必填）"
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "数据可信度"
+                },
+                "note": {
+                    "type": "string",
+                    "description": "如 type=estimated，说明估算依据"
+                }
+            }
+        }
+    }
+}
 
 @register_tool(timeout=120)
-def generate_ppt(slides: list, theme: str = 'tech_blue', output_path: str = None, 
+def generate_ppt(slides: list = None, theme: str = 'tech_blue', output_path: str = None, 
                  img_timeout: int = 30, download_timeout: int = 60, **kwargs):
     """
     一站式生成视觉精美的PowerPoint演示文稿（HTML截图背景 + 可编辑文字层）。
@@ -490,6 +527,8 @@ def batch_ppt_process(directory: str, operation: str):
         ppt_files = list(directory_path.glob("*.pptx")) + list(directory_path.glob("*.ppt"))
         
         results = []
+        if operation == "merge":
+            base_prs = Presentation()
         for file_path in ppt_files:
             try:
                 prs = Presentation(file_path)
@@ -507,12 +546,21 @@ def batch_ppt_process(directory: str, operation: str):
                         )
                     }
                     results.append(info)
+                
+                elif operation == "merge":
+                    for slide in prs.slides:
+                        slide_layout = base_prs.slide_layouts[6]  # blank layout
+                        new_slide = base_prs.slides.add_slide(slide_layout)
+                        # Copy shapes from source slide
+                        for shape in slide.shapes:
+                            if hasattr(shape, "element"):
+                                new_slide.shapes._spTree.append(shape.element)
                     
             except Exception as e:
                 print(f"处理文件 {file_path.name} 时出错: {str(e)}")
         
         # 保存合并结果
-        if operation == "merge" and results:
+        if operation == "merge":
             merge_output = directory_path / "合并演示文稿.pptx"
             base_prs.save(merge_output)
             

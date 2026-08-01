@@ -20,6 +20,7 @@ from utils.error_mapper import translate_error
 from logger import get_logger
 from backend.agent import run_agent
 from backend.routing import check_chat_layer, check_frequent_cache, check_complexity, record_success
+from backend.rate_limiter import limiter
 from config.settings import SCREENSHOTS_DIR, MODELS_CONFIG_PATH, USER_PROFILE_PATH, MODEL_PRESETS
 from core.agent_state import checkpoint_manager
 
@@ -162,7 +163,11 @@ def _inject_attachment_context(user_message: str, file_list: list):
 
 # ── 工具执行线程池单例 ──
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
-atexit.register(_TOOL_EXECUTOR.shutdown, wait=False)
+
+def _shutdown_executor():
+    _TOOL_EXECUTOR.shutdown(wait=False)
+
+atexit.register(_shutdown_executor)
 
 # ── 命令确认机制（纯内存管理，无磁盘持久化） ──
 _pending_confirmations: dict = {}
@@ -223,7 +228,7 @@ def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
 
     append_session_message(session_id, "assistant", text,
                            trace_id=trace_id, user_id=user_id,
-                           skip_compress=True)
+                           skip_compress=True, msg_type="final_answer")
     return generate()
 
 
@@ -242,6 +247,9 @@ def api_chat():
         data = request.json
         user_input = data.get("message", "").strip()
         session_id = data.get("session_id")
+        
+        # Debug: Add initial error handling
+        get_logger().info(f"[/chat] API start: session_id={session_id}, trace_id={trace_id}", trace_id=trace_id)
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
 
@@ -388,7 +396,9 @@ def api_chat():
                                         return
                         get_logger().info(f"[/chat] Worker线程run_agent执行完成", trace_id=trace_id)
                     except Exception as e:
-                        get_logger().error("Agent worker 执行异常",
+                        import traceback
+                        tb_text = traceback.format_exc()
+                        get_logger().error("Agent worker 执行异常 (详细traceback)\n" + tb_text,
                                            trace_id=trace_id, session_id=session_id, error=str(e))
                         event_queue.put(("__error__", str(e)))
                     finally:
@@ -551,6 +561,7 @@ def _save_user_profile(profile):
             append_fact(text)
 
 
+@limiter.exempt
 @chat_bp.route('/api/config/models', methods=['GET'])
 def api_get_models_config():
     return jsonify({"success": True, **_load_models_config()})
@@ -582,6 +593,7 @@ def api_set_active_model():
 
 
 # ── 用户信息与首次启动 API ──
+@limiter.exempt
 @chat_bp.route('/api/config/user_profile', methods=['GET'])
 def api_get_user_profile():
     return jsonify({"success": True, "profile": _load_user_profile()})
@@ -599,11 +611,13 @@ def api_save_user_profile():
         return jsonify({"success": False, "message": str(e)})
 
 
+@limiter.exempt
 @chat_bp.route('/api/config/first_run', methods=['GET'])
-def api_check_first_run():
-    return jsonify({"first_run": not os.path.exists(USER_PROFILE_PATH)})
+def api_is_first_run():
+    return jsonify({"is_first_run": not os.path.exists(USER_PROFILE_PATH)})
 
 
+@limiter.exempt
 @chat_bp.route('/api/config/model_presets', methods=['GET'])
 def api_get_model_presets():
     return jsonify({"success": True, "presets": MODEL_PRESETS})
@@ -692,34 +706,49 @@ def save_session():
                 }
                 save_sessions_db(db)
             messages = data.get("messages", [])
+            saved_count = 0
+            total = len(messages) if messages else 0
             if messages:
                 existing = sql_get_messages(session_id)
                 existing_ids = {m.get("msg_id", "") for m in existing if m.get("msg_id")}
-                # 仅用 msg_id 去重，不用 content 去重（防止相同消息的多次请求被错误过滤）
+                # 用于内容级去重：后端 save_session_message 存的不带 msg_id，
+                # 前端 saveSessionToBackend 发来相同内容时会被此规则过滤
+                existing_ai_chat = {
+                    m.get("content", "") for m in existing
+                    if m.get("role") == "assistant" and m.get("msg_type") in ("chat", "text", "final_answer")
+                }
                 sender_to_role = {"user": "user", "ai": "assistant", "system": "system"}
                 for msg in messages:
-                    role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
-                    msg_text = msg.get("text") or ""
-                    msg_type = msg.get("msgType", "chat")
-                    msg_id = msg.get("msgId", "")
-                    if msg_id and msg_id in existing_ids:
-                        continue
-                    frontend_ts = msg.get("timestamp", "")
-                    if frontend_ts:
-                        try:
-                            from datetime import datetime, timezone, timedelta
-                            dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
-                            local_dt = dt.astimezone(timezone(timedelta(hours=8)))
-                            frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            frontend_ts = frontend_ts.replace("T", " ")[:19]
-                    sql_add_message(session_id,
-                        "user" if msg.get("sender") == "user" else "assistant",
-                        msg.get("text", ""),
-                        msg_type=msg.get("msgType", "chat"),
-                        msg_id=msg_id,
-                        timestamp=frontend_ts)
-        return jsonify({"success": True})
+                    try:
+                        role = sender_to_role.get(msg.get("sender", "ai"), "assistant")
+                        msg_text = msg.get("text") or ""
+                        msg_type = msg.get("msgType", "chat")
+                        msg_id = msg.get("msgId", "")
+                        if msg_id and msg_id in existing_ids:
+                            continue
+                        # 内容级去重：防止前端重发后端已存的 AI 回复（覆盖 chat/text/final_answer 三种类型）
+                        if not msg_id and role == "assistant" and msg_type in ("chat", "text", "final_answer") and msg_text in existing_ai_chat:
+                            continue
+                        frontend_ts = msg.get("timestamp", "")
+                        if frontend_ts:
+                            try:
+                                from datetime import datetime, timezone, timedelta
+                                dt = datetime.fromisoformat(frontend_ts.replace("Z", "+00:00"))
+                                local_dt = dt.astimezone(timezone(timedelta(hours=8)))
+                                frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                frontend_ts = frontend_ts.replace("T", " ")[:19]
+                        sql_add_message(session_id,
+                            "user" if msg.get("sender") == "user" else "assistant",
+                            msg.get("text", ""),
+                            msg_type=msg.get("msgType", "chat"),
+                            msg_id=msg_id,
+                            timestamp=frontend_ts)
+                        saved_count += 1
+                    except Exception as e:
+                        get_logger().error(f"保存消息失败: {e}", traceback=traceback.format_exc(),
+                                           session_id=session_id, msg_id=msg.get("msgId", ""))
+        return jsonify({"success": True, "saved": saved_count, "total": total})
     except Exception as e:
         return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
@@ -736,6 +765,7 @@ def new_session():
         return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 
+@limiter.exempt
 @chat_bp.route('/api/sessions', methods=['GET'])
 def get_sessions():
     try:
@@ -746,6 +776,7 @@ def get_sessions():
         return jsonify([])
 
 
+@limiter.exempt
 @chat_bp.route('/api/models', methods=['GET'])
 def get_models():
     try:
@@ -778,6 +809,7 @@ def delete_session_route(session_id):
         return jsonify({"success": False, "message": translate_error(str(e))}), 500
 
 
+@limiter.exempt
 @chat_bp.route('/api/sessions/active', methods=['GET'])
 def get_active_session():
     from memory import get_active_session_id
@@ -785,6 +817,7 @@ def get_active_session():
     return jsonify({"session_id": session_id})
 
 
+@limiter.exempt
 @chat_bp.route('/api/sessions/<session_id>', methods=['GET'])
 def get_session(session_id):
     from memory import get_chat_messages
@@ -793,10 +826,14 @@ def get_session(session_id):
         formatted = []
         for msg in messages:
             sender = "user" if msg["role"] == "user" else "ai"
+            msg_type = msg.get("msg_type") or "chat"
+            # 将 text 类型统一映射为 chat，保持前后端一致性；空类型也默认 chat
+            if msg_type in ("text", "", None):
+                msg_type = "chat"
             formatted.append({
                 "sender": sender,
                 "text": msg["content"],
-                "msgType": msg.get("msg_type", "chat"),
+                "msgType": msg_type,
                 "timestamp": msg.get("created_at", ""),
                 "msgId": msg.get("msg_id", "")
             })

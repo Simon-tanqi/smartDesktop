@@ -19,6 +19,7 @@ import os
 import time
 import json
 import logging
+import shutil
 from typing import Dict, List, Optional, Tuple, Any
 
 from config.settings import SCREENSHOTS_DIR, DATA_DIR
@@ -110,7 +111,7 @@ def _resolve_path(file_path: str) -> str | None:
 def _safe_gui_operation(require_cv2: bool = False, require_clip: bool = False):
     """GUI操作的安全装饰器，统一异常处理，消除双重try-except。
 
-    被装饰函数不需要内部try-except，直接抛异常即可。
+    操作后自动等待 0.5s 确保 UI 响应，并记录操作日志以便排查。
     """
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -119,6 +120,11 @@ def _safe_gui_operation(require_cv2: bool = False, require_clip: bool = False):
                 return {"success": False, "message": error_msg}
             try:
                 result = func(*args, **kwargs)
+                # 操作后等待 UI 响应并记录日志（Bug 3 修复：增加操作后反馈校验）
+                time.sleep(0.5)
+                logger.info("GUI 操作完成 %s, 结果: %s",
+                            func.__name__,
+                            str(result.get("message", ""))[:120] if isinstance(result, dict) else "ok")
                 return _truncate_result(result)
             except pyautogui.FailSafeException:
                 return {"success": False, "message": "⚠️ 触发了pyautogui安全熔断（鼠标移到左上角），操作已终止"}
@@ -380,6 +386,116 @@ def _gui_locate_on_screen(image_path: str, confidence: float = 0.8) -> Dict[str,
 #  高级操作
 # ═══════════════════════════════════════════
 
+# 常见程序名 → 候选绝对路径列表（用于裸程序名解析）
+_KNOWN_PROGRAMS: Dict[str, List[str]] = {
+    "msedge": [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ],
+    "chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+    ],
+    "firefox": [
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+    ],
+    "notepad": [
+        r"C:\Windows\System32\notepad.exe",
+        r"C:\Windows\notepad.exe",
+    ],
+    "calc": [
+        r"C:\Windows\System32\calc.exe",
+        r"C:\Windows\calc.exe",
+    ],
+    "explorer": [
+        r"C:\Windows\explorer.exe",
+    ],
+    "cmd": [
+        r"C:\Windows\System32\cmd.exe",
+    ],
+    "powershell": [
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    ],
+    "taskmgr": [
+        r"C:\Windows\System32\Taskmgr.exe",
+    ],
+    "control": [
+        r"C:\Windows\System32\control.exe",
+    ],
+    "mspaint": [
+        r"C:\Windows\System32\mspaint.exe",
+        r"C:\Program Files\Windows NT\Accessories\mspaint.exe",
+    ],
+    "wordpad": [
+        r"C:\Program Files\Windows NT\Accessories\wordpad.exe",
+    ],
+}
+
+
+def _resolve_program_path(name_or_path: str) -> Optional[str]:
+    """将裸程序名解析为可执行文件绝对路径。
+    查找顺序：①_KNOWN_PROGRAMS映射（逐候选检查exists）→ ②shutil.which(name) →
+    ③shutil.which(name+'.exe') → ④常见安装目录一层扫描（名称含name_key的目录下找含name_key的.exe）。
+    未找到返回 None；扫描过程捕获 PermissionError 等异常兜底。"""
+    if not name_or_path or not name_or_path.strip():
+        return None
+    name = name_or_path.strip()
+
+    # ① 已知程序映射：逐候选路径检查存在性
+    candidates = _KNOWN_PROGRAMS.get(name.lower())
+    if candidates:
+        for cand in candidates:
+            if cand and os.path.isfile(cand):
+                return cand
+
+    # ②③ PATH 查找：优先原样，其次补 .exe 后缀
+    try:
+        found = shutil.which(name)
+        if found:
+            return found
+        found = shutil.which(name + ".exe")
+        if found:
+            return found
+    except Exception:
+        pass
+
+    # ④ 常见安装目录一层扫描
+    base_dirs: List[str] = []
+    for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+        val = os.environ.get(env_var)
+        if val and os.path.isdir(val):
+            base_dirs.append(val)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        base_dirs.append(os.path.join(local, "Programs"))
+    name_key = name.lower()
+    for base in base_dirs:
+        try:
+            entries = os.listdir(base)
+        except (PermissionError, OSError):
+            continue
+        for entry in entries:
+            try:
+                if name_key not in entry.lower():
+                    continue
+                dir_path = os.path.join(base, entry)
+                if not os.path.isdir(dir_path):
+                    continue
+                try:
+                    for fname in os.listdir(dir_path):
+                        fl = fname.lower()
+                        if fl.startswith(name_key) and fl.endswith(".exe"):
+                            full = os.path.join(dir_path, fname)
+                            if os.path.isfile(full):
+                                return full
+                except (PermissionError, OSError):
+                    continue
+            except (PermissionError, OSError):
+                continue
+    return None
+
 @_safe_gui_operation()
 def _gui_open_application(application_path: str, wait_time: int = DEFAULT_APP_WAIT) -> Dict[str, Any]:
     # 支持 Windows URI 协议（如 ms-settings:, mailto:, https: 等）
@@ -396,6 +512,18 @@ def _gui_open_application(application_path: str, wait_time: int = DEFAULT_APP_WA
         except Exception as e:
             return {"success": False, "message": f"URI协议启动失败: {str(e)}"}
 
+    # 裸程序名分支：非绝对路径且不含路径分隔符时，尝试解析为系统已安装程序
+    if not os.path.isabs(application_path) and "/" not in application_path and "\\" not in application_path:
+        resolved_prog = _resolve_program_path(application_path)
+        if resolved_prog:
+            try:
+                os.startfile(resolved_prog)
+                time.sleep(wait_time)
+                return {"success": True, "message": f"已启动应用程序: {application_path} → {resolved_prog}", "app_path": resolved_prog}
+            except Exception as e:
+                return {"success": False, "message": f"启动应用程序失败: {application_path} → {resolved_prog}: {str(e)}"}
+        # 未命中则继续走原有路径校验逻辑（workspace / 绝对路径 / 错误返回）
+
     # 路径安全校验：允许workspace内或系统已安装程序
     resolved = _resolve_path(application_path)
     if resolved:
@@ -408,6 +536,18 @@ def _gui_open_application(application_path: str, wait_time: int = DEFAULT_APP_WA
 
     if not os.path.exists(target):
         return {"success": False, "message": f"应用程序不存在: {target}"}
+
+    # ── 文件扩展名白名单校验 ──
+    _ALLOWED_EXTENSIONS = {".exe", ".lnk", ".bat", ".cmd", ".msi", ".com", ".ps1", ".vbs", ".wsf", ".jar", ".appref-ms"}
+    _ext = os.path.splitext(target)[1].lower()
+    if _ext and _ext not in _ALLOWED_EXTENSIONS:
+        return {
+            "success": False,
+            "message": (
+                f"拒绝启动：文件扩展名 '{_ext}' 不在白名单中。"
+                f"仅允许启动已知安全类型：{', '.join(sorted(_ALLOWED_EXTENSIONS))}。"
+            )
+        }
 
     os.startfile(target)
     time.sleep(wait_time)
@@ -531,7 +671,6 @@ def gui_locate_image(image_path: str, confidence: float = 0.8) -> str:
 
 
 @register_tool(timeout=60)
-@path_params("application_path")
 def gui_open_app(application_path: str, wait_time: int = 3) -> str:
     """打开应用程序。application_path须在workspace内或为系统已安装程序路径。wait_time为启动等待秒数。"""
     return json.dumps(_gui_open_application(application_path, wait_time), ensure_ascii=False)

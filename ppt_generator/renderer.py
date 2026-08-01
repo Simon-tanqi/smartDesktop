@@ -119,6 +119,37 @@ def _hex_color(rgba_str: str) -> str:
     return '#333333'
 
 
+def _render_source_footnote(slide_data: dict) -> str:
+    """在 slide 底部渲染数据来源标注"""
+    source = slide_data.get("data_source", {})
+    source_type = source.get("type", "model_knowledge")
+
+    footnote_map = {
+        "search_verified": f" 数据来源: {', '.join(source.get('urls', [])[:2])}",
+        "user_provided": " 数据来源: 用户提供",
+        "model_knowledge": "⚠️ 基于模型知识，未经实时验证",
+        "estimated": f" 估算值: {source.get('note', '无说明')}",
+    }
+
+    footnote_text = footnote_map.get(source_type, "")
+    if not footnote_text:
+        return ""
+
+    return f'''    <div class="slide-footnote" style="
+        position: absolute;
+        bottom: 12px;
+        left: 40px;
+        right: 40px;
+        font-size: 10px;
+        color: #999;
+        border-top: 1px solid #eee;
+        padding-top: 6px;
+    ">
+        {footnote_text}
+    </div>
+    '''
+
+
 # ── PPTX 生成 ──────────────────────────────────
 
 def _add_text_box(slide, region: dict):
@@ -505,6 +536,14 @@ def _render_playwright(slides_data: list, theme: dict, output_path: str,
 
                 tmpl = env.get_template(tmpl_name)
                 html = tmpl.render(theme=theme, **slide_info.get("data", {}))
+
+                # 集成数据来源脚注
+                footnote_html = _render_source_footnote(slide_info)
+                if footnote_html:
+                    if '</body>' in html:
+                        html = html.replace('</body>', footnote_html + '\n</body>')
+                    else:
+                        html += '\n' + footnote_html
 
                 tmp_dir = Path(tempfile.mkdtemp())
                 temp_dirs.append(tmp_dir)

@@ -88,3 +88,13 @@ MODEL_PRESETS = {
     "ollama":       {"name": "Ollama 本地","base_url": "http://localhost:11434/v1",          "temperature": 0.7, "models": [], "warning": "本地模型功能可能受模型能力影响，效果远不如云端大模型"},
     "custom":       {"name": "自定义",     "base_url": "",                                   "temperature": 0.7, "models": []},
 }
+
+# ═══════════════════════════════════════════════
+#  功能开关
+# ═══════════════════════════════════════════════
+# 关闭对应功能时改为 False，引擎侧相应 hook 会跳过执行（保留调用点，不删除代码结构）。
+PROGRESS_EVALUATOR_ENABLED = True
+CONTEXT_ROUTER_ENABLED = True
+COMPRESSOR_ENABLED = True
+CHALLENGE_PATH_A_ENABLED = True
+TURN_PERSIST_ENABLED = True

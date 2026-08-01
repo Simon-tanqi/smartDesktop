@@ -11,6 +11,8 @@ import json
 import datetime
 import threading
 
+_cache_lock = threading.Lock()
+
 from memory.config import (
     USER_MD, PROJECTS_MD, SKILLS_MD, FACTS_MD,
     CUSTOM_SKILLS_DIR, MAX_RELEVANT_MEMORY_CHARS,
@@ -134,18 +136,21 @@ def _read_lines_cached(filepath, skip_header=1):
         mtime = os.path.getmtime(filepath) if os.path.exists(filepath) else 0
     except OSError:
         mtime = 0
-    if filepath in _lines_cache:
-        cached_mtime, cached_lines = _lines_cache[filepath]
-        if cached_mtime == mtime:
-            return cached_lines
+    with _cache_lock:
+        if filepath in _lines_cache:
+            cached_mtime, cached_lines = _lines_cache[filepath]
+            if cached_mtime == mtime:
+                return cached_lines
     lines = _read_lines(filepath, skip_header=skip_header)
-    _lines_cache[filepath] = (mtime, lines)
+    with _cache_lock:
+        _lines_cache[filepath] = (mtime, lines)
     return lines
 
 
 def _invalidate_cache(filepath):
-    if filepath in _lines_cache:
-        del _lines_cache[filepath]
+    with _cache_lock:
+        if filepath in _lines_cache:
+            del _lines_cache[filepath]
 
 
 def _timestamp():
@@ -223,8 +228,31 @@ def list_custom_skill_files():
     return files
 
 
+def _extract_keywords(text):
+    """提取关键词：去标点、去停用词、保留2字以上有意义的词"""
+    clean = re.sub(r'[^\w\u4e00-\u9fff]', ' ', text)
+    words = re.findall(r'[\w\u4e00-\u9fff]+', clean)
+    stopwords = {
+        "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都",
+        "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会",
+        "着", "没有", "看", "好", "自己", "这", "他", "她", "它", "我们",
+        "他们", "对", "与", "为", "把", "被", "让", "从", "那", "吗", "吧",
+        "呢", "啊", "哦", "嗯", "什么", "怎么", "如何", "为什么", "可以",
+        "能", "该", "个", "些", "里", "中", "后", "前", "时", "将", "要",
+        "还", "已经", "正在", "这个", "那个", "这些", "那些", "做", "用",
+        "没", "可能", "向", "比", "更", "最", "太", "很", "非常", "比较",
+        "因为", "所以", "但", "是", "不", "如果", "虽然", "然后", "而且",
+        "或者", "还是", "但是", "可以", "应该", "需要", "经过", "通过",
+    }
+    return [w for w in words if w.lower() not in stopwords and len(w) >= 2]
+
+
 def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     _ensure_migrated()
+
+    keywords = _extract_keywords(user_message)
+    if not keywords:
+        return ""
 
     sections = []
 
@@ -250,20 +278,49 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
     if not sections:
         return ""
 
+    # 按关键词匹配数打分，仅保留有关联的记录
+    scored = []
+    for cat_name, lines in sections:
+        for line in lines:
+            match_count = sum(1 for kw in keywords if kw.lower() in line.lower())
+            if match_count > 0:
+                scored.append((match_count, cat_name, line))
+
+    if not scored:
+        return ""
+
+    # 按分数降序排列
+    scored.sort(key=lambda x: -x[0])
+
+    # 按分数截断，尽量保留整条句子
     parts = []
     total_chars = 0
-    for cat_name, lines in sections:
-        header = f"【{cat_name}】"
-        if total_chars + len(header) > max_chars:
-            return "\n".join(parts)
-        parts.append(header)
-        total_chars += len(header)
+    current_header = None
 
-        for line in lines:
-            if total_chars + len(line) > max_chars:
-                return "\n".join(parts)
-            parts.append(line)
-            total_chars += len(line)
+    for score, cat_name, line in scored:
+        # 是否需要加分类标题
+        if cat_name != current_header:
+            header = f"【{cat_name}】"
+            if total_chars + len(header) > max_chars:
+                break
+            parts.append(header)
+            total_chars += len(header)
+            current_header = cat_name
+
+        if total_chars + len(line) > max_chars:
+            # 尝试保留到句子边界
+            remaining = max_chars - total_chars
+            if remaining > 20:
+                truncated = line[:remaining]
+                for sep in ("。", "！", "？", "\n", ".", "!", "?"):
+                    idx = truncated.rfind(sep)
+                    if idx > 0:
+                        parts.append(truncated[:idx + 1])
+                        break
+            break
+
+        parts.append(line)
+        total_chars += len(line)
 
     return "\n".join(parts)
 
@@ -271,3 +328,26 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
 def add_compressed_summary(summary, source_type="auto"):
     prefix = "【自动压缩】" if source_type == "auto" else ""
     append_fact(f"{prefix}{summary}")
+
+
+def add_task_memory(session_id, turn, query, outcome="success",
+                    key_tools=None, summary="", timestamp=None):
+    """任务结束沉淀：将本次任务的 query/结果/关键工具写入长期记忆（事实库）。
+
+    追加到 FACTS_MD，供 get_relevant_memory 关键词检索。
+    """
+    key_tools = key_tools or []
+    if isinstance(key_tools, (list, tuple, set)):
+        key_tools = ",".join(str(k) for k in key_tools if k)
+    ts = timestamp or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    query_s = str(query).strip().replace("\n", " ")[:200]
+    summary_s = str(summary).strip().replace("\n", " ")[:300]
+
+    line = (f"【任务】[{ts}] sid={session_id} turn={turn} "
+            f"结果={outcome} 查询={query_s}")
+    if key_tools:
+        line += f" 工具={key_tools}"
+    if summary_s:
+        line += f" 摘要={summary_s}"
+    append_fact(line)
+    return line

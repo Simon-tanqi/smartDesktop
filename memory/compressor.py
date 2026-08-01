@@ -94,7 +94,7 @@ def _generate_summary(messages, old_summary="", max_len=MAX_SUMMARY_CHARS):
         if content:
             dialogue_parts.append(f"[{role}]: {str(content)[:500]}")
     dialogue = "\n".join(dialogue_parts)[:3000]
-    old_block = f"【之前摘要】{old_summary}\n" if old_summary else ""
+    old_block = f"【之前摘要】{old_summary[-2000:]}\n" if old_summary else ""
     system_prompt = {
         "role": "system",
         "content": SUMMARY_PROMPT_TEMPLATE.format(
@@ -144,10 +144,12 @@ def increment_merge_summary(session_id, new_round_data, max_len=MAX_SUMMARY_CHAR
     old_summary = get_latest_summary(session_id)
     
     round_text = []
-    if new_round_data.get("user_task"):
-        round_text.append(f"用户: {new_round_data['user_task'][:500]}")
-    if new_round_data.get("ai_reply"):
-        round_text.append(f"AI: {new_round_data['ai_reply'][:500]}")
+    user_task = new_round_data.get("user_task", "")
+    if user_task:
+        round_text.append(f"用户: {user_task[:500]}")
+    ai_reply = new_round_data.get("ai_reply", "")
+    if ai_reply:
+        round_text.append(f"AI: {ai_reply[:500]}")
     for tc in new_round_data.get("tool_calls", []):
         tool_name = tc.get("tool_name", "")
         tool_args = tc.get("tool_arguments", {})
@@ -158,7 +160,7 @@ def increment_merge_summary(session_id, new_round_data, max_len=MAX_SUMMARY_CHAR
     
     dialogue = "\n".join(round_text)
     
-    old_block = f"【之前摘要】{old_summary}\n" if old_summary else ""
+    old_block = f"【之前摘要】{old_summary[-2000:]}\n" if old_summary else ""
     
     system_prompt = {
         "role": "system",
@@ -251,15 +253,20 @@ def compress_conversation_async(session_id, recent_token_min=RECENT_TOKEN_MIN,
     if now - last_cleanup > _LOCK_CLEANUP_INTERVAL:
         _cleanup_expired_locks()
 
-    lock = _compression_locks.setdefault(session_id, threading.Lock())
-    if not lock.acquire(blocking=False):
-        return
     _compression_lock_timestamps[session_id] = now
 
     def _run():
+        lock = _compression_locks.setdefault(session_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return
         try:
             messages = _get_chat_messages_with_ids(session_id)
             if not messages:
+                return
+
+            # 对话轮次少于 3 轮时不触发摘要压缩，避免过早消费 LLM 调用
+            user_turns = sum(1 for m in messages if m.get("role") == "user")
+            if user_turns < 3:
                 return
 
             total_tokens = estimate_messages_tokens(messages)

@@ -11,6 +11,7 @@ v4：
 import os
 import re
 import json
+import logging
 import datetime
 import threading
 
@@ -23,8 +24,9 @@ from memory.stores.json_store import load_sessions_db, save_sessions_db
 from memory.stores.sqlite_store import (
     add_chat_message, get_chat_messages, log_operation,
     get_session_messages, get_full_session_messages, get_latest_summary,
-    add_summary,
+    add_summary, count_chat_messages,
 )
+from logger import get_logger
 from memory.extractor import extract_facts_async
 from memory.compressor import (
     compress_conversation_async,
@@ -33,6 +35,74 @@ from memory.compressor import (
     increment_merge_summary,
 )
 from memory.long_term import get_relevant_memory
+
+
+# 在 session.py 顶部定义常量
+WORKING_MEMORY_ROUNDS = 2  # 情节缓存保留轮数
+
+def _get_working_memory(session_id: str) -> dict:
+    """获取当前会话的通用工作记忆（通用键值容器）。
+    
+    返回结构：
+    {
+        "variables": {},        # Agent 自由写入的任意键值对
+        "plan": [],            # 当前任务拆解的计划步骤（可选）
+        "current_step": 0,      # 当前执行到的步骤
+        "last_observation": "", # 上一步的观察结果
+    }
+    """
+    db = load_sessions_db()
+    session_data = db.get(session_id, {})
+    
+    # 若不存在，初始化一个空的工作记忆容器
+    if "working_memory" not in session_data:
+        session_data["working_memory"] = {
+            "variables": {},
+            "plan": [],
+            "current_step": 0,
+            "last_observation": ""
+        }
+        db[session_id] = session_data
+        save_sessions_db(db)
+    
+    return session_data["working_memory"]
+
+def _update_working_memory(session_id: str, updates: dict):
+    """供外部或工具调用的工作记忆更新接口。
+    
+    Args:
+        updates: 要更新的字段，如 {"variables": {"file_path": "/tmp/a.csv"}}
+    """
+    db = load_sessions_db()
+    if session_id not in db:
+        return False
+    
+    session_data = db[session_id]
+    if "working_memory" not in session_data:
+        session_data["working_memory"] = {"variables": {}, "plan": [], "current_step": 0}
+    
+    # 深度合并（简单示例，生产可用深合并）
+    for key, value in updates.items():
+        if key == "variables" and isinstance(value, dict):
+            session_data["working_memory"]["variables"].update(value)
+        else:
+            session_data["working_memory"][key] = value
+    
+    save_sessions_db(db)
+    return True
+
+def _get_tool_cache_from_registry(available_tools: list) -> list:
+    """第一阶段：仅输出名称+单行描述的'菜单'，不携带完整 schema。"""
+    cache = []
+    for tool in available_tools:
+        desc = tool.get("description", "")
+        # 截取第一行或前80字符作为单行描述
+        single_line = desc.split('\n')[0][:80] if desc else "无描述"
+        cache.append({
+            "name": tool.get("name", "unknown"),
+            "desc": single_line
+        })
+    return cache
 
 
 def _make_title(content: str) -> str:
@@ -199,7 +269,31 @@ def update_last_turn(session_id, turn):
 
 def get_last_turn(session_id):
     db = load_sessions_db()
-    return db.get(session_id, {}).get("last_turn", 0)
+    return db.get(session_id, {}).get("last_turn", -1)
+
+
+def load_turn_count(session_id: str) -> int:
+    """读该会话已分配的最大 turn 序号；不存在返回 -1。读失败返回 -1 并记日志，绝不抛。"""
+    try:
+        db = load_sessions_db()
+        return db.get(session_id, {}).get("turn_count", -1)
+    except Exception as e:
+        get_logger().error(f"load_turn_count 失败 session={session_id}: {e}")
+        return -1
+
+
+def save_turn_count(session_id: str, n: int) -> bool:
+    """写回；成功返回 True，失败返回 False（调用方据此回滚内存）。"""
+    try:
+        db = load_sessions_db()
+        if session_id in db:
+            db[session_id]["turn_count"] = n
+            save_sessions_db(db)
+            return True
+        return False
+    except Exception as e:
+        get_logger().error(f"save_turn_count 失败 session={session_id}: {e}")
+        return False
 
 
 def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35):
@@ -293,6 +387,39 @@ def _calculate_session_relevance(current_user_msg, messages, threshold=0.1):
 
     avg_score = weighted_score / total_weight
     return avg_score >= threshold, avg_score
+    
+#供 Agent 调用
+def tool_save_memory(session_id: str, key: str, value: str) -> str:
+    """保存关键信息到工作记忆（用于跨轮次传递）。
+    
+    Args:
+        key: 变量名（如 "generated_file", "user_preference"）
+        value: 具体的值
+    """
+    if not session_id:
+        return "错误：未找到会话"
+    
+    current = _get_working_memory(session_id)
+    current["variables"][key] = value
+    _update_working_memory(session_id, {"variables": {key: value}})
+    
+    return f"已记住：{key} = {value[:50]}..."
+
+def tool_recall_memory(session_id: str, key: str = None) -> str:
+    """从工作记忆中提取信息。
+    
+    Args:
+        key: 要查询的变量名，若不填则返回所有记忆。
+    """
+    if not session_id:
+        return "错误：未找到会话"
+    
+    memory = _get_working_memory(session_id)
+    if key:
+        value = memory["variables"].get(key, "未找到该信息")
+        return f"{key} = {value}"
+    else:
+        return json.dumps(memory["variables"], ensure_ascii=False, indent=2)
 
 
 def _parse_tool_call(content):
@@ -471,7 +598,8 @@ def _trim_tool_result(result, max_len=200, preserve_full=False):
 
 def _build_structured_history(messages, session_id="", 
                               preserve_thinking_rounds=3,
-                              is_current_turn=False):
+                              is_current_turn=False,
+                              max_reasoning_subturns=2):
     """构建结构化历史。
     
     设计要点：
@@ -485,6 +613,7 @@ def _build_structured_history(messages, session_id="",
         session_id: 会话ID
         preserve_thinking_rounds: 保留思考轨迹的用户轮次数量
         is_current_turn: 是否为当前正在进行的用户轮次（运行态）
+        max_reasoning_subturns: 当前轮次内保留完整思考轨迹的子轮次数量（从末尾计数）
     """
     history_entries = []
     current_entry = None
@@ -524,7 +653,16 @@ def _build_structured_history(messages, session_id="",
             current_child_turns = []
 
         elif role == "assistant":
-            if current_entry:
+            # 仅对话类 assistant 消息参与结构化历史：
+            # 排除 msg_type="think"（思考摘要）和 "think_step"（前端展示摘要），
+            # 否则会污染子轮次记录，并让 ai_reply 抓到思考内容而非真实回复
+            if current_entry and msg_type == "final_answer":
+                # AI 最终回复（_safe_final 以 msg_type="final_answer" 入库）：
+                # 填充当前轮次的 ai_reply，使本轮对话摘要进入 context_memory（近3轮结构化记忆）。
+                # 此前 final_answer 被忽略，导致 ai_reply 恒为空——context_memory 从未包含 AI 回复。
+                # 每轮仅一条 final_answer（_safe_final 有 final_emitted 守卫），直接覆盖天然幂等。
+                current_entry["ai_reply"] = content[:500] if len(content) > 500 else content
+            elif current_entry and msg_type in ("chat", "tool_call"):
                 tool_name, tool_args = _parse_tool_call(content)
                 tool_call_list = _extract_tool_calls(content)
                 reasoning_trace = _parse_reasoning_trace(content)
@@ -608,6 +746,17 @@ def _build_structured_history(messages, session_id="",
                 else:
                     new_child_turns.append(_clean_reasoning_for_archive(ct))
             entry["child_turns"] = new_child_turns
+        elif is_current_turn and rounds_from_end == 0:
+            # 当前轮次：裁剪超过 max_reasoning_subturns 的子轮次思考轨迹
+            child_turns = entry.get("child_turns", [])
+            for j, ct in enumerate(child_turns):
+                turns_from_end = len(child_turns) - 1 - j
+                if turns_from_end >= max_reasoning_subturns:
+                    ct["reasoning_trace"] = {}
+                    ct["ai_thinking"] = ""
+                    ct["ai_output"] = _trim_tool_result(
+                        ct.get("ai_output", ""), max_len=200
+                    )
 
     return history_entries
 
@@ -639,7 +788,7 @@ def _finalize_entry_v2(entry, tool_calls, last_tool_name, last_tool_args, last_t
     ai_reply = entry.get("ai_reply", "")
     if any_failed:
         entry["task_status"] = "failed"
-    elif all_success or "final_message" in ai_reply or "任务已完成" in ai_reply:
+    elif tool_calls and (all_success or "final_message" in ai_reply or "任务已完成" in ai_reply):
         entry["task_status"] = "completed"
     elif ai_reply:
         entry["task_status"] = "completed"
@@ -743,29 +892,219 @@ def build_child_turn_context(child_turns: list, keep_reasoning_rounds: int = 2) 
         parts.append("\n".join(ct_parts))
     
     return "\n\n".join(parts)
+    
+    
+WORKING_ROUNDS = 3           # 情节缓存保留的用户轮次数
+COMPRESS_THRESHOLD = 3       # 超过此轮次触发摘要压缩
+KEEP_REASONING_SUBTURNS = 2  # 子轮次思考轨迹保留数
+
+
+def _build_episodic_buffer(messages, rounds=2):
+    """构建紧凑的情节缓存，提取最近 rounds 轮的核心信息。
+    
+    消息格式与 _build_structured_history_v2 一致：
+    - user + chat: 用户任务消息
+    - assistant: AI回复（含工具调用或思考）
+    - user + tool_result: 工具执行结果
+    """
+    buffer = []
+    current_round = None
+    
+    for m in messages:
+        role = m.get("role")
+        msg_type = m.get("msg_type", "chat")
+        content = m.get("content", "")
+        
+        if role == "user" and msg_type == "chat":
+            if current_round:
+                buffer.append(current_round)
+            current_round = {
+                "user_task": content[:300],
+                "tool_calls": []
+            }
+        elif role == "assistant" and current_round:
+            tool_name, tool_args = _parse_tool_call(content)
+            if tool_name:
+                current_round["tool_calls"].append({
+                    "tool": tool_name,
+                    "arguments": tool_args,
+                    "result": ""
+                })
+            # 非工具调用的助手回复（纯文本最终回复）不注入紧凑缓存，
+            # 完整回复由 _build_structured_history 的 ai_reply 承担，避免重复注入
+        elif role == "user" and msg_type == "tool_result" and current_round:
+            result_snippet = content[:400] if len(content) > 400 else content
+            if current_round["tool_calls"]:
+                current_round["tool_calls"][-1]["result"] = result_snippet
+    
+    if current_round:
+        buffer.append(current_round)
+    
+    return buffer[-rounds:] if len(buffer) > rounds else buffer
+
+
+def get_layered_memory(session_id: str, user_message: str = "") -> dict:
+    """为 react_engine 子轮次拼接提供分层记忆数据。
+
+    纯读取无副作用，不触发压缩、不做重复查询检测、不构建 context_suffix。
+
+    Returns:
+        {
+            "long_term": str,              # ① 长期记忆
+            "recent_structured": str,      # ② 近三轮结构化记忆（JSON）
+            "older_summary": str,          # ③ 超三轮自然语言摘要
+            "plan_info": str,              # ⑤ 规划信息
+        }
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        messages = get_full_session_messages(session_id)
+    except Exception:
+        messages = []
+
+    # 找到用户消息索引（仅 chat 类型）
+    chat_user_indices = [i for i, m in enumerate(messages)
+                         if m.get("role") == "user" and m.get("msg_type") == "chat"]
+    total_rounds = len(chat_user_indices)
+
+    # ① 长期记忆
+    try:
+        long_term = get_relevant_memory(user_message) or ""
+    except Exception as e:
+        logger.warning(f"[get_layered_memory] ① 长期记忆构建失败: {e}")
+        long_term = ""
+
+    # ② 近三轮结构化记忆
+    recent_structured = ""
+    try:
+        if total_rounds > 0:
+            if total_rounds > WORKING_ROUNDS:
+                cutoff_idx = chat_user_indices[-WORKING_ROUNDS]
+                episodic_messages = messages[cutoff_idx:]
+            else:
+                episodic_messages = messages
+
+            episodic_history = _build_structured_history(
+                episodic_messages, session_id,
+                preserve_thinking_rounds=WORKING_ROUNDS,
+                is_current_turn=True,
+                max_reasoning_subturns=KEEP_REASONING_SUBTURNS
+            )
+
+            recent_structured = json.dumps(episodic_history, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[get_layered_memory] ② 结构化记忆构建失败: {e}")
+        recent_structured = ""
+
+    # ③ 超三轮自然语言摘要
+    older_summary = ""
+    try:
+        if total_rounds > WORKING_ROUNDS:
+            older_summary = get_latest_summary(session_id) or ""
+    except Exception as e:
+        logger.warning(f"[get_layered_memory] ③ 摘要构建失败: {e}")
+        older_summary = ""
+
+    # ⑤ 规划信息（从工作记忆提取）
+    plan_info = ""
+    try:
+        wm = _get_working_memory(session_id)
+        plan = wm.get("plan", [])
+        current_step = wm.get("current_step", 0)
+        last_observation = wm.get("last_observation", "")
+
+        if plan or last_observation:
+            lines = []
+            if plan:
+                if isinstance(plan, list):
+                    lines.append("计划:\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan)))
+                else:
+                    lines.append(f"计划: {plan}")
+            if current_step > 0:
+                lines.append(f"执行步数: {current_step}")
+            if last_observation:
+                lines.append(f"最近观察: {str(last_observation)[:300]}")
+            plan_info = "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"[get_layered_memory] ⑤ 规划信息构建失败: {e}")
+        plan_info = ""
+
+    return {
+        "long_term": long_term,
+        "recent_structured": recent_structured,
+        "older_summary": older_summary,
+        "plan_info": plan_info,
+    }
+
+
+def build_context_suffix(session_id, current_user_input):
+    """收集所有动态上下文信息，拼成后缀字符串。
+
+    优先级：长期记忆 → 短期记忆摘要 → 子轮次/执行状态。
+    所有动态信息统一拼接到 user message 末尾，保证 system prompt 静态可缓存。
+
+    Args:
+        session_id: 会话 ID
+        current_user_input: 当前用户输入，用于检索长期记忆
+
+    Returns:
+        拼接后的后缀字符串，无动态信息时返回空字符串
+    """
+    suffix_parts = []
+
+    # 1. 长期记忆（根据 current_user_input 检索相关记忆）
+    try:
+        long_term_memory = get_relevant_memory(current_user_input)
+        if long_term_memory:
+            suffix_parts.append(f"\n\n### 长期记忆 ###\n{long_term_memory}")
+    except Exception:
+        pass
+
+    # 2. 短期记忆摘要（用户轮次 > 3 时启用）
+    #    使用 count_chat_messages 估算轮次数，避免引入额外依赖
+    try:
+        total_msgs = count_chat_messages(session_id)
+        # 粗略估算用户轮次：总消息数 / 2（每轮至少包含 user + assistant）
+        estimated_rounds = total_msgs // 2
+        if estimated_rounds > 3:
+            summary = get_latest_summary(session_id)
+            if summary:
+                suffix_parts.append(f"\n\n### 对话摘要 ###\n{summary}")
+    except Exception:
+        pass
+
+    # 3. 子轮次/执行状态（当前计划、步骤进度、最近观察）
+    working_mem = _get_working_memory(session_id)
+    plan = working_mem.get("plan", [])
+    current_step = working_mem.get("current_step", 0)
+    last_observation = working_mem.get("last_observation", "")
+
+    if plan or last_observation:
+        state_lines = []
+        if plan:
+            state_lines.append(f"当前计划: {json.dumps(plan, ensure_ascii=False, default=str)}")
+        if current_step > 0:
+            state_lines.append(f"执行步数: {current_step}")
+        if last_observation:
+            state_lines.append(f"最近观察: {str(last_observation)[:300]}")
+        suffix_parts.append(f"\n\n### 执行状态 ###\n" + "\n".join(state_lines))
+
+    return "".join(suffix_parts)
 
 
 def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOKEN_BUDGET,
-                           user_message="",
-                           is_continuation: bool = False):
-    """构建 LLM 上下文消息列表。
-
-    设计要点：
-    1. 四层记忆分层：长期记忆 → 历史摘要 → 近3轮完整对话 → 当前子轮次增量
-    2. 统一压缩机制：以 compressor.py 为唯一压缩执行层
-    3. 结构化思考轨迹：解析 reasoning_trace JSON 并存储
-    4. 子轮次增量传递：仅在当前用户任务内传递思考轨迹
-
-    参数：
-        is_continuation：由调用方（react_engine）传入，True 表示引擎已判定为同一任务延续，
-                         此时跳过 _calculate_session_relevance 独立检测，避免两套检测器结论矛盾。
-    """
+                           user_message="", is_continuation=False, available_tools=None):
+    """构建 LLM 上下文"""
+    
     messages = get_full_session_messages(session_id, limit=limit)
-
-    chat_user_indices = [i for i, m in enumerate(messages)
-                          if m.get("role") == "user" and m.get("msg_type") == "chat"]
-    conversation_rounds = len(chat_user_indices)
-
+    chat_user_indices = [i for i, m in enumerate(messages) 
+                         if m.get("role") == "user" and m.get("msg_type") == "chat"]
+    total_rounds = len(chat_user_indices)
+    
+    # --- 1. 重复查询处理 ---
+    # 话题切换不由这里判定：react_engine 的 BM25 检测器（context_router）是唯一判定源，
+    # 且切换时引擎会清空缓存的短期记忆（cached_short_term_memory=""），
+    # 因此这里不再跑第二套相似度检测，避免两套算法结论互相矛盾。
     last_user_msg = user_message
     if not last_user_msg:
         for m in reversed(messages):
@@ -773,90 +1112,100 @@ def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOK
                 last_user_msg = m.get("content", "")
                 break
 
-    early_summary = ""
-    early_messages = []
-    remaining_messages = messages
-
-    if last_user_msg:
-        if not is_continuation:
-            # 引擎未判定为延续时才独立检测；延续时完全信任引擎判断，避免两套检测器结论矛盾
-            from memory.config import RECALL_RELEVANCE_THRESHOLD
-            is_relevant, relevance_score = _calculate_session_relevance(
-                last_user_msg, messages, threshold=RECALL_RELEVANCE_THRESHOLD
-            )
-            if not is_relevant:
-                user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
-                if len(user_indices) >= 3:
-                    keep_from = user_indices[-2]
-                    remaining_messages = messages[keep_from:]
-                remaining_messages.append({
-                    "role": "system",
-                    "content": f"【话题切换提示】检测到新话题与历史上下文不相关（相似度 {relevance_score:.2f}），已保留最近对话轮次。"
-                })
-        else:
-            # 延续场景：跳过 bigram 相关性检测，保留全量上下文，信任引擎判断
-            exclude_indices = _detect_repeated_query(remaining_messages, last_user_msg)
-            if exclude_indices:
-                for idx in exclude_indices:
-                    if idx < len(remaining_messages):
-                        del remaining_messages[idx]
-                remaining_messages.append({
-                    "role": "system",
-                    "content": "【注意】用户重复了之前提问。历史工具调用结果已保留，已完成部分可直接引用，但失败/遗漏部分需重新执行。"
-                })
-
-    chat_user_indices_remaining = [i for i, m in enumerate(remaining_messages)
-                                   if m.get("role") == "user" and m.get("msg_type") == "chat"]
-    conversation_rounds_remaining = len(chat_user_indices_remaining)
-
-    if conversation_rounds_remaining > 4:
-        cutoff_idx = chat_user_indices_remaining[-4]
-        early_messages = remaining_messages[:cutoff_idx]
-        remaining_messages = remaining_messages[cutoff_idx:]
-
-    history_entries = _build_structured_history(remaining_messages, session_id)
-
-    early_summary = get_latest_summary(session_id)
+    repeat_query_note = ""
+    if last_user_msg and is_continuation:
+        exclude_indices = _detect_repeated_query(messages, last_user_msg)
+        if exclude_indices:
+            # 删除前先校验索引是否在当前 messages 范围内（防止切片后旧索引越界）
+            valid_exclude = [idx for idx in exclude_indices if idx < len(messages)]
+            for idx in sorted(valid_exclude, reverse=True):
+                del messages[idx]
+            repeat_query_note = "【重复查询】检测到重复提问，已保留历史工具结果，仅需重试失败步骤。"
+            chat_user_indices = [i for i, m in enumerate(messages)
+                                 if m.get("role") == "user" and m.get("msg_type") == "chat"]
+            total_rounds = len(chat_user_indices)
     
-    _trigger_increment_compression(session_id, history_entries)
-
+    # --- 2. 切割分层：历史摘要(早期) vs 情节缓存(最近N轮) ---
+    if total_rounds > WORKING_ROUNDS:
+        # 最近3轮 → 情节缓存
+        cutoff_idx = chat_user_indices[-WORKING_ROUNDS]
+        historical_messages = messages[:cutoff_idx]   # 第1~N-3轮
+        episodic_messages = messages[cutoff_idx:]      # 最近3轮
+    else:
+        historical_messages = []
+        episodic_messages = messages
+    
     result_messages = []
-
-    if last_user_msg:
-        long_term_memory = get_relevant_memory(last_user_msg)
-        if long_term_memory:
-            result_messages.append({
-                "role": "system",
-                "content": f"【长期记忆】\n{long_term_memory}"
-            })
-
-    if early_summary:
-        truncated = early_summary
-        max_iterations = 20
-        iterations = 0
-        while estimate_messages_tokens([{"role": "system", "content": truncated}]) > summary_max_tokens:
-            new_len = int(len(truncated) * 0.8)
-            if new_len >= len(truncated) or new_len == 0:
-                truncated = ""
-                break
-            truncated = truncated[:new_len]
-            iterations += 1
-            if iterations >= max_iterations:
-                truncated = ""
-                break
-        if truncated:
-            result_messages.append({
-                "role": "system",
-                "content": f"【历史对话摘要】\n{truncated}"
-            })
-
-    if history_entries:
-        history_json = json.dumps(history_entries, ensure_ascii=False, indent=2)
+    
+    # --- 3. 构建动态上下文后缀 ---
+    # 所有动态信息（长期记忆 / 摘要 / 执行状态）通过后缀注入到 user message 末尾，
+    # system prompt 保持静态以最大化 LLM 服务端缓存命中率。
+    context_suffix = build_context_suffix(
+        session_id, last_user_msg or user_message
+    )
+    
+    # 将重复查询提示放入结果（话题切换由 react_engine BM25 检测器统一判定）
+    if repeat_query_note:
         result_messages.append({
             "role": "system",
-            "content": f"【历史对话上下文】\n{history_json}"
+            "content": repeat_query_note
         })
-
+    
+    # --- 4. 动态上下文后缀（拼入 user message，此处作为独立消息返回供调用方拼接） ---
+    if context_suffix:
+        result_messages.append({
+            "role": "context_suffix",
+            "content": context_suffix
+        })
+    
+    # 3.5 【历史摘要】（早期轮次的压缩）
+    historical_summary = get_latest_summary(session_id)
+    if historical_messages:
+        historical_summary = get_latest_summary(session_id)
+        if historical_summary:
+            result_messages.append({
+                "role": "system",
+                "content": f"【历史摘要】(第1~{total_rounds - WORKING_ROUNDS}轮压缩)\n{historical_summary}"
+            })
+        
+        # 触发增量压缩：超过阈值时，把最老的1轮合并进摘要
+        if total_rounds > COMPRESS_THRESHOLD + WORKING_ROUNDS:
+            history_entries = _build_structured_history(
+                historical_messages, session_id, 
+                preserve_thinking_rounds=0,  # 归档态：完全剥离思考轨迹
+                is_current_turn=False
+            )
+            _trigger_increment_compression(session_id, history_entries)
+    
+    # 4. 情节缓存 (最近3轮，子轮次完整保留，思考轨迹按规则裁剪)
+    episodic_history = _build_structured_history(
+        episodic_messages, session_id,
+        preserve_thinking_rounds=WORKING_ROUNDS,
+        is_current_turn=True
+    )
+    
+    # 对每个用户轮次内部的子轮次做思考轨迹裁剪
+    for entry in episodic_history:
+        child_turns = entry.get("child_turns", [])
+        total_subturns = len(child_turns)
+        for j, ct in enumerate(child_turns):
+            turns_from_end = total_subturns - 1 - j
+            if turns_from_end >= KEEP_REASONING_SUBTURNS:
+                # 超过2个子轮次的，剥离思考轨迹，仅保留工具名+参数+结果
+                ct["reasoning_trace"] = {}
+                ct["ai_thinking"] = ""
+                ct["ai_output"] = _trim_tool_result(
+                    ct.get("ai_output", ""), max_len=200
+                )
+    
+    result_messages.append({
+        "role": "system",
+        "content": f"【情节缓存 - 最近{WORKING_ROUNDS}轮完整交互】\n"
+                   f"说明: 每轮内保留最近{KEEP_REASONING_SUBTURNS}个子轮次的思考轨迹，"
+                   f"更早子轮次仅保留工具调用与结果。\n\n"
+                   f"{json.dumps(episodic_history, ensure_ascii=False, indent=2)}"
+    })
+    
     return result_messages
 
 

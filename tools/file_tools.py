@@ -30,6 +30,7 @@ def _create_excel_copy(source_path: str) -> str:
 
 
 @register_tool(timeout=30)
+@path_params("path")
 def scan_directory(path: str):
     """扫描指定路径下的第一层文件和文件夹，返回 JSON 数组。path: 要扫描的目录绝对路径"""
     try:
@@ -560,8 +561,8 @@ def excel_formula(file_path: str, sheet_name: str, cell: str, formula: str):
 
 
 @register_tool(timeout=60)
-def excel_conditional_format(file_path: str, sheet_name: str, range: str, condition_type: str, rule: dict, style: dict = None):
-    """设置条件格式。file_path: 文件路径, sheet_name: 工作表名, range: 单元格范围(如A1:C10), condition_type: cellIs/greaterThan/lessThan/between/containsText, rule: 条件规则, style: 样式"""
+def excel_conditional_format(file_path: str, sheet_name: str, cell_range: str, condition_type: str, rule: dict, style: dict = None):
+    """设置条件格式。file_path: 文件路径, sheet_name: 工作表名, cell_range: 单元格范围(如A1:C10), condition_type: cellIs/greaterThan/lessThan/between/containsText, rule: 条件规则, style: 样式"""
     import openpyxl
     from openpyxl.formatting.rule import FormulaRule, CellIsRule
     from openpyxl.styles import PatternFill, Font, Border, Side
@@ -589,19 +590,19 @@ def excel_conditional_format(file_path: str, sheet_name: str, range: str, condit
             rule_type = rule.get('type', 'equal')
             value = rule.get('value', 0)
             ws.conditional_formatting.add(
-                range,
+                cell_range,
                 CellIsRule(operator=rule_type, formula=[f'"{value}"' if isinstance(value, str) else str(value)],
                           stopIfTrue=True, fill=fill, font=font)
             )
         elif condition_type == "greaterThan":
             ws.conditional_formatting.add(
-                range,
+                cell_range,
                 CellIsRule(operator='greaterThan', formula=[str(rule.get('value', 0))],
                           stopIfTrue=True, fill=fill, font=font)
             )
         elif condition_type == "lessThan":
             ws.conditional_formatting.add(
-                range,
+                cell_range,
                 CellIsRule(operator='lessThan', formula=[str(rule.get('value', 0))],
                           stopIfTrue=True, fill=fill, font=font)
             )
@@ -609,15 +610,15 @@ def excel_conditional_format(file_path: str, sheet_name: str, range: str, condit
             min_val = rule.get('min', 0)
             max_val = rule.get('max', 100)
             ws.conditional_formatting.add(
-                range,
+                cell_range,
                 CellIsRule(operator='between', formula=[str(min_val), str(max_val)],
                           stopIfTrue=True, fill=fill, font=font)
             )
         elif condition_type == "containsText":
             text = rule.get('text', '')
             ws.conditional_formatting.add(
-                range,
-                FormulaRule(formula=[f'=ISNUMBER(SEARCH("{text}",{range.split(":")[0]}))'],
+                cell_range,
+                FormulaRule(formula=[f'=ISNUMBER(SEARCH("{text}",{cell_range.split(":")[0]}))'],
                           stopIfTrue=True, fill=fill, font=font)
             )
         
@@ -625,7 +626,7 @@ def excel_conditional_format(file_path: str, sheet_name: str, range: str, condit
         
         result = {
             "success": True,
-            "message": f"条件格式已应用到 {sheet_name}!{range}",
+            "message": f"条件格式已应用到 {sheet_name}!{cell_range}",
             "source_file": file_path,
             "output_file": copy_path,
             "condition_type": condition_type,

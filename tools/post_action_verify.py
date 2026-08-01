@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 import shlex
 
+from . import register_tool
+
 
 class VerifyResult(Enum):
     """验证结果状态"""
@@ -44,6 +46,7 @@ class VerifyReport:
 _VERIFIERS: Dict[str, Callable[[VerifyContext], VerifyReport]] = {}
 
 
+@register_tool
 def register_verifier(operation_type: str):
     """装饰器：注册操作后验证器"""
     def decorator(func: Callable[[VerifyContext], VerifyReport]):
@@ -112,6 +115,7 @@ def _extract_registry_value(command: str) -> tuple:
 # 具体验证器实现
 # ═══════════════════════════════════════════════════════════════
 
+@register_tool
 @register_verifier("uninstall")
 def verify_uninstall(ctx: VerifyContext) -> VerifyReport:
     """
@@ -151,7 +155,7 @@ try {{
 
 # 3. 检查开始菜单 (注意：这里用 .Name 属性)
 try {{
-    $startMenu = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -ErrorAction SilentlyContinue | 
+    $startMenu = Get-ChildItem "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs" -Recurse -ErrorAction SilentlyContinue | 
                  Where-Object {{ $_.Name -match $escapedProg }}
     if ($startMenu) {{ $found += "StartMenu:" + $startMenu.Name }}
 }} catch {{}}
@@ -214,6 +218,7 @@ if ($found.Count -eq 0) {{
         )
 
 
+@register_tool
 @register_verifier("registry_add")
 def verify_registry_add(ctx: VerifyContext) -> VerifyReport:
     """
@@ -236,7 +241,11 @@ def verify_registry_add(ctx: VerifyContext) -> VerifyReport:
     try:
         from . import safe_exec
     except ImportError:
-        safe_exec = None  # 或抛出一个明确的错误提示
+        return VerifyReport(
+            result=VerifyResult.UNCERTAIN,
+            message="验证失败：无法加载 safe_exec 模块",
+            details={"error": "ImportError"}
+        )
     result = safe_exec.run_cmd(shlex.split(verify_cmd), timeout=10)
     
     if not result.get("success"):
@@ -278,52 +287,6 @@ def verify_registry_add(ctx: VerifyContext) -> VerifyReport:
         message=f"✓ 验证通过：注册表项 '{path}' 存在",
         details={"path": path, "output": output[:500]}
     )
-    
-    try:
-        from . import safe_exec
-    except ImportError:
-        safe_exec = None  # 或抛出一个明确的错误提示
-    result = safe_exec.run_cmd(shlex.split(verify_cmd), timeout=10)
-    
-    if not result.get("success"):
-        return VerifyReport(
-            result=VerifyResult.UNCERTAIN,
-            message="无法验证音量设置"
-        )
-    
-    output = result.get("output", "")
-    
-    if "CURRENT_VOLUME:" in output:
-        current_vol = output.split("CURRENT_VOLUME:")[1].strip()
-        if expected_volume:
-            # 音量值可能有微小差异，允许 ±2 的误差
-            try:
-                diff = abs(int(current_vol) - int(expected_volume))
-                if diff <= 2:
-                    return VerifyReport(
-                        result=VerifyResult.SUCCESS,
-                        message=f"✓ 验证通过：音量已设置为 {current_vol}% (目标: {expected_volume}%)",
-                        details={"current": current_vol, "expected": expected_volume}
-                    )
-                else:
-                    return VerifyReport(
-                        result=VerifyResult.FAILED,
-                        message=f"✗ 验证失败：当前音量 {current_vol}%，但目标为 {expected_volume}%",
-                        details={"current": current_vol, "expected": expected_volume, "diff": diff}
-                    )
-            except ValueError:
-                pass
-        
-        return VerifyReport(
-            result=VerifyResult.SUCCESS,
-            message=f"✓ 当前音量：{current_vol}%",
-            details={"current": current_vol}
-        )
-    
-    return VerifyReport(
-        result=VerifyResult.UNCERTAIN,
-        message="无法获取当前音量值"
-    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -351,6 +314,7 @@ _VERIFICATION_PATTERNS: List[tuple] = [
 ]
 
 
+@register_tool
 def detect_operation_type(command: str) -> Optional[str]:
     """
     根据命令内容检测操作类型
@@ -371,6 +335,7 @@ def detect_operation_type(command: str) -> Optional[str]:
     return matches[0][0]
 
 
+@register_tool
 def verify_tool_result(
     tool_name: str,
     command: str,
@@ -433,6 +398,7 @@ def verify_tool_result(
     }
 
 
+@register_tool
 def format_verify_result(verify_report: Dict) -> str:
     """
     将验证报告格式化为人类可读的字符串
@@ -457,6 +423,7 @@ def format_verify_result(verify_report: Dict) -> str:
 # 便捷函数：用于工具包装
 # ═══════════════════════════════════════════════════════════════
 
+@register_tool
 def with_verification(tool_func: Callable) -> Callable:
     """
     装饰器：为工具函数自动添加验证逻辑

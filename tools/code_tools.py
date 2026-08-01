@@ -80,6 +80,43 @@ def _resolve_path(file_path: str) -> str | None:
     return resolved_abs
 
 
+def _resolve_path_read(file_path: str) -> str | None:
+    """解析路径（读操作，不限制工作区）。
+
+    读取文件时不限制路径范围，允许从任意位置读取文件。
+    规则：
+    1. 空路径 → 返回 None
+    2. 相对路径 → 基于工作区根目录解析
+    3. 绝对路径 → 直接返回（不做工作区校验）
+
+    返回：绝对路径 或 None（非法路径）
+    """
+    if not file_path:
+        return None
+
+    file_path = os.path.normpath(file_path)
+
+    # 相对路径 → 基于工作区解析
+    if not os.path.isabs(file_path):
+        resolved = os.path.abspath(os.path.join(WORKSPACE_ROOT, file_path))
+    else:
+        resolved = file_path
+
+    return os.path.abspath(resolved)
+
+
+@register_tool
+def resolve_path_safe(file_path: str) -> tuple:
+    """安全路径解析包装器，统一返回 (resolved_path, error_message)。
+    
+    解决 _resolve_path 返回 None 时各调用方处理不一致的问题。
+    """
+    resolved = _resolve_path(file_path)
+    if resolved is None:
+        return None, f"非法路径：只能在 workspace 内操作: {file_path}"
+    return resolved, None
+
+
 def _read_file_with_encoding(file_path: str, size_limit: int = MAX_FILE_SIZE) -> tuple | None:
     """读取文件，自动检测编码。
 
@@ -141,8 +178,20 @@ def _read_lines_with_encoding(file_path: str, size_limit: int = MAX_FILE_SIZE) -
 
 @register_tool
 def get_workspace_path():
-    """返回当前项目 workspace 文件夹的绝对路径。所有代码文件必须生成在此目录下。"""
+    """返回 workspace 文件夹的绝对路径。
+    
+    ⚠️ 仅在以下场景调用：
+    - 需要创建新文件（代码、文档、图片等）
+    - 需要读取/修改已有文件
+    
+    ❌ 以下场景不需要调用：
+    - 修改系统设置（音量、亮度等）→ 用 execute_command
+    - 安装/卸载软件 → 用 execute_command
+    - 纯问答/信息查询 → 直接回答或用 web_search
+    """
     workspace = _ensure_workspace()
+    if not workspace or not os.path.isdir(workspace):
+        return json.dumps({"success": False, "error": f"workspace 路径无效: {workspace}"})
     return json.dumps({"success": True, "workspace": workspace})
 
 
@@ -167,12 +216,23 @@ def write_file(file_path: str, content: str, overwrite: bool = True):
                 "message": f"文件已存在且不允许覆盖: {target_abs}"
             }, ensure_ascii=False)
 
+        # 判断是否真正修改（changed 字段）
+        actually_modified = True
+        if os.path.exists(target_abs):
+            try:
+                with open(target_abs, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+                actually_modified = (old_content != content)
+            except Exception:
+                actually_modified = True
+
         with open(target_abs, "w", encoding="utf-8", newline="") as f:
             f.write(content)
 
         return json.dumps({
             "success": True,
-            "message": f"文件写入成功: {target_abs}"
+            "message": f"文件写入成功: {target_abs}",
+            "changed": actually_modified
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -192,7 +252,7 @@ def read_file(file_path: str, start_line: int = None, end_line: int = None):
     2. 再用 read_file(start_line=行号-5, end_line=行号+30) 局部读取上下文
     3. 严禁通过缩小 start_line/end_line 范围来"搜索"——你只会重复读到文件开头区域
     """
-    target_abs = _resolve_path(file_path)
+    target_abs = _resolve_path_read(file_path)
     if not target_abs:
         return json.dumps({
             "success": False,
@@ -274,7 +334,7 @@ def search_content(keyword: str, directory: str = None, file_pattern: str = "*",
     """在目录下搜索包含关键词的文件行。返回匹配文件、行号、行内容。"""
     # 解析目录路径
     if directory:
-        dir_abs = _resolve_path(directory)
+        dir_abs = _resolve_path_read(directory)
         if not dir_abs:
             return json.dumps({
                 "success": False,
@@ -420,7 +480,7 @@ def replace_in_file(file_path: str, old_str: str, new_str: str, occurrence: int 
 def get_project_summary(directory: str = None):
     """列出目录下所有代码文件及大小，帮助快速了解项目结构。"""
     if directory:
-        dir_abs = _resolve_path(directory)
+        dir_abs = _resolve_path_read(directory)
         if not dir_abs:
             return json.dumps({
                 "success": False,
@@ -650,3 +710,7 @@ def run_python(code: str, timeout: int = 30, working_dir: str = None) -> str:
         "output": output,
         "stderr": stderr_output
     }, ensure_ascii=False)
+
+
+# 向后兼容别名：确保旧代码中引用 run_python_code 仍能正常工作
+run_python_code = run_python

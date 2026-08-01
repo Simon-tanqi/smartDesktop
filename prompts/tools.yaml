@@ -9,11 +9,10 @@ always_inject:
   - search_content
   - replace_in_file
   - ask_user_clarification
-  - load_domain_skills
   - get_workspace_path
-  - execute_command
-  - modify_registry
   - copy_file_to_workspace
+  - load_domain_skills
+  - execute_command
 
 tools:
   read_file:
@@ -425,7 +424,7 @@ tools:
 
 # ==================== Word 文档处理工具 ====================
   create_word_document:
-    desc: 创建Word文档
+    desc: 创建Word文档。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       file_path: {type: str, desc: 文件保存绝对路径}
       content: {type: dict, optional: true, desc: 文档内容配置}
@@ -434,7 +433,7 @@ tools:
     domains: [office_word]
 
   add_word_content:
-    desc: 向Word文档添加内容
+    desc: 向Word文档添加内容。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       file_path: {type: str, desc: 文档绝对路径}
       content_type: {type: str, desc: 内容类型(paragraph/table/heading/image)}
@@ -444,7 +443,7 @@ tools:
     domains: [office_word]
 
   extract_word_text:
-    desc: 提取Word文档文本内容
+    desc: 提取Word文档文本内容。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       file_path: {type: str, desc: 文档绝对路径}
       page_range: {type: tuple, optional: true, desc: 页码范围(起始,结束)}
@@ -453,7 +452,7 @@ tools:
     domains: [office_word]
 
   search_replace_word:
-    desc: 在Word文档中查找替换文本
+    desc: 在Word文档中查找替换文本。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       file_path: {type: str, desc: 文档绝对路径}
       search_text: {type: str, desc: 查找文本}
@@ -464,7 +463,7 @@ tools:
     domains: [office_word]
 
   batch_word_process:
-    desc: 批量处理Word文档
+    desc: 批量处理Word文档。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       directory: {type: str, desc: 文件夹绝对路径}
       operation: {type: str, desc: 操作类型(extract_info/word_count)}
@@ -478,7 +477,9 @@ tools:
     desc: 一站式生成视觉精美的PowerPoint演示文稿（HTML截图背景+可编辑文字层），
       支持封面/内容页模板、5种主题配色，最终输出PPTX
     params:
-      slides: {type: list, desc: "幻灯片列表，每项含template(cover|content)和data"}
+      slides:
+        type: list
+        desc: "幻灯片列表。每项 {template, data}。template 支持: cover/section/content/icon_grid/chart/table/image_text/comparison"
       theme: {type: str, default: tech_blue, desc: "主题: tech_blue(科技蓝)/business_gray(商务灰)/gradient_purple(渐变紫)/education_orange(教育橙)/minimal_dark(极简黑)"}
       output_path: {type: str, optional: true, desc: "输出路径，默认自动生成"}
     tier: 2
@@ -537,6 +538,9 @@ domains:
       - 网页
       - 天气
       - 下载文件
+      - 下载
+      - 下载到
+      - 保存文件
       - 联网
     tools:
       - web_search
@@ -627,12 +631,18 @@ domains:
       - 编辑
       - 排版
       - 查找替换
+      - 周报
+      - 论文
+      - 合同
+      - 简历
+      - 文章
     tools:
       - create_word_document
       - add_word_content
       - extract_word_text
       - search_replace_word
       - batch_word_process
+      - web_search
 
   office_ppt:
     description: "PowerPoint演示文稿"
@@ -651,6 +661,7 @@ domains:
       - extract_presentation_info
       - export_presentation_text
       - batch_ppt_process
+      - web_search
 
   gui_automation:
     description: "GUI自动化操作"

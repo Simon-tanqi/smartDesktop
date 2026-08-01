@@ -4,14 +4,32 @@ import signal
 import time
 from pathlib import Path
 from datetime import datetime
+import tkinter
+
+
+def _tk_safe_del(original_del):
+    """包装 __del__，静默捕获跨线程 GC 错误。"""
+    def wrapper(self):
+        try:
+            original_del(self)
+        except RuntimeError:
+            pass
+    return wrapper
+
+
+_tk_patched = {"Image", "Variable"}
+_tk_mod = tkinter
+for _name in _tk_patched:
+    _cls = getattr(_tk_mod, _name, None)
+    if _cls is not None and hasattr(_cls, "__del__"):
+        _cls.__del__ = _tk_safe_del(_cls.__del__)
 
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
 from backend.chat import chat_bp
 from backend.upload_api import upload_bp
+from backend.rate_limiter import limiter
 from memory.session import ensure_session_titles
 from utils.dependency_manager import check_and_report
 from logger import get_logger
@@ -44,10 +62,13 @@ def _setup_graceful_shutdown(app):
     """注册优雅停机信号处理"""
     def graceful_shutdown(signum, frame):
         logger.info("收到停机信号，正在优雅关闭服务...")
-        app.do_teardown_appcontext()
+        try:
+            app.do_teardown_appcontext()
+        except Exception as e:
+            logger.warning(f"do_teardown_appcontext 异常（无活动上下文，可忽略）: {e}")
         time.sleep(1)
         logger.info("服务已关闭")
-        sys.exit(0)
+        os._exit(0)
     
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT, graceful_shutdown)
@@ -55,7 +76,7 @@ def _setup_graceful_shutdown(app):
 
 def _validate_model_configs():
     """验证所有模型配置的有效性"""
-    from llm_client import get_available_models, get_model_from_cache, get_api_key, get_base_url
+    from llm_client import get_available_models, get_api_key
     
     try:
         models = get_available_models()
@@ -82,16 +103,16 @@ def _validate_model_configs():
         logger.error(f"模型配置验证失败: {e}", exc_info=True)
 
 
-def _init_app(app):
+def _init_app(app, config):
     """应用初始化逻辑 - 生产环境部署时也会执行"""
     logger.info("="*60)
     logger.info("Agent 服务启动中...")
     logger.info(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"运行模式: {'调试模式' if Config.DEBUG else '生产模式'}")
-    logger.info(f"主机地址: {Config.HOST}")
-    logger.info(f"监听端口: {Config.PORT}")
-    logger.info(f"CORS允许来源: {Config.CORS_ORIGINS}")
-    logger.info(f"限速: {'启用' if Config.RATELIMIT_ENABLED else '禁用'}")
+    logger.info(f"运行模式: {'调试模式' if config.DEBUG else '生产模式'}")
+    logger.info(f"主机地址: {config.HOST}")
+    logger.info(f"监听端口: {config.PORT}")
+    logger.info(f"CORS允许来源: {config.CORS_ORIGINS}")
+    logger.info(f"限速: {'启用' if config.RATELIMIT_ENABLED else '禁用'}")
     logger.info("-"*60)
     
     dep_report = check_and_report()
@@ -109,20 +130,11 @@ def _init_app(app):
     
     logger.info("-"*60)
     logger.info(f"Agent 服务初始化完成")
-    logger.info(f"访问地址: http://{Config.HOST}:{Config.PORT}")
+    logger.info(f"访问地址: http://{config.HOST}:{config.PORT}")
     logger.info("="*60)
     
     if hasattr(logger, 'flush'):
         logger.flush()
-    
-    try:
-        ensure_session_titles()
-    except Exception as e:
-        logger.error(f"初始化会话标题失败: {e}", exc_info=True)
-    try:
-        _register_tools()
-    except Exception as e:
-        logger.error(f"工具注册失败: {e}", exc_info=True)
 
 
 def create_app(config=None):
@@ -141,15 +153,7 @@ def create_app(config=None):
     
     CORS(app, resources={r"/api/*": {"origins": config.CORS_ORIGINS}}, supports_credentials=True)
     
-    limiter = Limiter(
-        get_remote_address,
-        app=app,
-        storage_uri=config.RATELIMIT_STORAGE_URI,
-        enabled=config.RATELIMIT_ENABLED,
-    )
-    
-    limiter.limit("30 per minute;200 per hour")(chat_bp)
-    limiter.limit("30 per minute;200 per hour")(upload_bp)
+    limiter.init_app(app)
     
     @app.route('/')
     def index():
@@ -183,12 +187,12 @@ def create_app(config=None):
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
     
     _setup_graceful_shutdown(app)
-    _init_app(app)
+    _init_app(app, config)
     
     return app
 
 
-app = create_app()
+app = None
 
 
 # 启动时打印可用模型列表，便于诊断 provider/model 错路由问题
@@ -206,6 +210,31 @@ except Exception as e:
     logger.warning(f"[STARTUP] 列出模型失败: {e}")
 
 
+def _cleanup_pycache(root_dir=None):
+    """启动前清除所有 __pycache__，防止修改后的 .py 被旧 .pyc 遮蔽。"""
+    import shutil
+    if root_dir is None:
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+    removed = 0
+    for dirpath, dirnames, _ in os.walk(root_dir):
+        # 跳过虚拟环境、node_modules 等
+        if any(skip in dirpath for skip in ('site-packages', 'node_modules', '.venv', 'venv')):
+            continue
+        for d in dirnames:
+            if d == '__pycache__':
+                pyc_dir = os.path.join(dirpath, d)
+                try:
+                    shutil.rmtree(pyc_dir, ignore_errors=True)
+                    removed += 1
+                except Exception:
+                    pass
+    return removed
+
+
 if __name__ == '__main__':
+    # 启动前清理所有 pyc 缓存，确保加载最新源码
+    _cleaned = _cleanup_pycache()
+    logger.info(f"[STARTUP] 已清理 {_cleaned} 个 __pycache__ 目录")
+    app = create_app()
     logger.info(f"Agent 前端已启动，请访问: http://{Config.HOST}:{Config.PORT}")
     app.run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG, use_reloader=False, threaded=True)

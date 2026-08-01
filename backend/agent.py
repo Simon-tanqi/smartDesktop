@@ -8,6 +8,7 @@ import json
 
 from core.react_engine import ReActEngine
 from core.agent_state import TaskCheckpoint
+from core.streaming import format_sse_event
 from logger import get_logger
 
 
@@ -54,15 +55,11 @@ def run_agent(
         - final: 最终回复，{"type": "final", "text": "...", "timestamp": "..."}
         - error: 错误信息，{"type": "error", "text": "..."}
         - warning: 警告信息，{"type": "warning", "text": "..."}
+
+    L0/L1 路由（聊天层 + 缓存层）已由 chat.py 在调用 run_agent() 之前完成，
+    本函数不再重复调用 route()，直接进入 ReAct 引擎。
     """
     logger = get_logger()
-    _local_executor_created = False
-
-    # 线程池策略：优先使用外部注入的；未注入时不自动创建（引擎内部工具调用为同步模式）
-    if tool_executor is None:
-        tool_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
-        _local_executor_created = True
-
     engine = ReActEngine(trace_id=trace_id, session_id=session_id, session_name=session_name)
 
     last_tool_call = {"tool_name": "", "params": None}
@@ -72,6 +69,10 @@ def run_agent(
     run_had_error = False
     # 是否走到了 final 事件
     run_had_final = False
+    # 从 final/done 事件中提取的 complete 标记
+    run_was_complete_from_event = None
+    # BUG-X-1: 从 done 事件中提取的消息历史，用于同步回 agent_state
+    final_messages = None
 
     try:
         for event in engine.run(
@@ -97,24 +98,39 @@ def run_agent(
                         })
                     elif ev_type == "error":
                         run_had_error = True
-                    elif ev_type == "final":
+                    elif ev_type in ("final", "done"):
                         run_had_final = True
+                        run_was_complete_from_event = event_data.get("complete", False)
+                        # BUG-X-1: 提取消息历史
+                        if ev_type == "done":
+                            final_messages = event_data.get("messages")
             except Exception:
                 pass
 
             # 在每次 yield 之间检查取消信号，使运行中的任务能尽快终止
             if cancel_event is not None and cancel_event.is_set():
+                # 引擎已发出 final（任务已完成/已终止）时，取消信号仅用于终止残留子进程，
+                # 不再额外 emit 兜底 final，避免"任务已完成仍弹出任务已取消"竞态
+                if run_had_final:
+                    return
                 logger.info("任务已被取消", trace_id=trace_id, session_id=session_id)
                 yield f'data: {json.dumps({"type": "final", "text": "任务已取消"}, ensure_ascii=False)}\n\n'
                 run_had_final = True
                 return
             yield event
 
+        # BUG-X-1: 同步消息历史回 agent_state，确保多轮对话上下文不丢失
+        if final_messages is not None:
+            engine.execution_state.set_history(final_messages)
+
         # 任务正常完成，触发成功回调
         # v2: 传入整条 tool_call 链 + 是否完整完成
         if on_success:
             try:
-                run_was_complete = run_had_final and not run_had_error
+                if run_was_complete_from_event is not None:
+                    run_was_complete = run_was_complete_from_event
+                else:
+                    run_was_complete = run_had_final and not run_had_error
                 try:
                     on_success(
                         user_message,
@@ -130,8 +146,10 @@ def run_agent(
                 logger.warning(f"on_success 回调执行失败: {e}", trace_id=trace_id, session_id=session_id)
 
     except GeneratorExit:
-        # 调用方提前终止迭代（客户端断开等）
+        # BUG-X-4: 调用方提前终止迭代（客户端断开等），立即通知子进程退出
         logger.info("生成器被调用方提前终止", trace_id=trace_id, session_id=session_id)
+        if cancel_event is not None:
+            cancel_event.set()
         raise
 
     except Exception as e:
@@ -144,6 +162,6 @@ def run_agent(
             pass
 
     finally:
-        # 资源清理：仅关闭本函数内部创建的线程池
-        if _local_executor_created:
-            tool_executor.shutdown(wait=False)
+        # BUG-X-4: 确保 cancel_event 被设置，通知引擎内子进程退出
+        if cancel_event is not None:
+            cancel_event.set()

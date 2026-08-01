@@ -98,11 +98,13 @@ class ToolDataProvider:
     
     def _sync_all(self):
         """同步 YAML配置 + 运行时注册工具，生成统一视图"""
-        if not self._sync_required:
-            return
-        
+        # 先检测文件变更，再决定是否跳过。否则 _sync_required=False 时
+        # 永远不会调用 _load_yaml_config，mtime 变化永远无法被检测到。
         yaml_config = self._load_yaml_config()
         agent_config = self._load_agent_config()
+        
+        if not self._sync_required:
+            return
         
         merged_tools = {}
         merged_domains = {}
@@ -126,7 +128,19 @@ class ToolDataProvider:
                     merged_tools[name]["function"] = tool_info.get("function")
                     merged_tools[name]["timeout"] = tool_info.get("timeout", 60)
                     merged_tools[name]["desc"] = tool_info.get("description", merged_tools[name].get("desc", ""))
-                    merged_tools[name]["params"] = tool_info.get("parameters", merged_tools[name].get("params", {}))
+                    # 参数级合并：YAML 约束优先于运行时自省
+                    rt_params = tool_info.get("parameters", {})
+                    yml_params = merged_tools[name].get("params", {})
+                    for pname, pinfo in rt_params.items():
+                        yml_pinfo = yml_params.get(pname, {})
+                        # desc：运行时为空时取 YAML
+                        if not pinfo.get("desc") and yml_pinfo.get("desc"):
+                            pinfo["desc"] = yml_pinfo["desc"]
+                        # optional：YAML 无 optional+无 default → 必填，覆盖运行时
+                        if ("optional" not in yml_pinfo and "default" not in yml_pinfo
+                                and pinfo.get("optional")):
+                            pinfo["optional"] = False
+                    merged_tools[name]["params"] = rt_params
         
         merged_domains.update(yaml_config.get("domains", {}))
         merged_domains.update(agent_config.get("domains", {}))
@@ -165,11 +179,27 @@ class ToolDataProvider:
         except Exception:
             return "any"
     
+    # 内部确认/授权标志：仅在引擎重调工具时由 react_engine 经 kwargs 注入，
+    # 严禁出现在 LLM 可见的 JSON Schema / 系统提示词参数摘要中，
+    # 防止 LLM 直接传 confirmed=True 等参数绕过安全检查。
+    _INTERNAL_PARAM_NAMES = frozenset({
+        "confirmed", "confirmation_token", "challenge_token", "challenge_response",
+        "domain_confirmed", "_skip_validation", "prevalidated_uninstall_paths",
+    })
+
+    def _is_internal_param(self, name: str) -> bool:
+        return name in self._INTERNAL_PARAM_NAMES
+
     def register_tool(self, func: Callable, *, timeout: int = 60) -> Dict[str, Any]:
         """注册运行时工具，自动同步到统一视图"""
         sig = inspect.signature(func)
         parameters = {}
         for name, param in sig.parameters.items():
+            # 内部确认/授权参数不出现在 schema 中（问题 #4：防 LLM 绕过）
+            # 变长参数（**kwargs / *args）为引擎内部通道，同样不暴露给 LLM
+            if self._is_internal_param(name) or param.kind in (
+                    inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                continue
             parameters[name] = {
                 "type": self._get_type_name(param.annotation),
                 "desc": "",
@@ -330,6 +360,9 @@ class ToolDataProvider:
             return ""
         parts = []
         for pname, pinfo in params.items():
+            # 双保险：内部参数绝不出现在系统提示词参数摘要中
+            if self._is_internal_param(pname):
+                continue
             ptype = pinfo.get("type", "str")
             opt = "可选" if pinfo.get("optional") else "必填"
             default = ""
@@ -385,6 +418,9 @@ class ToolDataProvider:
     def _build_parameter_schema(self, params: Dict[str, Any]) -> Dict[str, Any]:
         schema = {"type": "object", "properties": {}, "required": []}
         for pname, pinfo in params.items():
+            # 双保险：即使上游 YAML/运行时合并遗漏，内部参数也不进 LLM schema
+            if self._is_internal_param(pname):
+                continue
             py_type = pinfo.get("type", "string")
             prop = self._parse_complex_type(py_type)
             prop["description"] = pinfo.get("desc", "")

@@ -9,8 +9,6 @@ from requests.adapters import HTTPAdapter
 import requests
 from memory import log_trace
 from logger import get_logger
-from utils import normalize_path_component
-
 logger = get_logger()
 
 import keyring
@@ -20,6 +18,7 @@ KEYRING_SERVICE = "MyAgent"
 KEYRING_USERNAME = "api_key"
 
 _KEYRING_AVAILABLE = None
+DEFAULT_TEMPERATURE = 0.25
 
 
 def _is_keyring_available():
@@ -175,24 +174,46 @@ def save_config(backend, api_key=None, model="deepseek-chat", base_url="https://
 def _save_config_raw(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com"):
     save_config(backend, api_key, model, base_url)
 
-
-DEFAULT_TEMPERATURE = 0.75
-
 _session = requests.Session()
 _retry_strategy = Retry(
     total=3,
+    connect=3,
+    read=2,
     backoff_factor=1,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["POST"]
+    allowed_methods=["POST"],
+    raise_on_status=True
 )
 _session.mount("http://", HTTPAdapter(max_retries=_retry_strategy))
 _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
 
 
+def _assert_system_first(messages, caller="llm"):
+    """P0 校验：messages 中存在 system 角色时，messages[0] 必须是 system。
+
+    进度摘要等辅助调用只传 user 消息（无 system），直接跳过，避免误伤。
+    主对话 LLM 调用路径（含 system prompt）若注入位置错误则记录错误日志并触发断言。
+    """
+    if not messages:
+        return
+    has_system = any(isinstance(m, dict) and m.get("role") == "system" for m in messages)
+    if not has_system:
+        return
+    first_role = messages[0].get("role") if isinstance(messages[0], dict) else None
+    if first_role != "system":
+        logger.error(
+            f"[{caller}] system prompt 注入位置错误：messages[0].role={first_role!r}，"
+            f"要求第一行必须为 system（P0 修复）"
+        )
+        assert first_role == "system", (
+            f"[{caller}] messages[0] 必须是 system 角色，实际为 {first_role!r}"
+        )
+
+
 def _normalize_base_url(base_url):
     url = base_url.rstrip('/')
-    url = re.sub(r'/chat/completions/?$', '', url)
     url = re.sub(r'/v\d+/chat/completions/?$', '', url)
+    url = re.sub(r'/chat/completions/?$', '', url)
     return url
 
 
@@ -266,7 +287,8 @@ def ai_concat(messages, model_name=None, provider=None, trace_id="",
         raise RuntimeError(f"AI服务不可用: {e}") from e
 
 
-def _ollama_call(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
+def _ollama_call(messages, model, trace_id="", tools=None, response_format=None, temperature=None):
+    _assert_system_first(messages, caller="ollama")
     url = "http://localhost:11434/api/chat"
 
     # 防御性检查：拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
@@ -288,7 +310,7 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
         payload["format"] = fmt
     t0 = time.perf_counter()
     try:
-        response = _session.post(url, json=payload, timeout=30)
+        response = _session.post(url, json=payload, timeout=(10, 120))
         response.raise_for_status()
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         result = response.json()
@@ -320,6 +342,18 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
             input_summary=str(messages)[:200],
             output_summary=output_summary
         )
+        # LLM 调用日志兜底记录
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=content,
+                model_name=model, provider="ollama",
+                elapsed_ms=elapsed_ms,
+                messages=messages,
+            )
+        except Exception:
+            pass
         return {"message": {"content": content, "reasoning_content": reasoning}}
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -338,10 +372,23 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
         )
         total_chars = sum(len(m.get("content", "")) for m in messages)
         logger.error(f"Ollama 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
+        # LLM 调用日志兜底记录（非流式失败）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=f"[LLM调用失败] {error_detail}",
+                model_name=model, provider="ollama",
+                elapsed_ms=elapsed_ms,
+                messages=messages,
+            )
+        except Exception:
+            pass
         return {"message": {"content": "", "error": error_detail, "reasoning_content": ""}}
 
 
 def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
+    _assert_system_first(messages, caller="ollama_stream")
     url = "http://localhost:11434/api/chat"
 
     # 防御性检查：拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
@@ -421,6 +468,20 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
                 if full_content and not full_content.endswith("\n"):
                     full_content += "\n"
                 full_content += f"```action\n{tool_call_json}\n```"
+            # 原生 tool_calls 结构
+            native_tool_calls = []
+            for idx in sorted(accumulated_tool_calls.keys()):
+                tc = accumulated_tool_calls[idx]
+                native_tool_calls.append({
+                    "id": f"call_{idx}_{int(time.time())}",
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"]
+                    }
+                })
+        else:
+            native_tool_calls = []
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log_trace(
@@ -430,7 +491,20 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
             input_summary=str(messages)[:200],
             output_summary=full_content[:200]
         )
-        yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning}
+        # LLM 调用日志兜底记录（流式入口，防止绕过 react_engine 的流式调用漏记）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=full_content,
+                model_name=model, provider="ollama",
+                elapsed_ms=elapsed_ms,
+                reasoning=full_reasoning,
+                messages=messages,
+            )
+        except Exception:
+            pass
+        yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning, "tool_calls": native_tool_calls}
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log_trace(
@@ -439,6 +513,18 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
             model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
             error=str(e)[:500]
         )
+        # LLM 调用日志兜底记录（流式失败）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=f"[LLM调用失败] {str(e)}",
+                model_name=model, provider="ollama",
+                elapsed_ms=elapsed_ms,
+                messages=messages,
+            )
+        except Exception:
+            pass
         logger.error(f"Ollama 流式请求失败: {e}")
         yield {"type": "error", "error": str(e)}
 
@@ -458,6 +544,7 @@ def _openai_compatible_call(messages, model, api_key, base_url,
         "model": model,
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": 4096,
         "stream": False
     }
     if tools:
@@ -503,6 +590,20 @@ def _openai_compatible_call(messages, model, api_key, base_url,
             input_summary=str(messages)[:200],
             output_summary=content[:200]
         )
+        # LLM 调用日志兜底记录（修复：llm_client 缺失 log_llm_call 导致日志丢失）
+        try:
+            usage = data.get("usage", {})
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=content,
+                model_name=model, provider=provider,
+                elapsed_ms=elapsed_ms,
+                token_estimate=usage.get("total_tokens", 0),
+                messages=messages,
+            )
+        except Exception:
+            pass
         return {"message": {"content": content, "reasoning_content": reasoning}}
 
     except Exception as e:
@@ -522,6 +623,18 @@ def _openai_compatible_call(messages, model, api_key, base_url,
         )
         total_chars = sum(len(m.get("content", "")) for m in messages)
         logger.error(f"{provider} 请求失败: {error_detail[:300]} | messages={len(messages)}条, 总计{total_chars}字符")
+        # LLM 调用日志兜底记录（非流式失败）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=f"[LLM调用失败] {error_detail}",
+                model_name=model, provider=provider,
+                elapsed_ms=elapsed_ms,
+                messages=messages,
+            )
+        except Exception:
+            pass
         return {"message": {"content": "", "error": error_detail, "reasoning_content": ""}}
 
 
@@ -529,6 +642,7 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
                                    provider="openai_compatible", trace_id="",
                                    tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE):
     """通用 OpenAI 兼容流式调用"""
+    _assert_system_first(messages, caller=provider or "openai_compatible_stream")
     if not api_key:
         logger.error(f"{provider} API Key 为空，无法发起流式调用（model={model}, base_url={base_url}）")
         yield {"type": "error", "error": f"{provider} API Key 未配置，请在设置中添加 API Key"}
@@ -541,6 +655,7 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
         "model": model,
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": 4096,
         "stream": True,
     }
     if tools:
@@ -572,7 +687,10 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
             except json.JSONDecodeError:
                 continue
 
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
             content_chunk = delta.get("content", "")
             reasoning_chunk = delta.get("reasoning_content", "")
 
@@ -610,6 +728,20 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
                 if full_content and not full_content.endswith("\n"):
                     full_content += "\n"
                 full_content += f"```action\n{tool_call_json}\n```"
+            # 原生 tool_calls 结构
+            native_tool_calls = []
+            for idx in sorted(accumulated_tool_calls.keys()):
+                tc = accumulated_tool_calls[idx]
+                native_tool_calls.append({
+                    "id": tc.get("id") or f"call_{idx}_{int(time.time())}",
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"]
+                    }
+                })
+        else:
+            native_tool_calls = []
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log_trace(
@@ -619,7 +751,21 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
             input_summary=str(messages)[:200],
             output_summary=full_content[:200]
         )
-        yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning}
+        # LLM 调用日志兜底记录（流式入口，防止绕过 react_engine 的流式调用漏记）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=full_content,
+                model_name=model, provider=provider,
+                elapsed_ms=elapsed_ms,
+                token_estimate=0,
+                reasoning=full_reasoning,
+                messages=messages,
+            )
+        except Exception:
+            pass
+        yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning, "tool_calls": native_tool_calls}
 
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -636,96 +782,184 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
             model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
             error=error_detail[:500]
         )
+        # LLM 调用日志兜底记录（流式失败）
+        try:
+            get_logger().log_llm_call(
+                trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                user_task="[llm_client直接调用]",
+                response=f"[LLM调用失败] {str(e)}",
+                model_name=model, provider=provider,
+                elapsed_ms=elapsed_ms,
+                messages=messages,
+            )
+        except Exception:
+            pass
         logger.error(f"{provider} 流式请求失败: {error_detail[:300]}")
         yield {"type": "error", "error": str(e)}
 
 
 def parse_ai_json(content):
     from json_repair import loads as repair_loads
-    import logging
-    logger = logging.getLogger(__name__)
     try:
         clean_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
+        # ── 优先级 1: action 代码块（最可靠的来源） ──
         action_match = re.search(r'```action\s*([\s\S]*?)\s*```', clean_content)
         if action_match:
-            clean_content = action_match.group(1).strip()
-            logger.debug(f"parse_ai_json: 提取action代码块成功，内容长度: {len(clean_content)}")
-        else:
-            reasoning_match = re.search(r'```reasoning\s*([\s\S]*?)\s*```', clean_content)
-            if reasoning_match:
-                clean_content = reasoning_match.group(1).strip()
-                logger.debug(f"parse_ai_json: 提取reasoning代码块成功，内容长度: {len(clean_content)}")
-            else:
-                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', clean_content)
-                if json_match:
-                    clean_content = json_match.group(1).strip()
-                    logger.debug(f"parse_ai_json: 提取json代码块成功，内容长度: {len(clean_content)}")
-                else:
-                    logger.debug(f"parse_ai_json: 未找到action/reasoning/json代码块，原始内容前200字符: {content[:200]}")
+            extracted = action_match.group(1).strip()
+            logger.debug(f"parse_ai_json: 提取action代码块成功，内容长度: {len(extracted)}")
+            return _try_parse_json_obj(extracted)
 
-        start_brace = clean_content.find('{')
-        if start_brace != -1:
-            depth = 0
-            in_string = False
-            escape = False
-            for i in range(start_brace, len(clean_content)):
-                c = clean_content[i]
-                if escape:
-                    escape = False
-                    continue
-                if c == '\\':
-                    escape = True
-                    continue
-                if c == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if c == '{':
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            obj = repair_loads(clean_content[start_brace:i + 1])
-                            if isinstance(obj, dict) and ("tool_name" in obj or "tool_call" in obj or "tool" in obj or "final_message" in obj or "progress" in obj):
-                                return obj
-                        except Exception:
-                            pass
+        # ── 优先级 2: json 代码块 ──
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', clean_content)
+        if json_match:
+            extracted = json_match.group(1).strip()
+            logger.debug(f"parse_ai_json: 提取json代码块成功，内容长度: {len(extracted)}")
+            result = _try_parse_json_obj(extracted)
+            if result is not None:
+                return result
+            # json 块解析失败不直接丢弃，继续用全文搜索
 
-        result = repair_loads(clean_content)
-        if result is not None and isinstance(result, dict):
+        # ── 移除 reasoning 块后，在剩余内容中搜索 JSON ──
+        # reasoning 块是 LLM 的思考过程，不应作为 action/final_message 来源
+        stripped = re.sub(r'```reasoning\s*[\s\S]*?\s*```', '', clean_content).strip()
+        if stripped and stripped != clean_content:
+            logger.debug(f"parse_ai_json: 移除reasoning块后搜索，剩余长度: {len(stripped)}")
+            result = _try_parse_json_obj(stripped)
+            if result is not None:
+                return result
+            # 继续用全文搜索
+
+        # ── 最后兜底：在全文（含 reasoning）中搜索 JSON 模式 ──
+        result = _try_parse_json_obj(clean_content)
+        if result is not None:
             return result
 
-        start = clean_content.find('{')
-        if start != -1:
-            depth = 0
-            in_string = False
-            escape = False
-            for i in range(start, len(clean_content)):
-                c = clean_content[i]
-                if escape:
-                    escape = False
-                    continue
-                if c == '\\':
-                    escape = True
-                    continue
-                if c == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if c == '{':
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return repair_loads(clean_content[start:i + 1])
+        # ── 自然语言兜底解析 ──
+        # 模式1：检测工具调用意图
+        tool_mention_patterns = [
+            r'(?:调用|使用|执行|运行)\s*(\w+)\s*(?:工具|函数|来)',
+            r'(?:我需要|我应该|接下来)\s*(?:调用|使用)\s*(\w+)',
+            r'(?:tool|工具)[:：]\s*(\w+)',
+        ]
+        for pattern in tool_mention_patterns:
+            tool_match = re.search(pattern, clean_content, re.IGNORECASE)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                args_match = re.search(r'\{[^{}]*\}', clean_content)
+                args = {}
+                if args_match:
+                    try:
+                        args = repair_loads(args_match.group(0))
+                    except:
+                        args = {}
+                logger.info(f"parse_ai_json 自然语言兜底: 提取到工具 {tool_name}, 参数: {args}")
+                return {"tool_name": tool_name, "arguments": args}
+
+        # 模式2：检测终结信号（扩展更多自然语言完成模式）
+        final_patterns = [
+            r'(?:任务完成|已完成|最终回复|final answer|done)',
+            r'(?:文件已生成|已生成|已创建|已保存)',
+            # 成功操作类：✅/已将/已经/搞定/没问题/成功设置/成功调整/成功执行
+            r'[✅✔✓]\s*(?:已|已经|成功)',
+            r'(?:已将|已经|搞定|弄好了|没问题了|完成了|搞好了)',
+            r'(?:设置为|调整到|调到|设为|改成|切换到)',
+            r'(?:成功|已成功|已经成功)',
+        ]
+        for pattern in final_patterns:
+            if re.search(pattern, clean_content, re.IGNORECASE):
+                logger.info(f"parse_ai_json 自然语言兜底: 检测到终结信号 pattern={pattern}")
+                return {"final_message": clean_content.strip()}
+
+        # 模式3：短文本+非工具调用特征 → 视为纯文本回复
+        # 条件：内容不长 + 不含工具调用特征 + 含自然语言
+        if (len(clean_content) <= 200
+            and not re.search(r'\{\s*"tool_name"', clean_content)
+            and not re.search(r'\{\s*"tool_call"', clean_content)
+            and not re.search(r'```action', clean_content)
+            and not re.search(r'```json', clean_content)
+            and (re.search(r'[\u4e00-\u9fff]', clean_content) or re.match(r'^[A-Za-z✅✔✓]', clean_content))):
+            logger.info("parse_ai_json 自然语言兜底: 短文本视为final_message")
+            return {"final_message": clean_content.strip()}
+
         return None
     except Exception as e:
         logger.error(f"JSON 解析异常: {e}")
         return None
+
+
+def _try_parse_json_obj(text):
+    """从给定文本中尝试提取并解析有效 JSON 对象。
+    只返回包含 tool_name/tool_call/tool/final_message/progress 等有效字段的 dict，
+    或无法判断时返回 None（避免误把推理 JSON 当成 action）。
+    """
+    from json_repair import loads as repair_loads
+
+    # 方法1: 整体解析
+    try:
+        obj = repair_loads(text)
+        if isinstance(obj, dict):
+            # 如果包含有效字段，直接返回
+            if any(k in obj for k in ("tool_name", "tool_call", "tool", "final_message", "progress")):
+                return obj
+            # 特殊处理：包含 next_step 等推理字段但无有效 action 字段 → 视为无意义
+            # 可能是推理 JSON（如 {"level": 56, "next_step": "任务完成"}）
+            # 这种情况返回 None 让上层用纯文本兜底
+            if "next_step" in obj and len(obj) <= 3:
+                return None
+            # 其他 dict 也无有效字段 → 返回 None
+            return None
+    except Exception:
+        pass
+
+    # 方法2: 逐字符扫描提取完整 JSON
+    start_brace = text.find('{')
+    if start_brace == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start_brace, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\':
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = repair_loads(text[start_brace:i + 1])
+                    if isinstance(obj, dict):
+                        if any(k in obj for k in ("tool_name", "tool_call", "tool", "final_message", "progress")):
+                            return obj
+                        if "next_step" in obj and len(obj) <= 3:
+                            return None
+                except Exception:
+                    pass
+                # 继续搜索下一个 {
+                depth = 0
+                in_string = False
+                escape = False
+                start_brace = text.find('{', i + 1)
+                if start_brace == -1:
+                    break
+                # 重新开始扫描
+                i = start_brace
+                depth = 1
+                continue
+
+    return None
 
 
 _models_cache = None
@@ -861,13 +1095,14 @@ def _deepseek_call(messages, model, api_key, base_url,
 
 def _deepseek_call_stream(messages, model, api_key, base_url,
                           provider="deepseek", trace_id="", tools=None, response_format=None,temperature=DEFAULT_TEMPERATURE):
+    _assert_system_first(messages, caller="deepseek_stream")
     return _openai_compatible_call_stream(messages, model, api_key, base_url,
                                           provider=provider, trace_id=trace_id,
                                           tools=tools, response_format=response_format,temperature=temperature)
 
 
 def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
-                     tools=None, response_format=None, base_url_override=None, api_version="v1", model_id=None):
+                     tools=None, response_format=None, base_url_override=None, api_version="v1", model_id=None, temperature=DEFAULT_TEMPERATURE):
     """统一 AI 流式调用入口：Ollama 走专属逻辑，其余走通用 OpenAI 兼容协议"""
     try:
         get_logger().debug(f"[ai_concat_stream] 开始调用", trace_id=trace_id, model_id=model_id, 
@@ -887,10 +1122,10 @@ def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
 
         if backend == "ollama":
             model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-r1:7b")
-            temperature = model_cfg.get("temperature", DEFAULT_TEMPERATURE) if model_cfg else DEFAULT_TEMPERATURE
-            get_logger().debug(f"[ai_concat_stream] Ollama调用", trace_id=trace_id, model=model, temperature=temperature)
+            resolved_temperature = temperature if temperature is not None else (model_cfg.get("temperature", DEFAULT_TEMPERATURE) if model_cfg else DEFAULT_TEMPERATURE)
+            get_logger().debug(f"[ai_concat_stream] Ollama调用", trace_id=trace_id, model=model, temperature=resolved_temperature)
             yield from _ollama_call_stream(messages, model, trace_id=trace_id,
-                                           tools=tools, response_format=response_format, temperature=temperature)
+                                           tools=tools, response_format=response_format, temperature=resolved_temperature)
         else:
             resolved_model = model_name or (model_cfg.get("model") if model_cfg else None) or config.get("model", "deepseek-chat")
             resolved_api_key = get_api_key(model_id)
@@ -898,13 +1133,13 @@ def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
             if model_cfg:
                 resolved_base_url = base_url_override or model_cfg.get("base_url", "https://api.deepseek.com")
                 resolved_api_version = model_cfg.get("api_version", "v1")
-                resolved_temperature = model_cfg.get("temperature", DEFAULT_TEMPERATURE)
+                resolved_temperature = temperature if temperature is not None else model_cfg.get("temperature", DEFAULT_TEMPERATURE)
             else:
                 resolved_base_url = base_url_override or get_base_url(model_id)
                 resolved_api_version = api_version
                 if model_id and config.get("models") and config["models"].get(model_id):
                     resolved_api_version = config["models"][model_id].get("api_version", "v1")
-                resolved_temperature = DEFAULT_TEMPERATURE
+                resolved_temperature = temperature if temperature is not None else DEFAULT_TEMPERATURE
 
             if not resolved_base_url:
                 raise ValueError(f"无法解析 Base URL，请检查 model_id={model_id} 配置或传入 base_url_override")

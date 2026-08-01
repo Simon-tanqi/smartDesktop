@@ -6,6 +6,7 @@ import time
 import subprocess
 import re
 import shlex
+import shutil
 import threading
 from datetime import datetime
 
@@ -15,12 +16,16 @@ from . import post_action_verify
 from config.config_loader import get_safety_config
 from config.settings import MAX_OUTPUT_CHARS, PYTHON_TIMEOUT
 
-# 注意：tools/system_tools.py 使用独立的 _pending_confirmations 字典
-# 与 backend/chat.py 的 _pending_confirmations 完全分离，避免数据格式冲突
-# - backend/chat.py 格式: {token: {"event": evt, "result": result_holder}}
-# - tools/system_tools.py 格式: {token: (command, expiry_time)}
-_pending_confirmations: dict = {}
-_pending_lock = threading.Lock()
+# 注意：tools/system_tools.py 已统一使用 core.confirmation_manager
+# 惰性导入：避免 tools → core → tools 循环导入
+_confirmation_manager = None
+
+def _get_confirmation_manager():
+    global _confirmation_manager
+    if _confirmation_manager is None:
+        from core.confirmation_manager import confirmation_manager as _cm
+        _confirmation_manager = _cm
+    return _confirmation_manager
 
 # ============================================================
 # 卸载路径缓存 — 防止 LLM 捏造路径
@@ -65,6 +70,41 @@ def _is_audio_command(command: str) -> bool:
     kw_hit = any(re.search(kw, cmd_lower) for kw in audio_keywords)
     pattern_hit = any(re.search(p, command, re.IGNORECASE) for p in _AUDIO_COMMAND_PATTERNS)
     return kw_hit or pattern_hit
+
+
+def _win_split_command(cmdline: str) -> list:
+    """Windows CommandLineToArgvW 风格解析命令行（保留带空格参数为单 token）。
+
+    与 shlex.split(posix=False) 不同，引号内的空格不会被拆开（如
+    /LOG="a b.txt" 应解析为 '/LOG=a b.txt' 而非 '/LOG="a' 与 'b.txt"'），
+    供卸载器 Popen 列表形式使用，避免 cmd.exe 引号地狱。
+    """
+    args = []
+    cur = ""
+    in_quotes = False
+    i = 0
+    n = len(cmdline)
+    while i < n:
+        c = cmdline[i]
+        if c == '"':
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if c == '\\' and i + 1 < n and cmdline[i + 1] == '"':
+            cur += '"'
+            i += 2
+            continue
+        if c.isspace() and not in_quotes:
+            if cur:
+                args.append(cur)
+                cur = ""
+            i += 1
+            continue
+        cur += c
+        i += 1
+    if cur:
+        args.append(cur)
+    return args
 
 
 def _parse_first_token(command: str) -> str:
@@ -225,14 +265,8 @@ def _log_confirmation(command: str, status: str, detail: str = ""):
         f.write(entry)
 
 
-def _get_lock():
-    global _pending_lock
-    if _pending_lock is None:
-        _pending_lock = threading.Lock()
-    return _pending_lock
-_com_ref_count = threading.local()
-_com_ref_count.value = 0
-_com_ref_count.initialized = False
+_com_ref_count = {}
+_com_ref_lock = threading.Lock()
 
 
 def _validate_uninstall_path(command: str, prevalidated_paths: list = None) -> dict:
@@ -331,56 +365,107 @@ def _validate_uninstall_path(command: str, prevalidated_paths: list = None) -> d
     except Exception:
         pass
 
-    return {"valid": True, "message": "路径未缓存，已放行通过"}
+    return {"valid": False, "message": "卸载路径未预先缓存且无法验证，已拒绝放行"}
+
+
+def _run_command_threaded(command: str, working_dir: str = None, timeout: int = 120,
+                          **safe_exec_kwargs) -> dict:
+    """在线程中执行非破坏性命令，共享主进程 Python 状态。
+
+    与 subprocess 子进程不同，线程内存与主进程共享：TOOL_REGISTRY、
+    confirmation_manager、_uninstall_path_cache 等模块级状态均可直接访问。
+
+    破坏性命令（卸载/删除/格式化等）应继续走 subprocess 路径以保持隔离。
+    """
+    result_container: list = [None]
+    exception_container: list = [None]
+
+    def _target():
+        try:
+            result_container[0] = safe_exec.run_powershell(
+                command, working_dir=working_dir, timeout=timeout,
+                _skip_validation=True, **safe_exec_kwargs
+            )
+        except Exception as e:
+            exception_container[0] = e
+
+    t = threading.Thread(target=_target, daemon=False)
+    t.start()
+    t.join(timeout=timeout + 10)
+
+    if t.is_alive():
+        # 超时但线程未结束，不强行 join 避免卡死主线程
+        return {"success": False, "output": "", "message": "命令执行超时（线程未返回）"}
+
+    if exception_container[0] is not None:
+        return {"success": False, "output": "",
+                "message": f"命令执行异常: {str(exception_container[0])}"}
+
+    return result_container[0] or {"success": False, "output": "", "message": "命令未产生结果"}
+
 
 @register_tool(timeout=120)
-def execute_command(command: str, working_dir: str = None, confirmed: bool = False,
-                    challenge_response: str = None, challenge_token: str = None,
-                    confirmation_token: str = None, domain_confirmed: bool = False,
-                    prevalidated_uninstall_paths: list = None, **kwargs) -> str:
-    """在终端执行一条命令。"""
+def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
+    """在用户电脑上执行 shell/PowerShell 命令并返回输出。
+    
+    适用场景：
+    - 修改系统设置（音量、亮度、分辨率等）
+    - 安装/卸载软件（pip install, winget, choco 等）
+    - 运行脚本（python xxx.py, node xxx.js）
+    - 系统信息查询（systeminfo, ipconfig 等）
+    - 进程管理（tasklist, taskkill 等）
+    
+    Args:
+        command: 要执行的命令字符串（Windows 下默认使用 PowerShell）
+        working_dir: 工作目录，默认为 workspace
+        timeout: 超时秒数，默认30秒
+    """
+    # 内部确认标志：由 react_engine Path B 确认通过后带 token 重调注入，
+    # 不出现在 LLM 可见的 JSON Schema 中（schema 已过滤这些参数名）。
+    confirmed = bool(kwargs.get("confirmed"))
+    challenge_response = kwargs.get("challenge_response")
+    challenge_token = kwargs.get("challenge_token")
+    confirmation_token = kwargs.get("confirmation_token")
+    domain_confirmed = bool(kwargs.get("domain_confirmed"))
+    prevalidated_uninstall_paths = kwargs.get("prevalidated_uninstall_paths")
     stripped = command.lstrip()
     if not stripped:
         return json.dumps({"success": False, "message": "空命令"})
 
     _confirmed_note = ""
     _is_verified = False
+    _command_is_readonly = False  # Bug 1 修复：标记为非破坏性命令（可走线程路径）
 
     # ── 1. 提前验证可能传入的确认令牌（如果有效则直接标记为已验证）──
     if challenge_response and challenge_token:
-        with _get_lock():
-            pending = _pending_confirmations.get(challenge_token)
-            if pending:
-                stored_cmd, expiry = pending
-                expected_phrase = _get_cfg().danger_challenge_phrase
-                if time.time() < expiry and challenge_response == expected_phrase:
-                    if command.strip() != stored_cmd.strip():
-                        return json.dumps({
-                            "success": False,
-                            "message": "命令不匹配：令牌已绑定其他命令"
-                        })
-                    _is_verified = True
-                    _confirmed_note = f"[已授权] {challenge_token[:8]}"
-                    del _pending_confirmations[challenge_token]
+        pending = _get_confirmation_manager().pop(challenge_token)
+        if pending:
+            stored_cmd = pending["command"]
+            expected_phrase = _get_cfg().danger_challenge_phrase
+            if challenge_response == expected_phrase:
+                if command.strip() != stored_cmd.strip():
+                    return json.dumps({
+                        "success": False,
+                        "message": "命令不匹配：令牌已绑定其他命令"
+                    })
+                _is_verified = True
+                _confirmed_note = f"[已授权] {challenge_token[:8]}"
         if not _is_verified:
             return json.dumps({
                 "success": False,
                 "message": "挑战验证失败：令牌无效、已过期或短语不匹配"
             })
     elif confirmation_token:
-        with _get_lock():
-            pending = _pending_confirmations.get(confirmation_token)
-            if pending:
-                stored_cmd, expiry = pending
-                if time.time() < expiry:
-                    if command.strip() != stored_cmd.strip():
-                        return json.dumps({
-                            "success": False,
-                            "message": "命令不匹配：令牌已绑定其他命令"
-                        })
-                    _is_verified = True
-                    _confirmed_note = f"[已确认] {confirmation_token[:8]}"
-                    del _pending_confirmations[confirmation_token]
+        pending = _get_confirmation_manager().pop_confirmation(confirmation_token)
+        if pending:
+            stored_cmd = pending["command"]
+            if command.strip() != stored_cmd.strip():
+                return json.dumps({
+                    "success": False,
+                    "message": "命令不匹配：令牌已绑定其他命令"
+                })
+            _is_verified = True
+            _confirmed_note = f"[已确认] {confirmation_token[:8]}"
         if not _is_verified:
             return json.dumps({
                 "success": False,
@@ -402,22 +487,28 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
         if not path_check["valid"]:
             return json.dumps(path_check, ensure_ascii=False)
 
-        # 已验证则跳过确认，继续执行
-        if _is_verified:
-            pass
-        else:
-            # 生成新的确认令牌（P1 挑战）
-            token = secrets.token_hex(16)
-            with _get_lock():
-                _pending_confirmations[token] = (command, time.time() + 300)
-
+        if not _is_verified and not confirmed:
+            # P1 风险：需要挑战短语确认，返回 confirmation_required 触发系统弹窗
+            challenge_phrase = _get_cfg().danger_challenge_phrase
+            token = _get_confirmation_manager().create_challenge(
+                command=command,
+                desc="卸载软件",
+                source="system_tools",
+                level="high"
+            )
             return json.dumps({
                 "success": False,
-                "message": "高危操作需要确认",
                 "confirmation_required": True,
-                "challenge_phrase": _get_cfg().danger_challenge_phrase,
-                "challenge_token": token
-            })
+                "challenge_phrase": challenge_phrase,
+                "challenge_token": token,
+                "message": f"卸载软件属于 P1 风险操作，需要确认。请回复以下完整短语以确认执行：\\n```\\n{challenge_phrase}\\n```",
+                "details": {
+                    "操作": "卸载软件",
+                    "风险等级": "P1",
+                    "说明": "此操作将删除软件及其相关文件，不可恢复"
+                }
+            }, ensure_ascii=False)
+        # confirmed 或已验证 → 继续执行
 
     # ── 4. 原有的命令分类与风险判断（未经验证时执行）──
     try:
@@ -432,106 +523,36 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
 
         if prog and prog in _get_cfg().readonly_patterns:
             _is_verified = True
+            _command_is_readonly = True
         elif prog_no_ext and prog_no_ext in _get_cfg().readonly_patterns:
             _is_verified = True
+            _command_is_readonly = True
         elif first_token.lower() in _get_cfg().readonly_patterns:
             _is_verified = True
+            _command_is_readonly = True
         elif any(kw in command for kw in _get_cfg().low_risk_registry_patterns) and "hkcu" in command.lower():
             _is_verified = True
+            _command_is_readonly = True
 
-        # 原有的挑战/确认逻辑（已移到前面，下面的代码不会在令牌已验证时执行）
         if not _is_verified:
-            # 注意：如果令牌验证已在第一步完成，这里不会进入
-            # 但为了代码清晰，仍保留原有结构，只是移除了重复的令牌验证部分
             if confirmed or domain_confirmed:
                 _is_verified = True
                 _confirmed_note = "[已确认]" if confirmed else "[域已确认]"
             elif any(re.search(p[0], command, re.IGNORECASE) for p in _get_cfg().danger_patterns):
-                matched_level = "challenge"
-                for p in _get_cfg().danger_patterns:
-                    try:
-                        if re.search(p[0], command, re.IGNORECASE):
-                            matched_level = p[2] if len(p) > 2 else "challenge"
-                            break
-                    except re.error:
-                        continue
-
-                cmd_lower = command.lower().strip('"').strip("'")
-                is_program_files = any(pf in cmd_lower for pf in [
-                    "c:\\program files\\", "c:\\program files (x86)\\",
-                    "d:\\program files\\", "d:\\program files (x86)\\",
-                    "c:\\program files", "d:\\program files",
-                ]) or any(kw in cmd_lower for kw in ["program files", "programfiles", "progra~1", "progra~2"])
-                is_batch_delete = any(kw in cmd_lower for kw in [
-                    "del ", "rmdir ", "rd ", "rm -rf ", "清空回收站",
-                    "rd /s", "del /f /s", "del /q /s",
-                ])
-                is_password_change = any(kw in cmd_lower for kw in [
-                    "net user ", "密码", "password ", "change password",
-                ])
-                is_recycle_bin = any(kw in cmd_lower for kw in [
-                    "回收站", "$recycle.bin", "recycle.bin", "empty",
-                ])
-                is_high_risk = is_program_files or is_batch_delete or is_password_change or is_recycle_bin
-
-                token = secrets.token_hex(16)
-                with _get_lock():
-                    _pending_confirmations[token] = (command, time.time() + 300)
-
-                if matched_level == "challenge" or is_high_risk:
-                    return json.dumps({
-                        "success": False,
-                        "message": "高危操作需要确认",
-                        "confirmation_required": True,
-                        "challenge_phrase": _get_cfg().danger_challenge_phrase,
-                        "challenge_token": token
-                    })
-                else:
-                    return json.dumps({
-                        "success": False,
-                        "message": "操作需要确认",
-                        "confirmation_required": True,
-                        "confirmation_token": token
-                    })
+                # 危险模式：无预先授权时直接拒绝，不返回 chat 级确认
+                return json.dumps({
+                    "success": False,
+                    "message": "操作被拒绝：命令匹配危险模式，需要预先授权"
+                })
             elif any(re.search(pattern, command, re.IGNORECASE) for pattern in _get_cfg().delete_command_patterns):
-                cfg = _get_cfg()
-                challenge_phrase = None
-                if hasattr(cfg, 'danger_path_patterns') and cfg.danger_path_patterns:
-                    for path_pattern, path_desc in cfg.danger_path_patterns:
-                        if re.search(path_pattern, command, re.IGNORECASE):
-                            challenge_phrase = cfg.danger_challenge_phrase
-                            break
+                # 删除操作：无预先授权时直接拒绝
+                return json.dumps({
+                    "success": False,
+                    "message": "操作被拒绝：删除命令需要预先授权"
+                })
+            # 未匹配任何分类的命令：直接执行（UI 确认已在 react_engine 层完成）
+            _is_verified = True
 
-                token = secrets.token_hex(16)
-                with _get_lock():
-                    _pending_confirmations[token] = (command, time.time() + 300)
-
-                if challenge_phrase:
-                    return json.dumps({
-                        "success": False,
-                        "message": "检测到目标路径涉及受保护目录，需要授权",
-                        "confirmation_required": True,
-                        "challenge_phrase": challenge_phrase,
-                        "challenge_token": token
-                    })
-                else:
-                    return json.dumps({
-                        "success": False,
-                        "message": "中等风险操作，请确认",
-                        "confirmation_required": True,
-                        "confirmation_token": token
-                    })
-
-            # 默认 P2：未匹配任何白名单(P3)或危险模式(P0/P1)的命令，需要确认
-            token = secrets.token_hex(16)
-            with _get_lock():
-                _pending_confirmations[token] = (command, time.time() + 300)
-            return json.dumps({
-                "success": False,
-                "message": "操作需要确认",
-                "confirmation_required": True,
-                "confirmation_token": token
-            })
 
     # ── 5. 命令执行 ──
     if working_dir:
@@ -549,31 +570,27 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
     safe_exec_kwargs = {}
     try:
         if challenge_response and challenge_token and _is_verified:
-            from tools.safe_exec import _pending_challenges, _pending_lock as se_lock
-            import datetime as _dt
-            with se_lock:
-                _pending_challenges[challenge_token] = {
-                    "command": actual_command,
-                    "desc": "execute_command 已验证",
-                    "level": "challenge",
-                    "timestamp": _dt.datetime.now().isoformat(),
-                    "source": "powershell",
-                }
+            _get_confirmation_manager().create_challenge(
+                command=actual_command,
+                desc="execute_command 已验证",
+                source="powershell",
+                level="challenge",
+            )
             safe_exec_kwargs = {"challenge_response": challenge_response, "challenge_token": challenge_token}
 
         if is_uninstall:
             import subprocess
             try:
-                tokens = shlex.split(actual_command.strip(), posix=False)
+                tokens = _win_split_command(actual_command.strip())
                 exe_path = tokens[0].strip('"').strip("'") if tokens else ""
                 rest_args = tokens[1:] if len(tokens) > 1 else []
                 # 设置工作目录为卸载器所在目录（InnoSetup 需要 unins000.dat 等文件在同一目录）
                 uninstall_dir = os.path.dirname(exe_path)
-                # 统一使用 Popen 异步启动，不等执行完成（卸载器通常需要用户交互）
-                cmd_str = f'"{exe_path}" {" ".join(rest_args)}' if isinstance(rest_args, list) else f'"{exe_path}" {rest_args}'
+                # 统一使用 Popen 列表形式异步启动（shell=False），避免 cmd.exe 引号地狱
+                # 导致 WinError 123（如 exe 路径或参数含嵌套引号时）
                 subprocess.Popen(
-                    cmd_str,
-                    shell=True, cwd=uninstall_dir,
+                    [exe_path] + rest_args,
+                    shell=False, cwd=uninstall_dir,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
                 )
                 result = {"success": True, "output": "卸载程序已启动，需要用户手动完成后续操作", "is_gui_operation": True}
@@ -581,36 +598,19 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
                 result = {"success": False, "message": f"可执行文件不存在: {exe_path}", "output": f"可执行文件不存在: {exe_path}"}
             except Exception as e:
                 result = {"success": False, "message": f"启动卸载程序失败: {str(e)}", "output": f"启动卸载程序失败: {str(e)}"}
+        elif _command_is_readonly and not is_uninstall:
+            # Bug 1 修复：非破坏性命令走线程路径，共享主进程 TOOL_REGISTRY 等 Python 状态
+            result = _run_command_threaded(actual_command, working_dir=working_dir, timeout=120,
+                                          domain_confirmed=(confirmed or bool(_confirmed_note)),
+                                          **safe_exec_kwargs)
         else:
-            result = safe_exec.run_powershell(actual_command, working_dir=working_dir, timeout=120, domain_confirmed=(confirmed or bool(_confirmed_note)), **safe_exec_kwargs)
+            result = safe_exec.run_powershell(actual_command, working_dir=working_dir, timeout=120, domain_confirmed=(confirmed or bool(_confirmed_note)), _skip_validation=True, **safe_exec_kwargs)
 
         if result.get("challenge_required"):
-            token = result["challenge_token"]
-            if _is_verified and challenge_response:
-                from tools.safe_exec import _pending_challenges, _pending_lock as se_lock
-                import datetime as _dt
-                with se_lock:
-                    _pending_challenges[token] = {
-                        "command": actual_command,
-                        "desc": "execute_command 已验证，自动转发授权",
-                        "level": "challenge",
-                        "timestamp": _dt.datetime.now().isoformat(),
-                        "source": "powershell",
-                    }
-                result = safe_exec.run_powershell(actual_command, working_dir=working_dir, timeout=120, 
-                                                  domain_confirmed=(confirmed or bool(_confirmed_note)), 
-                                                  challenge_token=token, challenge_response=challenge_response)
-            else:
-                with _get_lock():
-                    _pending_confirmations[token] = (command, time.time() + 300)
-                return json.dumps({
-                    "success": False,
-                    "confirmation_required": True,
-                    "challenge_phrase": result.get("challenge_phrase"),
-                    "challenge_token": token,
-                    "message": result.get("message"),
-                    "details": result.get("details", {}),
-                }, ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "message": "操作被拒绝：safe_exec 模块验证失败，需要预先授权"
+            })
 
         success = result.get("success")
         if success is None or success is False:
@@ -629,6 +629,7 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
                 "success": True,
                 "output": output,
                 "is_gui_operation": True,
+                "polling": False,
                 "warning": "⚠️ GUI 程序已启动，需要用户手动操作完成。"
             }, ensure_ascii=False)
 
@@ -636,11 +637,16 @@ def execute_command(command: str, working_dir: str = None, confirmed: bool = Fal
             half = MAX_OUTPUT_CHARS // 2
             output = output[:half] + f"\n[...截断：共 {len(output)} 字符...]\n" + output[-half:]
 
+        # 检测是否为轮询命令（re 已在模块级 import，函数内重复 import 会导致闭包作用域错误）
+        _poll_re = re.compile(r"(tasklist|findstr|ping\s+-n|Start-Sleep|timeout|while|until|--watch)", re.I)
+        is_polling = bool(_poll_re.search(command))
+
         return json.dumps({
             "success": True,
             "output": output,
             "output_total_chars": len(result.get("output", "")),
-            "truncated": len(result.get("output", "")) > MAX_OUTPUT_CHARS
+            "truncated": len(result.get("output", "")) > MAX_OUTPUT_CHARS,
+            "polling": is_polling
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -1229,27 +1235,31 @@ def system_audio(operation: str, value: int = None, device: str = None) -> str:
             "message": f"缺少依赖库 {missing_lib}: {str(e)}，请安装: pip install pycaw comtypes"
         }, ensure_ascii=False)
 
-    if not hasattr(_com_ref_count, 'value'):
-        _com_ref_count.value = 0
-    if not hasattr(_com_ref_count, 'initialized'):
-        _com_ref_count.initialized = False
+    tid = threading.get_ident()
+    with _com_ref_lock:
+        if tid not in _com_ref_count:
+            _com_ref_count[tid] = {"value": 0, "initialized": False}
+        entry = _com_ref_count[tid]
 
-    if _com_ref_count.value == 0:
+    if entry["value"] == 0:
         try:
             from comtypes import CoInitializeEx, COINIT_APARTMENTTHREADED
             hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED)
             if hr == 0:
-                _com_ref_count.value = 1
-                _com_ref_count.initialized = True
+                with _com_ref_lock:
+                    _com_ref_count[tid]["value"] = 1
+                    _com_ref_count[tid]["initialized"] = True
         except Exception:
             try:
                 CoInitialize(None)
-                _com_ref_count.value = 1
-                _com_ref_count.initialized = True
+                with _com_ref_lock:
+                    _com_ref_count[tid]["value"] = 1
+                    _com_ref_count[tid]["initialized"] = True
             except Exception:
                 pass
     else:
-        _com_ref_count.value += 1
+        with _com_ref_lock:
+            _com_ref_count[tid]["value"] += 1
 
     try:
         def _get_speakers():
@@ -1417,11 +1427,134 @@ def system_audio(operation: str, value: int = None, device: str = None) -> str:
                 "message": f"音频操作失败: {error_msg}"
             }, ensure_ascii=False)
     finally:
-        if hasattr(_com_ref_count, 'value') and _com_ref_count.value > 0:
-            _com_ref_count.value -= 1
-            if _com_ref_count.value == 0 and hasattr(_com_ref_count, 'initialized') and _com_ref_count.initialized:
-                _com_ref_count.initialized = False
+        tid = threading.get_ident()
+        need_uninit = False
+        with _com_ref_lock:
+            if tid in _com_ref_count:
+                if _com_ref_count[tid]["value"] > 0:
+                    _com_ref_count[tid]["value"] -= 1
+                    if _com_ref_count[tid]["value"] == 0 and _com_ref_count[tid]["initialized"]:
+                        _com_ref_count[tid]["initialized"] = False
+                        need_uninit = True
+                    if _com_ref_count[tid]["value"] == 0:
+                        del _com_ref_count[tid]
+        if need_uninit:
+            try:
+                CoUninitialize()
+            except Exception:
+                pass
+
+@register_tool(timeout=15)
+def find_program(program_name: str) -> str:
+    """查找已安装程序的路径，支持通过 PATH、注册表 App Paths、常见安装目录查找，返回多个匹配。
+    program_name: 程序名关键词（如 chrome、edge、notepad）。
+    来源标记：PATH（环境变量）、registry（注册表 App Paths）、filesystem（安装目录/开始菜单扫描）。"""
+    try:
+        if not program_name or not program_name.strip():
+            return json.dumps({"success": False, "message": "program_name 不能为空"}, ensure_ascii=False)
+        raw_name = program_name.strip()
+        name_key = raw_name[:-4] if raw_name.lower().endswith(".exe") else raw_name
+        name_key = name_key.lower()
+        results: list = []
+        seen: set = set()
+
+        def _add(path: str, source: str) -> None:
+            if not path:
+                return
+            p = os.path.normpath(path)
+            if not os.path.exists(p):
+                return
+            pk = p.lower()
+            if pk in seen:
+                return
+            seen.add(pk)
+            results.append({"name": name_key, "path": p, "source": source})
+
+        # ① PATH：依次试 name / name.exe / name.com / name.bat
+        for candidate in (raw_name, name_key + ".exe", name_key + ".com", name_key + ".bat"):
+            try:
+                found = shutil.which(candidate)
+            except Exception:
+                found = None
+            if found:
+                _add(found, "PATH")
+
+        # ② Windows 注册表 App Paths（HKLM + HKCU）
+        try:
+            import winreg
+        except Exception:
+            winreg = None
+        if winreg is not None:
+            _app_paths_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+            for hive, hive_name in ((winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")):
                 try:
-                    CoUninitialize()
-                except Exception:
-                    pass
+                    with winreg.OpenKey(hive, _app_paths_key) as key:
+                        for i in range(winreg.QueryInfoKey(key)[0]):
+                            try:
+                                sub = winreg.EnumKey(key, i)
+                                if name_key not in sub.lower():
+                                    continue
+                                try:
+                                    with winreg.OpenKey(key, sub) as sk:
+                                        try:
+                                            val, _ = winreg.QueryValueEx(sk, None)
+                                        except OSError:
+                                            val = None
+                                except OSError:
+                                    val = None
+                                if val:
+                                    _add(val, "registry")
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+
+        # ③ 常见安装目录一层扫描（PROGRAMFILES / PROGRAMFILES(X86) / LOCALAPPDATA\Programs / 开始菜单 Programs）
+        base_dirs: list = []
+        for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+            v = os.environ.get(env_var)
+            if v and os.path.isdir(v):
+                base_dirs.append(v)
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            base_dirs.append(os.path.join(local, "Programs"))
+        for env_var in ("APPDATA", "PROGRAMDATA"):
+            v = os.environ.get(env_var)
+            if v:
+                base_dirs.append(os.path.join(v, "Microsoft", "Windows", "Start Menu", "Programs"))
+        for base in base_dirs:
+            if not os.path.isdir(base):
+                continue
+            try:
+                entries = os.listdir(base)
+            except (PermissionError, OSError):
+                continue
+            for entry in entries:
+                el = entry.lower()
+                if name_key not in el:
+                    continue
+                full = os.path.join(base, entry)
+                try:
+                    if os.path.isfile(full) and (el.endswith(".exe") or el.endswith(".lnk")):
+                        _add(full, "filesystem")
+                    elif os.path.isdir(full):
+                        # 目录名命中关键词：在该目录一层内找含关键词的 .exe/.lnk
+                        try:
+                            for fname in os.listdir(full):
+                                fl = fname.lower()
+                                if (fl.startswith(name_key) or name_key in fl) and (fl.endswith(".exe") or fl.endswith(".lnk")):
+                                    _add(os.path.join(full, fname), "filesystem")
+                        except (PermissionError, OSError):
+                            continue
+                except (PermissionError, OSError):
+                    continue
+
+        if not results:
+            return json.dumps({"success": False, "message": f"未找到程序: {program_name}", "programs": []}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "message": f"找到 {len(results)} 个匹配程序",
+            "programs": results
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"查找程序失败: {str(e)}", "programs": []}, ensure_ascii=False)

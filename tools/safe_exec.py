@@ -21,6 +21,8 @@ from datetime import datetime
 from config.config_loader import get_safety_config
 from config.settings import COMMAND_TIMEOUT
 
+from . import register_tool
+
 
 # =============================================================================
 # 命令规范化
@@ -84,11 +86,17 @@ def _expand_env_vars(token: str) -> str:
 
 
 # =============================================================================
-# 内部状态（线程安全）
+# 内部状态（统一确认管理器）
+# 惰性导入：避免 tools → core → tools 循环导入
 # =============================================================================
-_pending_challenges = {}
-_pending_lock = threading.Lock()
-_CHALLENGE_TTL_SECONDS = 300
+_confirmation_manager = None
+
+def _get_confirmation_manager():
+    global _confirmation_manager
+    if _confirmation_manager is None:
+        from core.confirmation_manager import confirmation_manager as _cm
+        _confirmation_manager = _cm
+    return _confirmation_manager
 
 _config_cache = None
 _config_cache_mtime = 0
@@ -113,6 +121,7 @@ def _get_safety_config_cached():
             _config_cache_mtime = 0
         return _config_cache
 
+@register_tool
 def invalidate_config_cache():
     global _config_cache, _config_cache_mtime
     with _config_cache_lock:
@@ -120,25 +129,8 @@ def invalidate_config_cache():
         _config_cache_mtime = 0
 
 def _evict_stale_challenges():
-    now = datetime.now()
-    stale = []
-    with _pending_lock:
-        for token, entry in list(_pending_challenges.items()):
-            ts_str = entry.get("timestamp")
-            if ts_str:
-                try:
-                    ts = datetime.fromisoformat(ts_str)
-                    if (now - ts).total_seconds() > _CHALLENGE_TTL_SECONDS:
-                        stale.append(token)
-                except ValueError:
-                    stale.append(token)
-            else:
-                stale.append(token)
-        for token in stale:
-            _pending_challenges.pop(token, None)
-    if stale:
-        _log("EVICT", f"清理过期挑战令牌 {len(stale)} 个")
-    return len(stale)
+    """清理过期挑战令牌（委托给统一确认管理器）。"""
+    return _get_confirmation_manager().cleanup_expired()
 
 def _get_log_path():
     try:
@@ -469,6 +461,7 @@ def _check_danger(command: str):
                 _log("ERROR", f"Regex error in danger rule[{i}] '{pattern}': {e}")
     return False, "", ""
 
+@register_tool
 def is_dangerous(command):
     danger, _, _ = _check_danger(command)
     return danger
@@ -477,23 +470,34 @@ def is_dangerous(command):
 # =============================================================================
 # 安全执行核心函数
 # =============================================================================
-def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk",
-                   challenge_response=None, challenge_token=None, domain_confirmed=False):
+@register_tool(timeout=120)
+def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk", **kwargs):
     """
-    安全执行 PowerShell 命令。domain_confirmed 已废弃。
+    安全执行 PowerShell 命令。
+
+    _skip_validation=True: 跳过 L0/L1/L2 校验，由上层（execute_command）统一完成权限验证。
+    此参数解除 system_tools.py 与 safe_exec.py 的双重拦截问题。
+    内部确认标志（challenge_response/challenge_token/domain_confirmed/_skip_validation）
+    由上层经 kwargs 透传，不出现在 LLM 可见的 JSON Schema 中。
     """
+    # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）
+    challenge_response = kwargs.get("challenge_response")
+    challenge_token = kwargs.get("challenge_token")
+    domain_confirmed = bool(kwargs.get("domain_confirmed"))
+    _skip_validation = bool(kwargs.get("_skip_validation"))
     _evict_stale_challenges()
 
     script = _normalize_command(script)
     challenge_phrase = _get_safety_config_cached().danger_challenge_phrase
     challenge_verified = False
 
-    # ---- 挑战验证 ----
+    # ---- 挑战令牌透传（上层已验证场景） ----
     if challenge_response is not None and challenge_token:
-        with _pending_lock:
-            pending = _pending_challenges.pop(challenge_token, None)
+        pending = _get_confirmation_manager().verify_challenge(
+            challenge_token, challenge_response.strip(), challenge_phrase
+        )
         if not pending:
-            _log("WARN", f"无效挑战令牌: {challenge_token[:8]}...")
+            _log("WARN", f"无效挑战令牌或短语不匹配: {challenge_token[:8]}...")
             return {"success": False, "message": "挑战令牌无效或已过期，请重新发起操作"}
         if pending.get("source") != "powershell":
             _log("WARN", f"挑战令牌来源不匹配: {pending.get('source', 'unknown')}")
@@ -501,11 +505,6 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
         if "command" not in pending:
             _log("WARN", f"挑战令牌缺少 command 字段")
             return {"success": False, "message": "挑战令牌格式无效，请重新发起操作"}
-        if not challenge_response or not challenge_response.strip():
-            return {"success": False, "message": "授权文本为空，操作已取消"}
-        if challenge_response.strip() != challenge_phrase:
-            _log("WARN", f"挑战短语不匹配: '{challenge_response[:40]}...'")
-            return {"success": False, "message": "授权文本不匹配，操作已取消"}
         script = pending["command"]
         challenge_verified = True
         _log("AUTH", f"用户授权执行: {pending['desc']} | cmd={script[:120]}")
@@ -513,7 +512,7 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
     # ---- 解码命令用于检测 ----
     decoded_script = _decode_powershell_script(script)
 
-    # ---- 永久拦截（基于解码后） ----
+    # ---- 永久拦截（始终执行，不受 _skip_validation 影响） ----
     config = _get_safety_config_cached()
     for i, pattern in enumerate(config.always_blocked):
         try:
@@ -523,23 +522,20 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
         except re.error:
             continue
 
-    # ---- L0 路径硬拦截 + L2 挑战路径 ----
-    if not challenge_verified:
+    # ---- L0/L2 校验：_skip_validation=True 时跳过，由上层统一管控 ----
+    if not _skip_validation and not challenge_verified:
         block_hit, challenge_hit = _check_protected_paths(script, cwd=working_dir)
         if block_hit:
             _log("BLOCK", f"路径保护拦截 ({block_hit}): {script[:120]}")
             return {"success": False, "message": f"安全策略：禁止修改 {block_hit}。此路径受硬保护。", "stop": True}
         if challenge_hit:
             _log("CHALLENGE_PATH", f"挑战路径 ({challenge_hit}): {script[:120]}")
-            token = secrets.token_hex(16)
-            with _pending_lock:
-                _pending_challenges[token] = {
-                    "command": script,
-                    "desc": challenge_hit,
-                    "level": "challenge",
-                    "timestamp": datetime.now().isoformat(),
-                    "source": "powershell",
-                }
+            token = _get_confirmation_manager().create_challenge(
+                command=script,
+                desc=challenge_hit,
+                source="powershell",
+                level="challenge",
+            )
             return {
                 "challenge_required": True,
                 "challenge_token": token,
@@ -552,34 +548,26 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
                 ),
             }
 
-    # ---- L2 危险检测 ----
-    if not challenge_verified:
         is_danger, danger_desc, danger_level = _check_danger(script)
-    else:
-        is_danger = False
-
-    if is_danger:
-        token = secrets.token_hex(16)
-        with _pending_lock:
-            _pending_challenges[token] = {
-                "command": script,
-                "desc": danger_desc,
-                "level": "challenge",
-                "timestamp": datetime.now().isoformat(),
-                "source": "powershell",
+        if is_danger:
+            token = _get_confirmation_manager().create_challenge(
+                command=script,
+                desc=danger_desc,
+                source="powershell",
+                level="challenge",
+            )
+            _log("CHALLENGE", f"发起挑战: {danger_desc} | token={token[:8]}...")
+            return {
+                "challenge_required": True,
+                "challenge_token": token,
+                "danger_type": danger_desc,
+                "challenge_phrase": challenge_phrase,
+                "message": (
+                    f"检测到危险操作: {danger_desc}\n\n"
+                    f"请完整输入以下授权文字以继续:\n"
+                    f"「{challenge_phrase}」"
+                ),
             }
-        _log("CHALLENGE", f"发起挑战: {danger_desc} | token={token[:8]}...")
-        return {
-            "challenge_required": True,
-            "challenge_token": token,
-            "danger_type": danger_desc,
-            "challenge_phrase": challenge_phrase,
-            "message": (
-                f"检测到危险操作: {danger_desc}\n\n"
-                f"请完整输入以下授权文字以继续:\n"
-                f"「{challenge_phrase}」"
-            ),
-        }
 
     # ---- 执行 ----
     try:
@@ -606,17 +594,12 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
             # 再次检测拼接符号（已增强）
             danger, _, _ = _check_danger(script)
             if danger:
-                # 触发挑战（略，因为上面已经检测过，但可能因为某些原因漏过，这里做二次确认）
-                # 为简洁，我们直接返回挑战
-                token = secrets.token_hex(16)
-                with _pending_lock:
-                    _pending_challenges[token] = {
-                        "command": script,
-                        "desc": "CMD 拼接或危险操作",
-                        "level": "challenge",
-                        "timestamp": datetime.now().isoformat(),
-                        "source": "powershell",
-                    }
+                token = _get_confirmation_manager().create_challenge(
+                    command=script,
+                    desc="CMD 拼接或危险操作",
+                    source="powershell",
+                    level="challenge",
+                )
                 _log("CHALLENGE", f"cmd /c 分支触发挑战: {script[:120]}")
                 return {
                     "challenge_required": True,
@@ -744,12 +727,17 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
         return {"success": False, "message": str(e), "output": str(e)}
 
 
-def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk",
-            challenge_response=None, challenge_token=None):
+@register_tool(timeout=120)
+def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="gbk", **kwargs):
     """
     安全执行 CMD 命令（list 形式，shell=False）。
     直接使用参数列表进行检测，避免拼接丢失空格。
+    内部确认标志（challenge_response/challenge_token）由上层经 kwargs 透传，
+    不出现在 LLM 可见的 JSON Schema 中。
     """
+    # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）
+    challenge_response = kwargs.get("challenge_response")
+    challenge_token = kwargs.get("challenge_token")
     _evict_stale_challenges()
 
     challenge_phrase = _get_safety_config_cached().danger_challenge_phrase
@@ -757,8 +745,7 @@ def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="g
 
     # ---- 挑战验证 ----
     if challenge_response is not None and challenge_token:
-        with _pending_lock:
-            pending = _pending_challenges.pop(challenge_token, None)
+        pending = _get_confirmation_manager().pop(challenge_token)
         if not pending:
             _log("WARN", f"无效挑战令牌: {challenge_token[:8]}...")
             return {"success": False, "message": "挑战令牌无效或已过期"}
@@ -798,16 +785,13 @@ def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="g
             return {"success": False, "message": f"安全策略：禁止修改 {block_hit}。此路径受硬保护。", "stop": True}
         if challenge_hit:
             _log("CHALLENGE_PATH", f"挑战路径 ({challenge_hit}): {cmd_str[:120]}")
-            token = secrets.token_hex(16)
-            with _pending_lock:
-                _pending_challenges[token] = {
-                    "command": cmd_str,
-                    "cmd_list": command_list,
-                    "desc": challenge_hit,
-                    "level": "challenge",
-                    "timestamp": datetime.now().isoformat(),
-                    "source": "cmd",
-                }
+            token = _get_confirmation_manager().create_challenge(
+                command=cmd_str,
+                desc=challenge_hit,
+                source="cmd",
+                level="challenge",
+                cmd_list=command_list,
+            )
             return {
                 "challenge_required": True,
                 "challenge_token": token,
@@ -827,16 +811,13 @@ def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="g
         is_danger = False
 
     if is_danger:
-        token = secrets.token_hex(16)
-        with _pending_lock:
-            _pending_challenges[token] = {
-                "command": cmd_str,
-                "cmd_list": command_list,
-                "desc": danger_desc,
-                "level": "challenge",
-                "timestamp": datetime.now().isoformat(),
-                "source": "cmd",
-            }
+        token = _get_confirmation_manager().create_challenge(
+            command=cmd_str,
+            desc=danger_desc,
+            source="cmd",
+            level="challenge",
+            cmd_list=command_list,
+        )
         _log("CHALLENGE", f"发起挑战: {danger_desc}")
         return {
             "challenge_required": True,
