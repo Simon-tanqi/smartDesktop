@@ -45,6 +45,7 @@ from memory.stores.sqlite_store import (
     add_summary,
     get_latest_summary,
     get_summaries,
+    get_full_session_messages_rich,
 )
 
 # ── 长期记忆（Markdown）─
@@ -104,4 +105,75 @@ from memory.session import (
     build_step_summary,
     append_think_step,
     get_layered_memory,
+    # 新增：上下文构建辅助函数
+    build_dynamic_system_prompt,
+    get_long_term_memory,
+    get_compressed_summary,
+    get_current_plan,
+    get_recent_thinking_trace,
+    load_recent_rounds,
 )
+
+
+# ═══════════════════════════════════════════════
+# 依赖检查（模块加载时自动执行）
+# ═══════════════════════════════════════════════
+import os
+import sys as _sys
+
+_checked_deps = False
+
+
+def _check_dependencies():
+    """检查必要依赖库是否已安装，缺失时记录 ERROR/WARNING。"""
+    global _checked_deps
+    if _checked_deps:
+        return
+    _checked_deps = True
+
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    # sqlite3 内置，无需安装
+    try:
+        import sqlite3 as _sqlite3
+        _ = _sqlite3.sqlite_version
+    except Exception:
+        msg = "sqlite3 不可用，上下文构建将无法正常工作"
+        if ctx_log:
+            ctx_log.error(msg)
+        print(f"[ERROR] {msg}")
+
+    # requests
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        msg = "缺少依赖: requests。请运行 pip install requests 安装"
+        if ctx_log:
+            ctx_log.error(msg)
+        print(f"[WARNING] {msg}")
+
+    # python-dotenv
+    try:
+        import dotenv  # noqa: F401
+    except ImportError:
+        msg = "缺少依赖: python-dotenv。请运行 pip install python-dotenv 安装"
+        if ctx_log:
+            ctx_log.error(msg)
+        print(f"[WARNING] {msg}")
+
+    # 检查 prompts/*.md 是否存在
+    _app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for _md in ("core.md", "output.md", "safety.md"):
+        _path = os.path.join(_app_dir, "prompts", _md)
+        if not os.path.exists(_path):
+            msg = f"提示词文件缺失: prompts/{_md}"
+            if ctx_log:
+                ctx_log.warning(msg)
+            print(f"[WARNING] {msg}")
+
+
+_check_dependencies()

@@ -23,18 +23,35 @@ from backend.routing import check_chat_layer, check_frequent_cache, check_comple
 from backend.rate_limiter import limiter
 from config.settings import SCREENSHOTS_DIR, MODELS_CONFIG_PATH, USER_PROFILE_PATH, MODEL_PRESETS
 from core.agent_state import checkpoint_manager
+from core.react_engine import ReActEngine
 
 chat_bp = Blueprint('chat', __name__)
 
 # ── 全局会话状态管理 ──
-_active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id, "cancel_event": Event}}
+_active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id, "cancel_event": Event, "engine": ReActEngine}}
 _active_sessions_lock = threading.Lock()
+# ── 会话级 ReActEngine 跨 turn 缓存：_active_sessions 注销后仍保留，
+#    避免每 turn 新建引擎导致 context_detector 历史丢失 ──
+_session_engines = {}
+_session_engines_lock = threading.Lock()
 
 
-def _register_session(session_id):
+def _get_or_create_engine(session_id, trace_id="", session_name=""):
+    """获取或创建会话级 ReActEngine 实例，跨 turn 复用以保留 context_detector 历史。"""
+    with _session_engines_lock:
+        engine = _session_engines.get(session_id)
+        if engine is None:
+            engine = ReActEngine(trace_id=trace_id, session_id=session_id,
+                                 session_name=session_name)
+            _session_engines[session_id] = engine
+        return engine
+
+
+def _register_session(session_id, trace_id="", session_name=""):
     """注册会话并返回 (cancel_event, request_id)。
     如果会话已存在，先取消旧任务再注册新任务。
     引入 request_id 区分同会话的不同请求，避免竞态问题。
+    同时缓存会话级 ReActEngine 实例（跨 turn 复用，保留 context_detector 历史）。
     """
     cancel_event = threading.Event()
     request_id = str(uuid.uuid4())[:8]
@@ -42,6 +59,7 @@ def _register_session(session_id):
         existing = _active_sessions.get(session_id)
         if existing:
             existing["cancel_event"].set()
+        engine = _get_or_create_engine(session_id, trace_id=trace_id, session_name=session_name)
         _active_sessions[session_id] = {
             "started_at": time.time(),
             "thread_id": threading.current_thread().ident,
@@ -49,6 +67,7 @@ def _register_session(session_id):
             "status": "running",
             "current_state": "running",
             "request_id": request_id,
+            "engine": engine,
         }
     return cancel_event, request_id
 
@@ -264,6 +283,21 @@ def api_chat():
                               skip_compress=True, msg_id=msg_id)
         get_logger().info(f"[/chat] 用户消息保存完成", trace_id=trace_id)
 
+        # P1 写入验证：append 后立即 SELECT COUNT(*) 确认消息已落库，
+        # 及时发现 INSERT OR IGNORE/约束冲突导致的静默丢消息。
+        try:
+            from memory.stores.sqlite_store import count_chat_messages as _count_msgs
+            _msg_count = _count_msgs(session_id)
+            if _msg_count <= 0:
+                get_logger().error("[/chat] 用户消息写入验证失败：COUNT(*)=0，消息可能未落库",
+                                   trace_id=trace_id, session_id=session_id)
+            else:
+                get_logger().info(f"[/chat] 用户消息写入验证通过：COUNT(*)={_msg_count}",
+                                  trace_id=trace_id, session_id=session_id)
+        except Exception as _ve:
+            get_logger().warning(f"[/chat] 用户消息写入验证异常: {_ve}",
+                                 trace_id=trace_id, session_id=session_id)
+
         model_choice = data.get("model_choice")
         if (not model_choice or not isinstance(model_choice, dict)
                 or "provider" not in model_choice or "model" not in model_choice):
@@ -338,8 +372,17 @@ def api_chat():
                 )
 
             # 会话注册移入生成器内部，确保与注销成对执行，异常时不泄漏
-            cancel_event, request_id = _register_session(session_id)
+            cancel_event, request_id = _register_session(session_id, trace_id=trace_id, session_name=session_name)
             try:
+                # 获取当前会话缓存的 ReActEngine 实例（跨 turn 复用，保留 context_detector 历史）
+                engine = None
+                with _active_sessions_lock:
+                    _info = _active_sessions.get(session_id)
+                    if _info:
+                        engine = _info.get("engine")
+                if engine is None:
+                    engine = _get_or_create_engine(session_id, trace_id=trace_id,
+                                                   session_name=session_name)
                 # 构造带取消信号的确认处理器（捕获 cancel_event 闭包）
                 def _confirmation_handler(token, timeout=300):
                     with _active_sessions_lock:
@@ -383,6 +426,7 @@ def api_chat():
                             ),
                             resumed_checkpoint=resumed_checkpoint,
                             cancel_event=cancel_event,
+                            engine=engine,
                         ):
                             get_logger().info(f"[/chat] Worker线程收到chunk，长度={len(chunk)}", trace_id=trace_id)
                             while True:
@@ -396,10 +440,18 @@ def api_chat():
                                         return
                         get_logger().info(f"[/chat] Worker线程run_agent执行完成", trace_id=trace_id)
                     except Exception as e:
-                        import traceback
-                        tb_text = traceback.format_exc()
+                        import traceback as _tb
+                        tb_text = _tb.format_exc()
                         get_logger().error("Agent worker 执行异常 (详细traceback)\n" + tb_text,
                                            trace_id=trace_id, session_id=session_id, error=str(e))
+                        # 写 traceback 到文件，方便定位 TypeError 根因
+                        _tb_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'worker_traceback.txt')
+                        try:
+                            with open(_tb_file, 'w', encoding='utf-8') as _f:
+                                _f.write(f"TypeError 诊断 @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                _f.write(tb_text)
+                        except Exception:
+                            pass
                         event_queue.put(("__error__", str(e)))
                     finally:
                         event_queue.put(None)  # 哨兵：通知消费端结束
@@ -804,6 +856,9 @@ def delete_session_route(session_id):
     try:
         cleanup_session_uploads(session_id)
         delete_session(session_id)
+        # 会话删除后清理缓存的 ReActEngine 实例，避免内存泄漏
+        with _session_engines_lock:
+            _session_engines.pop(session_id, None)
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "message": translate_error(str(e))}), 500

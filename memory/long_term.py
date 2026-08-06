@@ -351,3 +351,29 @@ def add_task_memory(session_id, turn, query, outcome="success",
         line += f" 摘要={summary_s}"
     append_fact(line)
     return line
+
+
+def persist_task_memory(engine, state, final_text, outcome="success"):
+    """P1-4: 任务结束时把本次会话沉淀进长期记忆，供后续 get_relevant_memory 检索。
+
+    从 ReActEngine 迁移的独立函数，通过 engine 参数访问引擎属性。
+    """
+    try:
+        key_tools = [t for _, t, _ in getattr(getattr(engine, '_loop_detector', None), "_call_history", [])]
+        add_task_memory(
+            session_id=engine.session_id,
+            turn=getattr(state, "turn", 0),
+            query=getattr(state, "user_task", "") or "",
+            outcome=outcome,
+            key_tools=key_tools[-10:],
+            summary=final_text or "",
+        )
+    except Exception as _mem_err:
+        try:
+            from logger import get_logger
+            get_logger().warning(
+                f"写入长期记忆失败: {_mem_err}",
+                trace_id=getattr(engine, 'trace_id', ''), session_id=getattr(engine, 'session_id', ''),
+            )
+        except Exception:
+            pass

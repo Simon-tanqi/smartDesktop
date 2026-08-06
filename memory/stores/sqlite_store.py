@@ -14,6 +14,7 @@ from memory.config import (
     TRACE_DB, OPERATION_LOG_DB,
     get_session_messages_db, get_session_summaries_db,
 )
+from logger import get_logger
 
 
 # ═══════════════════════════════════════════════
@@ -166,6 +167,13 @@ def _get_conn_simple(db_path, row_factory=False):
         yield conn
     finally:
         try:
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        try:
             conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception:
             pass
@@ -271,6 +279,58 @@ def log_operation(trace_id, user_id, session_id, operation, detail=""):
 # 聊天记录（per-session messages.db）
 # ═══════════════════════════════════════════════
 
+_CHAT_HISTORY_FULL_COLS = [
+    "id", "trace_id", "user_id", "session_id", "role", "content",
+    "msg_type", "msg_id", "created_at", "is_temporary",
+    "tool_calls", "thinking_summary", "tool_call_id",
+]
+
+
+def _migrate_chat_history_drop_unique(conn):
+    """重建 chat_history 表以移除旧版 UNIQUE(trace_id, role, content) 约束。
+
+    该表级约束 + INSERT OR IGNORE 会导致 role+content 相同的消息被静默丢弃
+    （真实会话中用户连续相同输入 / 助手重复回复时会丢历史）。
+    仅当检测到旧表定义含该约束时才执行迁移；新库 / 已迁移库直接跳过。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='chat_history'"
+    ).fetchone()
+    if not row or not row[0] or "UNIQUE(trace_id, role, content)" not in row[0]:
+        return
+    old_cols = [r[1] for r in conn.execute("PRAGMA table_info(chat_history)").fetchall()]
+    conn.execute("ALTER TABLE chat_history RENAME TO chat_history_old")
+    conn.execute("""
+        CREATE TABLE chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            msg_type TEXT DEFAULT 'chat',
+            msg_id TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_temporary INTEGER DEFAULT 0,
+            tool_calls TEXT DEFAULT '',
+            thinking_summary TEXT DEFAULT '',
+            tool_call_id TEXT DEFAULT ''
+        )
+    """)
+    shared = [c for c in _CHAT_HISTORY_FULL_COLS if c in old_cols]
+    if shared:
+        cols_str = ", ".join(shared)
+        conn.execute(
+            f"INSERT INTO chat_history ({cols_str}) SELECT {cols_str} FROM chat_history_old"
+        )
+    conn.execute("DROP TABLE chat_history_old")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_trace ON chat_history(trace_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msg_id ON chat_history(session_id, msg_id) WHERE msg_id != ''")
+    # 显式提交迁移，避免在未走 _get_conn_simple 的只读调用路径中被回滚
+    conn.commit()
+
+
 def _init_chat_tables(conn):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
@@ -283,16 +343,21 @@ def _init_chat_tables(conn):
             content TEXT NOT NULL,
             msg_type TEXT DEFAULT 'chat',
             msg_id TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(trace_id, role, content)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 旧版表结构含 UNIQUE(trace_id, role, content) 表级约束，导致相同内容消息被
+    # INSERT OR IGNORE 静默丢弃。检测到旧表时重建表移除该约束。
+    _migrate_chat_history_drop_unique(conn)
     for col, col_type in [
         ("msg_type", "TEXT DEFAULT 'chat'"),
         ("trace_id", "TEXT NOT NULL DEFAULT ''"),
         ("user_id", "TEXT NOT NULL DEFAULT ''"),
         ("msg_id", "TEXT DEFAULT ''"),
         ("is_temporary", "INTEGER DEFAULT 0"),
+        ("tool_calls", "TEXT DEFAULT ''"),
+        ("thinking_summary", "TEXT DEFAULT ''"),
+        ("tool_call_id", "TEXT DEFAULT ''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE chat_history ADD COLUMN {col} {col_type}")
@@ -305,22 +370,46 @@ def _init_chat_tables(conn):
 
 def add_chat_message(session_id, role, content, msg_type="chat",
                      trace_id="", user_id="", timestamp="", msg_id="",
-                     is_temporary=False):
-    if role not in ("user", "assistant", "system"):
+                     is_temporary=False, tool_calls="", thinking_summary="",
+                     tool_call_id=""):
+    if role not in ("user", "assistant", "system", "tool"):
         return
     db_path = get_session_messages_db(session_id)
-    # 使用 _get_conn_simple：每次操作后关闭连接，允许 WAL checkpoint 合并
-    with _get_conn_simple(db_path) as conn:
+    # 使用 _get_conn（线程本地连接池）：生命周期内复用连接，避免每次开关连接
+    # 引发 WAL 文件锁/并发读写问题（替代 _get_conn_simple）。
+    with _get_conn(db_path) as conn:
         _init_chat_tables(conn)
+        cols = "trace_id, user_id, session_id, role, content, msg_type, msg_id, is_temporary"
+        placeholders = "?, ?, ?, ?, ?, ?, ?, ?"
+        params = [trace_id, user_id, session_id, role, content, msg_type, msg_id, int(is_temporary)]
+        if tool_calls:
+            cols += ", tool_calls"
+            placeholders += ", ?"
+            params.append(tool_calls)
+        if thinking_summary:
+            cols += ", thinking_summary"
+            placeholders += ", ?"
+            params.append(thinking_summary)
+        if tool_call_id:
+            cols += ", tool_call_id"
+            placeholders += ", ?"
+            params.append(tool_call_id)
         if timestamp:
+            cols += ", created_at"
+            placeholders += ", ?"
+            params.append(timestamp)
+        try:
             conn.execute(
-                "INSERT OR IGNORE INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, is_temporary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type, msg_id, int(is_temporary), timestamp),
+                f"INSERT INTO chat_history ({cols}) VALUES ({placeholders})",
+                params,
             )
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO chat_history (trace_id, user_id, session_id, role, content, msg_type, msg_id, is_temporary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (trace_id, user_id, session_id, role, content, msg_type, msg_id, int(is_temporary)),
+        except sqlite3.IntegrityError as e:
+            # 约束冲突（如 idx_chat_msg_id 唯一索引命中）：记录具体冲突日志，
+            # 不再静默忽略，便于定位丢消息问题。
+            get_logger().warning(
+                f"add_chat_message IntegrityError: {e}",
+                session_id=session_id, role=role, msg_type=msg_type,
+                msg_id=msg_id,
             )
 
 
@@ -335,8 +424,8 @@ def get_chat_messages(session_id, limit=200, offset=0):
         _init_chat_tables(conn)
         rows = conn.execute(
             "SELECT role, content, msg_type, msg_id, is_temporary, created_at FROM chat_history "
-            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type = '' OR msg_type IS NULL OR msg_type = 'think' OR msg_type = 'text') "
-            "ORDER BY id ASC LIMIT ? OFFSET ?",
+            "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type = '' OR msg_type IS NULL OR msg_type = 'think' OR msg_type = 'text' OR msg_type = 'final_answer') "
+            "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         ).fetchall()
         result = []
@@ -367,7 +456,7 @@ def get_session_messages(session_id, limit=500):
             rows = conn.execute(
                 "SELECT role, content FROM chat_history "
                 "WHERE session_id = ? AND (msg_type = 'chat' OR msg_type IS NULL OR msg_type = '' OR msg_type = 'text') AND is_temporary = 0 "
-                "ORDER BY id ASC LIMIT ?",
+                "ORDER BY created_at ASC, id ASC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         return [{"role": r[0], "content": r[1]} for r in rows]
@@ -387,12 +476,46 @@ def get_full_session_messages(session_id, limit=500):
             rows = conn.execute(
                 "SELECT role, content, msg_type FROM chat_history "
                 "WHERE session_id = ? AND is_temporary = 0 "
-                "ORDER BY id ASC LIMIT ?",
+                "ORDER BY created_at ASC, id ASC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         return [{"role": r[0], "content": r[1], "msg_type": r[2] or "chat"} for r in rows]
     except sqlite3.DatabaseError as e:
         print(f"[WARN] get_full_session_messages 读取失败: {e}, session={session_id}")
+        return []
+
+
+def get_full_session_messages_rich(session_id, limit=500):
+    """获取完整会话消息（含 tool_calls / thinking_summary / tool_call_id）。"""
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT id, role, content, msg_type, msg_id, tool_calls, thinking_summary, tool_call_id, created_at "
+                "FROM chat_history "
+                "WHERE session_id = ? AND is_temporary = 0 "
+                "ORDER BY created_at ASC, id ASC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "role": r[1],
+                "content": r[2],
+                "msg_type": r[3] or "chat",
+                "msg_id": r[4],
+                "tool_calls": r[5],
+                "thinking_summary": r[6],
+                "tool_call_id": r[7],
+                "created_at": r[8],
+            }
+            for r in rows
+        ]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] get_full_session_messages_rich 读取失败: {e}, session={session_id}")
         return []
 
 
@@ -407,7 +530,7 @@ def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
             rows = conn.execute(
                 "SELECT id, role, content FROM chat_history "
                 "WHERE session_id = ? AND (msg_type = ? OR msg_type IS NULL OR msg_type = '') "
-                "ORDER BY id ASC",
+                "ORDER BY created_at ASC, id ASC",
                 (session_id, msg_type_filter),
             ).fetchall()
         return [{"id": r[0], "role": r[1], "content": r[2]} for r in rows]

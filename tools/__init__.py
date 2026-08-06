@@ -103,6 +103,7 @@ def clear_session_domains(session_id: str):
             del _SESSION_DOMAINS[session_id]
 
 
+@register_tool(timeout=30)
 def load_domain_skills(domain: str, reason: str, session_id: str) -> str:
     """按需加载某个技能域的全部工具。当当前可用工具无法完成用户任务时调用此工具。
 

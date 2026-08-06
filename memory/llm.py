@@ -19,6 +19,26 @@ if not logger.handlers:
 _ai_concat = None
 _ai_concat_lock = threading.Lock()
 
+# 会话级 provider/model 跟随（由 agent_state.prepare_run_state 注入）：
+# 会话使用 ollama 本地模型时，记忆系统的辅助调用（压缩/提取/摘要）同样走
+# ollama，避免回落 deepseek 云端造成 402（T-52~T-55 根因）。
+_session_provider = None
+_session_model = None
+_session_lock = threading.Lock()
+
+
+def set_session_provider(provider, model=None):
+    """记录当前会话使用的 provider / model，供辅助调用路由跟随。"""
+    global _session_provider, _session_model
+    with _session_lock:
+        _session_provider = provider
+        if model:
+            _session_model = model
+
+
+def get_session_provider():
+    return _session_provider
+
 
 def _get_ai_concat():
     global _ai_concat
@@ -64,11 +84,22 @@ def _ollama_call(model_config, messages):
 
 
 def _default_call(messages, model=None, config=None):
-    """使用 llm_client.ai_concat（原有后端）。"""
+    """使用 llm_client.ai_concat（原有后端）。
+
+    路由跟随会话：若会话已注入 provider（如 ollama），则显式传给 ai_concat，
+    避免回落 config.backend 静默切到 DeepSeek 云端（T-52~T-55 402 根因）。
+    """
     ai_concat = _get_ai_concat()
     if not ai_concat:
         return None
-    return ai_concat(messages, model_name=model or "deepseek-chat")
+    use_provider = _session_provider or (config or {}).get("provider")
+    use_model = model or _session_model or "deepseek-chat"
+    # 会话为 ollama 时，禁止把 DeepSeek 在线模型名传给 ollama 路由
+    # （会触发 llm_client._ollama_call 的防御性检查 ValueError）
+    if use_provider == "ollama" and use_model in (
+            "deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3"):
+        use_model = _session_model or "deepseek-r1:7b"
+    return ai_concat(messages, model_name=use_model, provider=use_provider)
 
 
 def _try_call(cfg, messages, model=None):

@@ -24,7 +24,7 @@ from memory.stores.json_store import load_sessions_db, save_sessions_db
 from memory.stores.sqlite_store import (
     add_chat_message, get_chat_messages, log_operation,
     get_session_messages, get_full_session_messages, get_latest_summary,
-    add_summary, count_chat_messages,
+    add_summary, count_chat_messages, get_full_session_messages_rich,
 )
 from logger import get_logger
 from memory.extractor import extract_facts_async
@@ -627,7 +627,8 @@ def _build_structured_history(messages, session_id="",
         role = m.get("role")
         msg_type = m.get("msg_type", "chat")
         content = m.get("content", "")
-        timestamp = m.get("timestamp", "")
+        # 兼容普通消息（timestamp）与富消息（created_at）两种来源
+        timestamp = m.get("timestamp") or m.get("created_at", "")
 
         if role == "user" and msg_type == "chat":
             if current_entry:
@@ -716,7 +717,8 @@ def _build_structured_history(messages, session_id="",
 
                 current_child_turns.append(child_turn_data)
 
-        elif role == "user" and msg_type == "tool_result":
+        elif role in ("user", "tool") and msg_type == "tool_result":
+            # 兼容两种存储：新代码 role="tool"，旧代码 role="user"
             if current_entry and current_child_turns:
                 current_tool_result = content
                 current_child_turns[-1]["tool_result"] = content
@@ -761,6 +763,128 @@ def _build_structured_history(messages, session_id="",
     return history_entries
 
 
+def _infer_tool_result_status(result) -> str:
+    """推断单次工具执行结果的状态：success / failed / unknown。
+
+    优先解析 JSON 结构（web_search / search_files 等工具以 role="tool" 存储
+    原始结果 JSON），显式检查 success / status / error 字段，避免 naive 关键词
+    匹配误判（如 {"success": true, "results": []} 实际是空结果却被判成功）。
+
+    Args:
+        result: 工具原始结果（JSON 字符串 / dict / 纯文本）
+
+    Returns:
+        "success" / "failed" / "unknown"
+    """
+    if not result:
+        return "unknown"
+
+    data = result
+    if isinstance(data, str):
+        stripped = data.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                data = None  # 解析失败 → 走文本兜底
+
+    if isinstance(data, dict):
+        # 显式 success 字段优先
+        if data.get("success") is False:
+            return "failed"
+        if data.get("success") is True:
+            # success=true 但无有效结果 → 对下游同样不可用，判 failed
+            if _is_empty_result(data):
+                return "failed"
+            return "success"
+        # status 字段
+        status = str(data.get("status", "")).lower()
+        if status in ("empty", "low_quality", "error", "failed"):
+            return "failed"
+        if status in ("success", "ok", "completed"):
+            return "success"
+        # error 类字段
+        if data.get("error") or data.get("error_code"):
+            return "failed"
+        err_msg = str(data.get("message") or "")
+        if any(kw in err_msg.lower() for kw in ("失败", "错误", "error", "fail", "不可用", "无法", "exception")):
+            return "failed"
+        # 有 results/data 列表但为空 → 空结果，判 failed
+        if _is_empty_result(data):
+            return "failed"
+        return "success"
+
+    # 非 JSON 文本：回退到关键词匹配（仅作兜底）
+    text = str(result).lower()
+    if any(kw in text for kw in ("失败", "错误", "error", "fail", "exception", "\"success\": false")):
+        return "failed"
+    if any(kw in text for kw in ("成功", "success", "completed", "完成")):
+        return "success"
+    return "unknown"
+
+
+def _is_empty_result(data: dict) -> bool:
+    """判断工具返回 JSON 是否为「无有效结果」形态（空列表 / filtered_count=0）。
+
+    优先识别明确的非空信号（result/output/message 非空、results 等列表非空），
+    仅在所有内容字段都为空时才判空，避免误伤携带 result 字段的成功结果。
+    """
+    # 明确非空信号：只要有一处内容即视为非空
+    for key in ("result", "output", "message"):
+        if data.get(key):
+            return False
+    for key in ("results", "data", "items", "rows"):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return False
+    # 明确空信号：存在列表字段且为空
+    for key in ("results", "data", "items", "rows"):
+        if key in data and isinstance(data.get(key), list) and len(data[key]) == 0:
+            return True
+    # web_search 相关性过滤：filtered_count=0 且无其他内容 → 空结果
+    if isinstance(data.get("filtered_count"), (int, float)) and data.get("filtered_count", 0) == 0:
+        return True
+    return False
+
+
+_CONFIRM_REQUEST_MARKERS = (
+    "请确认", "请您确认", "是否确认", "是否符合您的预期",
+    "需要您确认", "需要确认", "等待您的确认", "确认这个", "确认后",
+)
+
+
+def _is_confirmation_request(text: str) -> bool:
+    """判断 ai_reply 是否为"展示结果并请求用户确认"类消息。
+
+    依据确认请求轮的真实文案特征（如"请确认这个大纲是否符合您的预期？"、
+    "需要确认，您觉得这个大纲结构合适吗？"），命中任一标记即视为确认请求轮。
+    标记均为明确的"请求确认"措辞，避免与普通完成回复误判。
+    """
+    if not text:
+        return False
+    return any(marker in text for marker in _CONFIRM_REQUEST_MARKERS)
+
+
+def _compute_elapsed_ms(child_turns):
+    """回填 child_turns 的 elapsed_ms：同轮相邻子轮时间差（毫秒，best-effort）。
+
+    时间戳来自消息的 timestamp / created_at；缺失或解析失败时保持 0，绝不抛异常。
+    """
+    if not child_turns or len(child_turns) < 2:
+        return
+    prev_ts = child_turns[0].get("timestamp", "")
+    for ct in child_turns[1:]:
+        curr_ts = ct.get("timestamp", "")
+        if prev_ts and curr_ts:
+            try:
+                t0 = datetime.datetime.strptime(str(prev_ts)[:19], "%Y-%m-%d %H:%M:%S")
+                t1 = datetime.datetime.strptime(str(curr_ts)[:19], "%Y-%m-%d %H:%M:%S")
+                ct["elapsed_ms"] = max(0, int((t1 - t0).total_seconds() * 1000))
+            except (ValueError, TypeError):
+                pass
+        prev_ts = curr_ts
+
+
 def _finalize_entry_v2(entry, tool_calls, last_tool_name, last_tool_args, last_tool_result, child_turns=None):
     if last_tool_name and last_tool_result:
         tool_calls.append({
@@ -773,25 +897,35 @@ def _finalize_entry_v2(entry, tool_calls, last_tool_name, last_tool_args, last_t
 
     if child_turns:
         entry["child_turns"] = child_turns
+        _compute_elapsed_ms(child_turns)
 
+    # 状态推断：JSON-aware，避免 naive 关键词匹配误判
     all_success = True
     any_failed = False
+    any_unknown = False
 
     for tc in tool_calls:
-        result_str = tc.get("tool_result", "").lower()
-        if "fail" in result_str or "失败" in result_str:
+        status = _infer_tool_result_status(tc.get("tool_result", ""))
+        if status == "failed":
             any_failed = True
             all_success = False
-        elif not ("success" in result_str or "成功" in result_str):
+        elif status == "unknown":
             all_success = False
+            any_unknown = True
 
     ai_reply = entry.get("ai_reply", "")
     if any_failed:
         entry["task_status"] = "failed"
+    elif ai_reply and _is_confirmation_request(ai_reply):
+        # 展示结果并请求用户确认：不视为失败/完成，标记为等待确认，
+        # 供 _infer_current_focus / 确认信号注入识别"已请求确认"状态
+        entry["task_status"] = "waiting_confirmation"
     elif tool_calls and (all_success or "final_message" in ai_reply or "任务已完成" in ai_reply):
         entry["task_status"] = "completed"
     elif ai_reply:
         entry["task_status"] = "completed"
+    elif any_unknown and tool_calls:
+        entry["task_status"] = "in_progress"
     else:
         entry["task_status"] = "in_progress"
 
@@ -932,7 +1066,8 @@ def _build_episodic_buffer(messages, rounds=2):
                 })
             # 非工具调用的助手回复（纯文本最终回复）不注入紧凑缓存，
             # 完整回复由 _build_structured_history 的 ai_reply 承担，避免重复注入
-        elif role == "user" and msg_type == "tool_result" and current_round:
+        elif role in ("user", "tool") and msg_type == "tool_result" and current_round:
+            # 兼容两种存储：新代码 role="tool"，旧代码 role="user"
             result_snippet = content[:400] if len(content) > 400 else content
             if current_round["tool_calls"]:
                 current_round["tool_calls"][-1]["result"] = result_snippet
@@ -958,7 +1093,8 @@ def get_layered_memory(session_id: str, user_message: str = "") -> dict:
     """
     logger = logging.getLogger(__name__)
     try:
-        messages = get_full_session_messages(session_id)
+        # 使用富消息（含 created_at 时间戳），供结构化记忆回填 child_turns.elapsed_ms
+        messages = get_full_session_messages_rich(session_id)
     except Exception:
         messages = []
 
@@ -1037,176 +1173,553 @@ def get_layered_memory(session_id: str, user_message: str = "") -> dict:
     }
 
 
-def build_context_suffix(session_id, current_user_input):
-    """收集所有动态上下文信息，拼成后缀字符串。
+def get_long_term_memory(session_id: str) -> str:
+    """获取长期记忆文本（存根封装，若 session_id 无关则返回空）。
 
-    优先级：长期记忆 → 短期记忆摘要 → 子轮次/执行状态。
-    所有动态信息统一拼接到 user message 末尾，保证 system prompt 静态可缓存。
-
-    Args:
-        session_id: 会话 ID
-        current_user_input: 当前用户输入，用于检索长期记忆
-
-    Returns:
-        拼接后的后缀字符串，无动态信息时返回空字符串
+    当前长期记忆通过关键词从 Markdown 文件检索，不关联 session_id。
+    保留 session_id 参数用于未来向量库扩展。
     """
-    suffix_parts = []
-
-    # 1. 长期记忆（根据 current_user_input 检索相关记忆）
     try:
-        long_term_memory = get_relevant_memory(current_user_input)
-        if long_term_memory:
-            suffix_parts.append(f"\n\n### 长期记忆 ###\n{long_term_memory}")
-    except Exception:
-        pass
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
 
-    # 2. 短期记忆摘要（用户轮次 > 3 时启用）
-    #    使用 count_chat_messages 估算轮次数，避免引入额外依赖
     try:
-        total_msgs = count_chat_messages(session_id)
-        # 粗略估算用户轮次：总消息数 / 2（每轮至少包含 user + assistant）
-        estimated_rounds = total_msgs // 2
-        if estimated_rounds > 3:
-            summary = get_latest_summary(session_id)
-            if summary:
-                suffix_parts.append(f"\n\n### 对话摘要 ###\n{summary}")
-    except Exception:
-        pass
+        # 长期记忆通过 get_relevant_memory 按关键词检索，需要用户消息
+        # 此处 session_id 仅作未来扩展用，当前返回空
+        return ""
+    except Exception as e:
+        if ctx_log:
+            ctx_log.error(f"获取长期记忆失败: {e}", exc_info=True)
+        return ""
 
-    # 3. 子轮次/执行状态（当前计划、步骤进度、最近观察）
-    working_mem = _get_working_memory(session_id)
-    plan = working_mem.get("plan", [])
-    current_step = working_mem.get("current_step", 0)
-    last_observation = working_mem.get("last_observation", "")
 
-    if plan or last_observation:
-        state_lines = []
+def get_compressed_summary(session_id: str) -> str:
+    """获取最新压缩摘要。"""
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    try:
+        summary = get_latest_summary(session_id) or ""
+        if ctx_log:
+            ctx_log.info(f"压缩摘要长度: {len(summary)} 字符")
+        return summary
+    except Exception as e:
+        if ctx_log:
+            ctx_log.warning(f"获取压缩摘要失败，降级: {e}")
+        return ""
+
+
+def get_current_plan(session_id: str) -> str:
+    """获取当前任务规划。"""
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    try:
+        wm = _get_working_memory(session_id)
+        plan = wm.get("plan", [])
         if plan:
-            state_lines.append(f"当前计划: {json.dumps(plan, ensure_ascii=False, default=str)}")
-        if current_step > 0:
-            state_lines.append(f"执行步数: {current_step}")
-        if last_observation:
-            state_lines.append(f"最近观察: {str(last_observation)[:300]}")
-        suffix_parts.append(f"\n\n### 执行状态 ###\n" + "\n".join(state_lines))
+            if isinstance(plan, list):
+                plan_text = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(plan))
+            else:
+                plan_text = str(plan)
+            if ctx_log:
+                ctx_log.info(f"任务规划长度: {len(plan_text)} 字符")
+            return plan_text
+        return ""
+    except Exception as e:
+        if ctx_log:
+            ctx_log.warning(f"获取任务规划失败，降级: {e}")
+        return ""
 
-    return "".join(suffix_parts)
+
+def get_recent_thinking_trace(session_id: str, rounds: int = 2) -> str:
+    """提取最近 N 轮 assistant 消息中的 thinking_summary，拼接返回。"""
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    try:
+        records = get_full_session_messages_rich(session_id, limit=100)
+        traces = []
+        for r in records:
+            if r.get("role") == "assistant" and r.get("thinking_summary"):
+                traces.append(r["thinking_summary"])
+        recent = traces[-rounds:] if len(traces) > rounds else traces
+        result = "\n".join(recent)
+        if ctx_log:
+            ctx_log.info(f"思考轨迹: {len(recent)} 条, {len(result)} 字符")
+        return result
+    except Exception as e:
+        if ctx_log:
+            ctx_log.warning(f"获取思考轨迹失败，降级: {e}")
+        return ""
 
 
-def build_context_messages(session_id, limit=150, summary_max_tokens=SUMMARY_TOKEN_BUDGET,
-                           user_message="", is_continuation=False, available_tools=None):
-    """构建 LLM 上下文"""
-    
-    messages = get_full_session_messages(session_id, limit=limit)
-    chat_user_indices = [i for i, m in enumerate(messages) 
-                         if m.get("role") == "user" and m.get("msg_type") == "chat"]
-    total_rounds = len(chat_user_indices)
-    
-    # --- 1. 重复查询处理 ---
-    # 话题切换不由这里判定：react_engine 的 BM25 检测器（context_router）是唯一判定源，
-    # 且切换时引擎会清空缓存的短期记忆（cached_short_term_memory=""），
-    # 因此这里不再跑第二套相似度检测，避免两套算法结论互相矛盾。
-    last_user_msg = user_message
-    if not last_user_msg:
-        for m in reversed(messages):
-            if m.get("role") == "user" and m.get("msg_type") == "chat":
-                last_user_msg = m.get("content", "")
+def load_recent_rounds(session_id: str, rounds: int = 3) -> list:
+    """加载最近 N 轮完整历史（按时间排序的字典列表）。
+
+    每轮包含：一条 user 消息 + 若干 assistant（含 tool_calls）+ 若干 tool 结果。
+    从 chat_history 表中最近 30 条消息中按轮次边界切分。
+    """
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    try:
+        records = get_full_session_messages_rich(session_id, limit=30)
+        if not records:
+            return []
+
+        # 按轮次边界切分：user 消息作为新轮次开始
+        round_groups = []
+        current_round = []
+        for r in records:
+            if r.get("role") == "user" and r.get("msg_type") == "chat":
+                if current_round:
+                    round_groups.append(current_round)
+                current_round = [r]
+            elif current_round:
+                current_round.append(r)
+        if current_round:
+            round_groups.append(current_round)
+
+        recent = round_groups[-rounds:] if len(round_groups) > rounds else round_groups
+        if ctx_log and recent:
+            timestamps = [m.get("created_at", "") for group in recent for m in group if m.get("created_at")]
+            ctx_log.info(
+                f"加载最近 {len(recent)} 轮: {len(sum(recent, []))} 条消息, "
+                f"时间范围 {timestamps[0] if timestamps else 'N/A'} ~ {timestamps[-1] if timestamps else 'N/A'}"
+            )
+        return sum(recent, [])  # 展平
+    except Exception as e:
+        if ctx_log:
+            ctx_log.error(f"加载最近轮次失败: {e}", exc_info=True)
+        return []
+
+
+def _is_tool_error_content(content) -> bool:
+    """判断工具消息内容是否为失败报文（忽略大小写）。
+
+    兼容两种格式：
+    1. JSON 报文：含 "success": false / error / fail / exception 关键词
+    2. 【上一步执行摘要】文本：含失败标记（失败原因 / ❌ 失败）
+    """
+    if not content:
+        return False
+    lower = content.lower()
+    if '"success": false' in lower or '"success":false' in lower:
+        return True
+    for kw in ("error", "fail", "exception"):
+        if kw in lower:
+            return True
+    # 摘要文本中文失败标记（build_step_summary 失败输出）
+    if "失败原因" in content:
+        return True
+    if "❌" in content and "失败" in content:
+        return True
+    return False
+
+
+def _extract_traceback_head(traceback_raw, max_lines: int = 3) -> str:
+    """提取 traceback 前 max_lines 行。"""
+    if not traceback_raw:
+        return ""
+    lines = str(traceback_raw).splitlines()
+    return "\n".join(lines[:max_lines])
+
+
+def _parse_tool_error_content(content, ctx_log=None):
+    """解析工具失败报文，返回 (tool_name, error_msg, suggestion)。
+
+    兼容两种格式：
+    1. JSON：提取 error / message / traceback（traceback 只取前 3 行）
+    2. 【上一步执行摘要】文本：提取工具 / 失败原因 / 重要提示首条
+    """
+    content = (content or "").strip()
+    if not content:
+        return ("", "", "")
+
+    stripped = content.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, dict):
+                tool_name = str(data.get("tool_name") or data.get("tool") or data.get("name") or "").strip()
+                error = data.get("error") or ""
+                if isinstance(error, dict):
+                    error = error.get("message") or str(error)
+                message = data.get("message") or ""
+                traceback = _extract_traceback_head(data.get("traceback") or data.get("stack_trace") or "")
+                error_msg = str(error or message or traceback).strip()
+                suggestion = str(data.get("suggestion") or data.get("advice") or data.get("建议") or "").strip()
+                return (tool_name, error_msg, suggestion)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            if ctx_log:
+                ctx_log.warning("get_last_tool_error JSON 解析失败，回退原始文本: %s", content[:200])
+
+    # 【上一步执行摘要】文本 / 原文
+    tool_name = ""
+    m = re.search(r"工具\s*[:：]\s*([^\n]+)", content)
+    if m:
+        tool_name = m.group(1).strip()
+    m = re.search(r"失败原因\s*[:：]\s*([^\n]+)", content)
+    if m:
+        error_msg = m.group(1).strip()
+    else:
+        error_msg = content
+    suggestion = ""
+    m = re.search(r"重要提示[:：]?\s*\n?\s*-?\s*([^\n]+)", content)
+    if m:
+        suggestion = m.group(1).strip()
+    return (tool_name, error_msg, suggestion)
+
+
+def _format_tool_error(tool_name, error_msg, suggestion, max_len) -> str:
+    """组装精简报错文本，总长度强制截断至 max_len 字符。"""
+    lines = ["【上一轮工具报错】"]
+    if tool_name:
+        lines.append(f"· 工具: {tool_name}")
+    lines.append(f"· 错误: {error_msg}")
+    if suggestion:
+        lines.append(f"· 建议: {suggestion}")
+    text = "\n".join(lines)
+    if len(text) > max_len:
+        suffix = "...（已截断）"
+        text = text[:max_len - len(suffix)] + suffix
+    return text
+
+
+def get_last_tool_error(session_id: str, max_len: int = 500) -> str:
+    """获取最近一轮工具执行报错（精简版），用于拼入 user 消息。
+
+    轮次边界：role=='user' 且 msg_type=='chat' 作为一轮开始；
+    仅取最近一轮内的 tool 消息，按时间倒序取最近一条失败消息。
+    无匹配返回空字符串；数据库异常降级返回空字符串。
+    """
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    if not session_id:
+        return ""
+
+    try:
+        import sqlite3 as _sqlite3
+        from memory.config import get_session_messages_db
+        db_path = get_session_messages_db(session_id)
+        if not os.path.exists(db_path):
+            if ctx_log:
+                ctx_log.info("get_last_tool_error: 会话无消息库，未检测到报错")
+            return ""
+
+        conn = _sqlite3.connect(db_path, timeout=10)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            # 1. 定位最近一轮边界：最后一条 user chat 消息
+            row = conn.execute(
+                "SELECT id FROM chat_history "
+                "WHERE session_id = ? AND role = 'user' AND msg_type = 'chat' AND is_temporary = 0 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                if ctx_log:
+                    ctx_log.info("get_last_tool_error: 无用户轮次，未检测到报错")
+                return ""
+            boundary_id = row[0]
+
+            # 2. 取该轮内 tool 消息，按时间倒序（created_at 精度不足时以 id 兜底）
+            rows = conn.execute(
+                "SELECT content, created_at FROM chat_history "
+                "WHERE session_id = ? AND role = 'tool' AND id > ? AND is_temporary = 0 "
+                "ORDER BY created_at DESC, id DESC",
+                (session_id, boundary_id),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        # 3. 找最近一条失败消息
+        failed_content = ""
+        for content, _created_at in rows:
+            if _is_tool_error_content(content):
+                failed_content = content
                 break
+        if not failed_content:
+            if ctx_log:
+                ctx_log.info("get_last_tool_error: 最近一轮未检测到工具失败消息")
+            return ""
 
-    repeat_query_note = ""
-    if last_user_msg and is_continuation:
-        exclude_indices = _detect_repeated_query(messages, last_user_msg)
-        if exclude_indices:
-            # 删除前先校验索引是否在当前 messages 范围内（防止切片后旧索引越界）
-            valid_exclude = [idx for idx in exclude_indices if idx < len(messages)]
-            for idx in sorted(valid_exclude, reverse=True):
-                del messages[idx]
-            repeat_query_note = "【重复查询】检测到重复提问，已保留历史工具结果，仅需重试失败步骤。"
+        if ctx_log:
+            ctx_log.debug("get_last_tool_error 原始报文: %s", failed_content[:200])
+
+        # 4. 解析并组装精简输出
+        tool_name, error_msg, suggestion = _parse_tool_error_content(failed_content, ctx_log)
+        if not error_msg:
+            return ""
+        text = _format_tool_error(tool_name, error_msg, suggestion, max_len)
+        if ctx_log:
+            ctx_log.info("get_last_tool_error 提取到报错: tool=%s len=%d", tool_name or "未知", len(text))
+        return text
+    except Exception as e:
+        if ctx_log:
+            ctx_log.error("get_last_tool_error 数据库查询异常，返回空串: %s", e, exc_info=True)
+        return ""
+
+
+def build_dynamic_system_prompt(session_id: str = "", persona_mode: str = None) -> str:
+    """构建系统提示词：静态部分 + 动态上下文。
+
+    静态部分：core.md / output.md / safety.md
+    动态部分：长期记忆 / 压缩摘要 / 任务规划 / 思考轨迹
+
+    返回格式：
+        {静态内容}
+
+        ==== 动态上下文（本轮生效） ====
+
+        {动态内容}
+    """
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    # 1. 加载静态提示词
+    static_parts = []
+    prompt_files = {
+        "core": "prompts/core.md",
+        "output": "prompts/output.md",
+        "safety": "prompts/safety.md",
+    }
+
+    for label, rel_path in prompt_files.items():
+        try:
+            file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), rel_path)
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                static_parts.append(content)
+            else:
+                if ctx_log:
+                    ctx_log.warning(f"提示词文件缺失: {rel_path}，使用默认内容")
+                # 硬编码默认文本
+                defaults = {
+                    "core": "你是功能强大的 AI 桌面助手。请用中文回复，简洁高效。",
+                    "output": "输出使用 Markdown 格式化，禁止使用表情符号。",
+                    "safety": "安全规则：禁止执行危险操作，数据保护优先。",
+                }
+                static_parts.append(defaults.get(label, ""))
+        except Exception as e:
+            if ctx_log:
+                ctx_log.error(f"读取提示词文件失败: {rel_path}: {e}", exc_info=True)
+            static_parts.append("")
+
+    static_content = "\n\n".join(p for p in static_parts if p)
+
+    # 2. 构建动态内容
+    dynamic_blocks = []
+
+    if session_id:
+        try:
+            long_term = get_long_term_memory(session_id)
+            if long_term:
+                dynamic_blocks.append(f"【长期记忆】\n{long_term}")
+                if ctx_log:
+                    ctx_log.info(f"长期记忆: {len(long_term)} 字符")
+            else:
+                if ctx_log:
+                    ctx_log.warning("长期记忆为空")
+        except Exception as e:
+            if ctx_log:
+                ctx_log.warning(f"长期记忆获取失败: {e}")
+
+        try:
+            summary = get_compressed_summary(session_id)
+            if summary:
+                dynamic_blocks.append(f"【历史摘要】\n{summary}")
+        except Exception as e:
+            if ctx_log:
+                ctx_log.warning(f"历史摘要获取失败: {e}")
+
+        try:
+            plan = get_current_plan(session_id)
+            if plan:
+                dynamic_blocks.append(f"【当前任务规划】\n{plan}")
+        except Exception as e:
+            if ctx_log:
+                ctx_log.warning(f"任务规划获取失败: {e}")
+
+        try:
+            thinking = get_recent_thinking_trace(session_id, rounds=2)
+            if thinking:
+                dynamic_blocks.append(f"【上一轮思考摘要】\n{thinking}")
+        except Exception as e:
+            if ctx_log:
+                ctx_log.warning(f"思考轨迹获取失败: {e}")
+
+    dynamic_content = "\n\n".join(dynamic_blocks)
+
+    # 3. 拼接：有 session_id 时始终输出分隔符（即使动态内容为空），保证前缀一致、缓存可复用
+    if session_id:
+        return f"{static_content}\n\n==== 动态上下文（本轮生效） ====\n\n{dynamic_content}"
+    return static_content
+
+
+def build_context_suffix(session_id, current_user_input):
+    """向后兼容存根。
+
+    旧代码将动态上下文拼入 user 消息末尾，重构后改为方案 B
+    （System Prompt 动态段），动态内容不再注入 user 消息。
+    保留函数签名不变，返回空字符串。
+    """
+    return ""
+
+
+def build_context_messages(session_id, user_query="", persona_mode=None,
+                           limit=150, summary_max_tokens=SUMMARY_TOKEN_BUDGET,
+                           is_continuation=False, available_tools=None):
+    """构建发送给 LLM 的完整 messages 数组（方案 B：API 规范）。
+
+    双模式：
+    1. user_query 为空 → 仅触发压缩副作用（react_engine 遗留兼容），返回空列表
+    2. user_query 非空 → 构建标准 API 格式 messages 数组
+
+    API 模式返回格式：
+    [
+      {"role": "system", "content": "<静态 + 动态 System Prompt>"},
+      {"role": "user", "content": "..."},        # 历史 user
+      {"role": "assistant", "content": ..., "tool_calls": [...]},  # 历史 assistant
+      {"role": "tool", "tool_call_id": "...", "content": "..."},   # 工具结果
+      ...
+      {"role": "user", "content": "<user_query>"},  # 当前用户消息
+    ]
+    """
+    try:
+        from core.logger import get_context_logger
+        ctx_log = get_context_logger()
+    except ImportError:
+        ctx_log = None
+
+    # ── 模式 1：无用户查询，仅触发压缩副作用 ──
+    if not user_query:
+        try:
+            messages = get_full_session_messages(session_id, limit=limit)
             chat_user_indices = [i for i, m in enumerate(messages)
                                  if m.get("role") == "user" and m.get("msg_type") == "chat"]
             total_rounds = len(chat_user_indices)
-    
-    # --- 2. 切割分层：历史摘要(早期) vs 情节缓存(最近N轮) ---
-    if total_rounds > WORKING_ROUNDS:
-        # 最近3轮 → 情节缓存
-        cutoff_idx = chat_user_indices[-WORKING_ROUNDS]
-        historical_messages = messages[:cutoff_idx]   # 第1~N-3轮
-        episodic_messages = messages[cutoff_idx:]      # 最近3轮
-    else:
-        historical_messages = []
-        episodic_messages = messages
-    
-    result_messages = []
-    
-    # --- 3. 构建动态上下文后缀 ---
-    # 所有动态信息（长期记忆 / 摘要 / 执行状态）通过后缀注入到 user message 末尾，
-    # system prompt 保持静态以最大化 LLM 服务端缓存命中率。
-    context_suffix = build_context_suffix(
-        session_id, last_user_msg or user_message
-    )
-    
-    # 将重复查询提示放入结果（话题切换由 react_engine BM25 检测器统一判定）
-    if repeat_query_note:
-        result_messages.append({
-            "role": "system",
-            "content": repeat_query_note
-        })
-    
-    # --- 4. 动态上下文后缀（拼入 user message，此处作为独立消息返回供调用方拼接） ---
-    if context_suffix:
-        result_messages.append({
-            "role": "context_suffix",
-            "content": context_suffix
-        })
-    
-    # 3.5 【历史摘要】（早期轮次的压缩）
-    historical_summary = get_latest_summary(session_id)
-    if historical_messages:
-        historical_summary = get_latest_summary(session_id)
-        if historical_summary:
-            result_messages.append({
-                "role": "system",
-                "content": f"【历史摘要】(第1~{total_rounds - WORKING_ROUNDS}轮压缩)\n{historical_summary}"
+
+            if total_rounds > WORKING_ROUNDS:
+                cutoff_idx = chat_user_indices[-WORKING_ROUNDS]
+                historical_messages = messages[:cutoff_idx]
+
+                if total_rounds > COMPRESS_THRESHOLD + WORKING_ROUNDS:
+                    history_entries = _build_structured_history(
+                        historical_messages, session_id,
+                        preserve_thinking_rounds=0,
+                        is_current_turn=False
+                    )
+                    _trigger_increment_compression(session_id, history_entries)
+        except Exception as e:
+            if ctx_log:
+                ctx_log.error(f"压缩副作用触发失败: {e}", exc_info=True)
+        return []
+
+    # ── 模式 2：构建 API 兼容 messages 数组 ──
+    result = []
+
+    # 1. System Prompt（静态 + 动态）
+    try:
+        system_content = build_dynamic_system_prompt(session_id, persona_mode)
+        if ctx_log:
+            ctx_log.info(f"System Prompt 长度: {len(system_content)} 字符")
+    except Exception as e:
+        if ctx_log:
+            ctx_log.error(f"构建 System Prompt 失败: {e}", exc_info=True)
+        # 降级：仅静态内容
+        system_content = build_dynamic_system_prompt("", None)
+    result.append({"role": "system", "content": system_content})
+
+    # 2. 历史消息（最近 3 轮完整历史）
+    try:
+        recent_records = load_recent_rounds(session_id, rounds=3)
+        if ctx_log:
+            ctx_log.debug(f"历史消息: {len(recent_records)} 条")
+    except Exception as e:
+        if ctx_log:
+            ctx_log.error(f"加载历史消息失败: {e}", exc_info=True)
+        recent_records = []
+
+    for record in recent_records:
+        role = record.get("role", "")
+        content = record.get("content", "")
+
+        if role == "user":
+            result.append({"role": "user", "content": content})
+
+        elif role == "assistant":
+            tool_calls_raw = record.get("tool_calls", "")
+            thinking_summary = record.get("thinking_summary", "") or None
+
+            if tool_calls_raw:
+                # 解析 tool_calls JSON
+                try:
+                    tool_calls = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
+                except (json.JSONDecodeError, TypeError):
+                    if ctx_log:
+                        ctx_log.warning(f"tool_calls JSON 解析失败，跳过: {tool_calls_raw[:100]}")
+                    tool_calls = None
+
+                if tool_calls:
+                    result.append({
+                        "role": "assistant",
+                        "content": thinking_summary,  # can be None per API spec
+                        "tool_calls": tool_calls,
+                    })
+                else:
+                    result.append({"role": "assistant", "content": content})
+            else:
+                result.append({"role": "assistant", "content": content})
+
+        elif role == "tool":
+            tool_call_id = record.get("tool_call_id", "")
+            result.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
             })
-        
-        # 触发增量压缩：超过阈值时，把最老的1轮合并进摘要
-        if total_rounds > COMPRESS_THRESHOLD + WORKING_ROUNDS:
-            history_entries = _build_structured_history(
-                historical_messages, session_id, 
-                preserve_thinking_rounds=0,  # 归档态：完全剥离思考轨迹
-                is_current_turn=False
-            )
-            _trigger_increment_compression(session_id, history_entries)
-    
-    # 4. 情节缓存 (最近3轮，子轮次完整保留，思考轨迹按规则裁剪)
-    episodic_history = _build_structured_history(
-        episodic_messages, session_id,
-        preserve_thinking_rounds=WORKING_ROUNDS,
-        is_current_turn=True
-    )
-    
-    # 对每个用户轮次内部的子轮次做思考轨迹裁剪
-    for entry in episodic_history:
-        child_turns = entry.get("child_turns", [])
-        total_subturns = len(child_turns)
-        for j, ct in enumerate(child_turns):
-            turns_from_end = total_subturns - 1 - j
-            if turns_from_end >= KEEP_REASONING_SUBTURNS:
-                # 超过2个子轮次的，剥离思考轨迹，仅保留工具名+参数+结果
-                ct["reasoning_trace"] = {}
-                ct["ai_thinking"] = ""
-                ct["ai_output"] = _trim_tool_result(
-                    ct.get("ai_output", ""), max_len=200
-                )
-    
-    result_messages.append({
-        "role": "system",
-        "content": f"【情节缓存 - 最近{WORKING_ROUNDS}轮完整交互】\n"
-                   f"说明: 每轮内保留最近{KEEP_REASONING_SUBTURNS}个子轮次的思考轨迹，"
-                   f"更早子轮次仅保留工具调用与结果。\n\n"
-                   f"{json.dumps(episodic_history, ensure_ascii=False, indent=2)}"
-    })
-    
-    return result_messages
+
+        # system / context_suffix / think_step 等角色跳过（不进入 API messages）
+
+    # 3. 当前用户消息（模式2：拼入上一轮工具报错精简上下文，位于用户问题之前以 --- 分隔）
+    error_context = get_last_tool_error(session_id)
+    if error_context:
+        user_content = f"{error_context}\n\n---\n\n{user_query}"
+    else:
+        user_content = user_query
+    result.append({"role": "user", "content": user_content})
+
+    if ctx_log:
+        ctx_log.info(
+            f"build_context_messages 完成: "
+            f"历史 {len(recent_records)} 条 → {len(result)} 条 API 消息"
+        )
+
+    return result
 
 
 def append_session_message(session_id, role, content,
@@ -1214,7 +1727,10 @@ def append_session_message(session_id, role, content,
                            skip_compress=False,
                            is_temporary=False,
                            msg_type="chat",
-                           msg_id=""):
+                           msg_id="",
+                           tool_call_id="",
+                           tool_calls="",
+                           thinking_summary=""):
     content = content.strip()
     if not content:
         return session_id
@@ -1235,7 +1751,10 @@ def append_session_message(session_id, role, content,
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     add_chat_message(session_id, role, content, msg_type=msg_type,
                      trace_id=trace_id, user_id=user_id, timestamp=now_ts,
-                     is_temporary=is_temporary, msg_id=msg_id)
+                     is_temporary=is_temporary, msg_id=msg_id,
+                     tool_call_id=tool_call_id,
+                     tool_calls=tool_calls,
+                     thinking_summary=thinking_summary)
 
     if role == "user":
         stripped = content.strip()

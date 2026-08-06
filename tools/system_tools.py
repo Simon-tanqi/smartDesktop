@@ -1242,21 +1242,39 @@ def system_audio(operation: str, value: int = None, device: str = None) -> str:
         entry = _com_ref_count[tid]
 
     if entry["value"] == 0:
+        # comtypes 1.4.16：CoInitializeEx(flags) 仅接受一个可选位置参数且无返回值，
+        # 初始化失败时抛 COMError；CoInitialize() 等价于 CoInitializeEx(COINIT_APARTMENTTHREADED)。
+        # 旧版 comtypes(<1.4) 签名为 CoInitializeEx(None, flags)，需做兼容。
+        # RPC_E_CHANGED_MODE(0x80010106) 表示当前线程 COM 已以其他模式初始化，可安全复用。
+        from comtypes import CoInitializeEx, COINIT_APARTMENTTHREADED, COMError
+        init_ok = False
+        init_error = None
         try:
-            from comtypes import CoInitializeEx, COINIT_APARTMENTTHREADED
-            hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-            if hr == 0:
-                with _com_ref_lock:
-                    _com_ref_count[tid]["value"] = 1
-                    _com_ref_count[tid]["initialized"] = True
-        except Exception:
+            CoInitializeEx(COINIT_APARTMENTTHREADED)  # comtypes >= 1.4 新签名
+            init_ok = True
+        except TypeError:
             try:
-                CoInitialize(None)
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED)  # comtypes < 1.4 旧签名
+                init_ok = True
+            except Exception as e:
+                init_error = e
+        except Exception as e:
+            init_error = e
+        if init_ok:
+            with _com_ref_lock:
+                _com_ref_count[tid]["value"] = 1
+                _com_ref_count[tid]["initialized"] = True
+        else:
+            # 线程 COM 已以其他模式初始化（RPC_E_CHANGED_MODE）时视为可用，不重复卸载
+            if isinstance(init_error, COMError) and getattr(init_error, "hresult", None) == -2147417850:
                 with _com_ref_lock:
                     _com_ref_count[tid]["value"] = 1
-                    _com_ref_count[tid]["initialized"] = True
-            except Exception:
-                pass
+                    _com_ref_count[tid]["initialized"] = False
+            else:
+                return json.dumps({
+                    "success": False,
+                    "message": f"COM 初始化失败: {type(init_error).__name__}: {init_error}"
+                }, ensure_ascii=False)
     else:
         with _com_ref_lock:
             _com_ref_count[tid]["value"] += 1

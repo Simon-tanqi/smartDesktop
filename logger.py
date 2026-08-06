@@ -1916,3 +1916,68 @@ def get_global_logger() -> _logging.Logger:
     logger.setLevel(_logging.DEBUG)
     logger.propagate = False
     return logger
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🆕 项目级日志 —— 写入项目 logs/ 目录，RotatingFileHandler
+# ═══════════════════════════════════════════════════════════════
+
+import logging.handlers as _handlers
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_LOG_DIR = _PROJECT_ROOT / "logs"
+_PROJECT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_project_loggers: dict[str, _logging.Logger] = {}
+_project_loggers_lock = threading.Lock()
+
+
+def _get_project_logger(name: str, filename: str,
+                        max_bytes: int = 10 * 1024 * 1024,
+                        backup_count: int = 5) -> _logging.Logger:
+    """项目级 RotatingFileHandler 日志工厂。
+
+    日志文件写入项目根目录下的 logs/ 目录，与其他已有 logger 完全独立。
+    """
+    with _project_loggers_lock:
+        if name in _project_loggers:
+            return _project_loggers[name]
+
+    logger = _logging.getLogger(f"MyAgent.project.{name}")
+    if logger.handlers:
+        with _project_loggers_lock:
+            _project_loggers[name] = logger
+        return logger
+
+    handler = _handlers.RotatingFileHandler(
+        str(_PROJECT_LOG_DIR / filename),
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8"
+    )
+    handler.setFormatter(_logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(module)s:%(lineno)d %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(handler)
+    logger.setLevel(_logging.DEBUG)
+    logger.propagate = False
+
+    with _project_loggers_lock:
+        _project_loggers[name] = logger
+    return logger
+
+
+def get_llm_request_logger() -> _logging.Logger:
+    """LLM 请求日志：写入 logs/llm_requests.log，10MB/5 备份。"""
+    return _get_project_logger("llm_request", "llm_requests.log")
+
+
+def get_validation_logger() -> _logging.Logger:
+    """四项任务验证日志：写入 logs/four_tasks_validation.log，10MB/5 备份。"""
+    return _get_project_logger("validation", "four_tasks_validation.log")
+
+
+def get_tool_execution_logger() -> _logging.Logger:
+    """工具执行日志：写入 logs/tool_execution.log，10MB/5 备份。"""
+    return _get_project_logger("tool_execution", "tool_execution.log")

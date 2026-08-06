@@ -57,14 +57,17 @@ def translate_error(exception_str: str) -> str:
     Returns:
         用户友好的错误提示文本
     """
-    s = str(exception_str) if exception_str else "未知错误"
+    try:
+        s = str(exception_str) if exception_str else "未知错误"
 
-    for keyword, user_msg in _ERROR_USER_MAP:
-        if keyword in s:
-            # 附加简短技术上下文（截断至 60 字符，方便排查但不吓人）
-            short_tech = s[:60].replace("\n", " ")
-            return f"{user_msg}。（技术详情：{short_tech}）"
+        for keyword, user_msg in _ERROR_USER_MAP:
+            if keyword in s:
+                # 附加简短技术上下文（截断至 60 字符，方便排查但不吓人）
+                short_tech = s[:60].replace("\n", " ").replace("`", "")
+                return f"{user_msg}。（技术详情：{short_tech}）"
 
-    # 未命中映射，返回通用提示 + 截断技术信息
-    short_tech = s[:80].replace("\n", " ")
-    return f"操作失败，请稍后重试。（技术详情：{short_tech}）"
+        # 未命中映射，返回通用提示 + 截断技术信息
+        short_tech = s[:80].replace("\n", " ").replace("`", "")
+        return f"操作失败，请稍后重试。（技术详情：{short_tech}）"
+    except Exception:
+        return f"操作失败，请稍后重试。（技术详情：{exception_str[:80] if exception_str else '未知错误'}）"

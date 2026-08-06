@@ -11,6 +11,7 @@ v4：
 import json
 import re
 import threading
+from typing import List, Dict, Any
 from memory.config import (
     COMPRESS_MODEL_CONFIG, TOKEN_SOFT_THRESHOLD, TOKEN_HARD_THRESHOLD,
     TOKEN_TARGET, RECENT_TURNS_KEEP, MAX_SUMMARY_CHARS, SUMMARY_MODEL,
@@ -24,6 +25,7 @@ from memory.stores.sqlite_store import (
     get_latest_summary,
     log_operation,
 )
+from logger import get_logger
 
 
 # ── Token 估算 ──
@@ -465,3 +467,141 @@ def get_recent_compressed(days=7):
 def get_latest_summary_for_session(session_id):
     """获取指定会话的最新摘要。"""
     return get_latest_summary(session_id)
+
+
+# ── 消息压缩（从 react_engine.py 迁入） ──
+
+
+def check_and_compress_messages(messages: List[Dict[str, Any]], *,
+                            max_context_tokens: int, safety_margin: int,
+                            trace_id: str = "", session_id: str = "",
+                            max_result_chars: int = 8000) -> List[Dict[str, Any]]:
+    """检查消息列表的 token 总量，接近上限时自动压缩。
+
+    使用 estimate_messages_tokens 估算 token 数，
+    当超过 MAX_CONTEXT_TOKENS - SAFETY_MARGIN 时触发压缩。
+    """
+    total_tokens = estimate_messages_tokens(messages)
+    threshold = max_context_tokens - safety_margin
+
+    if total_tokens > threshold:
+        get_logger().info(
+            f"上下文 token 数 {total_tokens} 超过阈值 {threshold}，"
+            f"触发压缩（目标：{max_context_tokens}）",
+            trace_id=trace_id, session_id=session_id
+        )
+        return compress_messages(messages, target_tokens=threshold,
+                                 session_id=session_id, trace_id=trace_id,
+                                 max_result_chars=max_result_chars)
+    return messages
+
+
+def compress_messages(messages: List[Dict[str, Any]], target_tokens: int, *,
+                  session_id: str = "", trace_id: str = "",
+                  max_result_chars: int = 8000) -> List[Dict[str, Any]]:
+    """压缩消息列表至目标 token 数以内。
+
+    策略：保留 system 消息 + 最近若干轮对话，中间历史合并为摘要。
+    """
+    from memory.session import compress_conversation_async
+
+    # 分离 system 消息
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+
+    if not non_system:
+        return messages
+
+    # 估算每轮 token 并保留末尾未压缩的轮次
+    accumulated = 0
+    keep_count = 0
+    for m in reversed(non_system):
+        mt = estimate_tokens(m.get("content", ""))
+        accumulated += mt
+        keep_count += 1
+        if accumulated > target_tokens // 2:
+            break
+
+    if keep_count < len(non_system):
+        # 调整切割边界：确保 assistant(tool_calls) + tool 配对不被切断
+        # 避免 API 400（OpenAI/DeepSeek 要求 tool 消息必须紧跟含对应 tool_call_id 的 assistant）
+        cut_idx = len(non_system) - keep_count
+
+        # 1) 如果 to_keep 第一条是 tool，向上回溯包含其 assistant
+        while cut_idx < len(non_system) and non_system[cut_idx].get("role") == "tool":
+            cut_idx -= 1
+            keep_count = len(non_system) - cut_idx
+
+        # 2) 如果 to_compress 最后一条是 assistant(tool_calls)，把配对的 tool 也归入 to_keep
+        while cut_idx > 0 and cut_idx < len(non_system) \
+                and non_system[cut_idx - 1].get("role") == "assistant" \
+                and non_system[cut_idx - 1].get("tool_calls"):
+            assistant_tool_ids = set()
+            for tc in non_system[cut_idx - 1].get("tool_calls", []):
+                tid = tc.get("id") or ""
+                if tid:
+                    assistant_tool_ids.add(tid)
+            if not assistant_tool_ids:
+                break
+            # 扫描后续 tool 消息，将匹配的移入 to_keep
+            moved = False
+            while cut_idx < len(non_system) \
+                    and non_system[cut_idx].get("role") == "tool" \
+                    and non_system[cut_idx].get("tool_call_id") in assistant_tool_ids:
+                cut_idx += 1
+                keep_count = len(non_system) - cut_idx
+                moved = True
+            if not moved:
+                break
+
+        # 用调整后的 cut_idx 重新划分
+        to_compress = non_system[:cut_idx] if cut_idx > 0 else []
+        to_keep = non_system[cut_idx:] if cut_idx < len(non_system) else []
+
+        # 尝试压缩中间部分为摘要
+        compressed = system_msgs + [
+            {"role": "system", "content": "[上下文压缩] 以下为历史对话的压缩摘要，已省略详细轮次以节省上下文空间。"}
+        ]
+
+        try:
+            if session_id and to_compress:
+                loop = None
+                try:
+                    loop = __import__('asyncio').get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop and loop.is_running():
+                    import asyncio
+                    task = asyncio.run_coroutine_threadsafe(
+                        compress_conversation_async(session_id, to_compress),
+                        loop
+                    )
+                    try:
+                        summary = task.result(timeout=10)
+                        if summary:
+                            compressed.append({
+                                "role": "system",
+                                "content": f"[历史摘要] {summary[:MAX_SUMMARY_CHARS]}"
+                            })
+                    except Exception:
+                        pass
+                else:
+                    # 同步 fallback：用 estimate_tokens 做简单截断
+                    total_chars = sum(len(m.get("content", "")) for m in to_compress)
+                    if total_chars > max_result_chars:
+                        compressed.append({
+                            "role": "system",
+                            "content": f"[历史压缩] 已省略 {len(to_compress)} 轮历史对话（约 {total_chars} 字符）。"
+                        })
+                    else:
+                        compressed.extend(to_compress)
+
+            compressed.extend(to_keep)
+        except Exception as e:
+            get_logger().warning(f"上下文压缩失败，使用原始消息: {e}",
+                                trace_id=trace_id, session_id=session_id)
+            return messages
+
+        return compressed
+
+    return messages

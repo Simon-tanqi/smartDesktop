@@ -15,99 +15,78 @@ try:
     PPT_AVAILABLE = True
 except ImportError:
     PPT_AVAILABLE = False
-    
-    
-# 在 generate_ppt 的 tool schema 中，强制要求每个 slide 携带 source 字段
 
-PPT_SLIDE_SCHEMA = {
-    "type": "object",
-    "required": ["slide_type", "title", "content", "data_source"],
-    "properties": {
-        "slide_type": {"type": "string", "enum": ["cover", "content", "section", "chart", "table", "comparison"]},
-        "title": {"type": "string"},
-        "content": {"type": "string"},
-        "data_source": {
+
+# ── Schema Override 装饰器（为 LLM 提供完整参数类型信息）────────────
+from typing import Callable, Dict, Any, TypedDict, List, Optional
+
+_SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {}
+
+    
+    
+def schema_override(name: str):
+    """将完整 JSON Schema 关联到指定工具，优先于自动推断的 schema"""
+    def decorator(fn: Callable) -> Callable:
+        _SCHEMA_OVERRIDES[name] = {
             "type": "object",
-            "required": ["type"],
             "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["search_verified", "model_knowledge", "user_provided", "estimated"]
-                },
-                "urls": {
+                "slides": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "数据来源URL（type=search_verified时必填）"
+                    "description": "幻灯片列表，支持多模板混排",
+                    "items": {
+                        "type": "object",
+                        "required": ["template", "data"],
+                        "properties": {
+                            "template": {
+                                "type": "string",
+                                "enum": ["cover", "section", "content", "icon_grid",
+                                         "chart", "table", "image_text", "comparison"],
+                                "description": "模板类型"
+                            },
+                            "data": {
+                                "type": "object",
+                                "description": "模板数据，结构因 template 而异"
+                            }
+                        }
+                    }
                 },
-                "confidence": {
+                "theme": {
                     "type": "string",
-                    "enum": ["high", "medium", "low"],
-                    "description": "数据可信度"
+                    "enum": ["tech_blue", "business_gray", "gradient_purple",
+                             "education_orange", "minimal_dark"],
+                    "default": "tech_blue"
                 },
-                "note": {
-                    "type": "string",
-                    "description": "如 type=estimated，说明估算依据"
-                }
-            }
+                "output_path": {"type": "string"},
+                "img_timeout": {"type": "integer", "default": 30},
+                "download_timeout": {"type": "integer", "default": 60},
+            },
+            "required": ["slides"]
         }
-    }
-}
+        return fn
+    return decorator
 
+def get_schema_override(name: str) -> Dict[str, Any] | None:
+    return _SCHEMA_OVERRIDES.get(name)
+
+
+
+@schema_override("generate_ppt")
 @register_tool(timeout=120)
-def generate_ppt(slides: list = None, theme: str = 'tech_blue', output_path: str = None, 
-                 img_timeout: int = 30, download_timeout: int = 60, **kwargs):
-    """
-    一站式生成视觉精美的PowerPoint演示文稿（HTML截图背景 + 可编辑文字层）。
-    内部流程：HTML+CSS模板渲染 → Playwright 截图做背景 → python-pptx 覆盖透明文本层。
-    效果：打开PPT看到精美设计，点击文字可直接编辑。
-    
-    返回：{success, message, file_path, file_size, slide_count}
-    
-    Args:
-        slides: 幻灯片列表，支持多模板混排，每页格式：
-            {  "template": "模板名", "data": { 模板数据 }  }
+def generate_ppt(slides: list = None, theme: str = 'tech_blue', output_path: str = None,
+                 img_timeout: int = 30, download_timeout: int = 60):
+    """一站式生成精美PowerPoint（HTML截图背景 + python-pptx透明文字层）。
 
-            可用模板：
+返回：{success, message, file_path, file_size, slide_count}
 
-            cover — 封面页
-              title: 标题, subtitle: 副标题, meta: 底部信息
-
-            section — 章节分隔页（深色背景）
-              title: 章节标题, subtitle: 副标题, number: 编号
-
-            content — 内容页（列表项+可选侧边栏）
-              title: 标题, items: [{"title":"标题","desc":"描述","icon":"emoji"}],
-              side: {"title":"侧边栏标题","list":["A","B"],"stat":"数值","stat_label":"说明"},
-              footer: 页脚
-
-            icon_grid — 图标网格页（展示特点/功能/数据指标）
-              title: 标题, desc: 描述, cols: 列数(默认4),
-              items: [{"icon":"📊","title":"名称","desc":"说明","stat":"数值"}]
-
-            chart — 数据图表页（柱状图+饼图）
-              title: 标题,
-              bars: [{"label":"X轴","value":数值,"pct":百分比高度}],
-              pie: {"total":"总计","segments":["色值1 百分比","色值2 百分比"],"legend":[{"color":"#色值","label":"名称","value":"数值"}]}
-
-            table — 数据表格页
-              title: 标题, desc: 说明,
-              columns: ["列名1","列名2",...],
-              rows: [["单元格1","单元格2"],...]
-
-            image_text — 图文混排页（左图右文）
-              title: 标题, paragraphs: ["段落1","段落2"], icon: "🖼️",
-              tagline: 标签行, img_url: 可选图片URL
-
-            comparison — 对比页（双栏对比）
-              title: 标题, desc: 说明,
-              col_a: {"badge":"标签","title":"标题","items":["特点1","特点2"],"price":"￥价格","price_sub":"说明"},
-              col_b: {"badge":"标签","title":"标题","items":["特点1","特点2"],"price":"￥价格","price_sub":"说明"}
-
-        theme: 主题配色，可选: tech_blue(科技蓝), business_gray(商务灰),
-               gradient_purple(渐变紫), education_orange(教育橙), minimal_dark(极简黑)
-        output_path: 可选输出路径，默认自动生成到workspace目录
-        img_timeout: 外部图片加载超时时间（秒），默认30秒
-        download_timeout: 图片下载超时时间（秒），默认60秒
+Args:
+    slides: 幻灯片列表，每项格式 {"template":"模板名","data":{...}}。
+        可用模板（详见系统提示词中的 _PPT_TEMPLATE_SCHEMA）：
+        cover / section / content / icon_grid / chart / table / image_text / comparison
+    theme: 配色方案，可选: tech_blue | business_gray | gradient_purple |
+           education_orange | minimal_dark（默认 tech_blue）
+    output_path: 可选输出路径，默认自动生成到 workspace 目录
+    img_timeout: 外部图片加载超时（秒），默认30
+    download_timeout: 图片下载超时（秒），默认60
     """
     try:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -117,22 +96,6 @@ def generate_ppt(slides: list = None, theme: str = 'tech_blue', output_path: str
         
         if theme not in THEMES:
             theme = 'tech_blue'
-        
-        if 'raw' in kwargs and slides is None:
-            raw_args = kwargs.get('raw')
-            try:
-                if isinstance(raw_args, str):
-                    raw_data = json.loads(raw_args)
-                else:
-                    raw_data = raw_args
-                if isinstance(raw_data, dict):
-                    slides = raw_data.get('slides')
-                    theme = raw_data.get('theme', theme)
-                    output_path = raw_data.get('output_path', output_path)
-                elif isinstance(raw_data, list):
-                    slides = raw_data
-            except Exception:
-                pass
         
         if slides is None:
             return json.dumps({"success": False, "message": "缺少必需参数: slides"}, ensure_ascii=False)
@@ -169,8 +132,16 @@ def generate_ppt(slides: list = None, theme: str = 'tech_blue', output_path: str
         return json.dumps({"success": False, "message": f"生成PPT失败: {str(e)}", "traceback": traceback.format_exc()}, ensure_ascii=False)
 
 
+# ── PresentationConfig TypedDict ──────────────────────────────
+class PresentationConfig(TypedDict, total=False):
+    """create_presentation 的 config 参数结构"""
+    title: str
+    slides: List[dict]
+
+
+@schema_override("create_presentation")
 @register_tool
-def create_presentation(file_path: str, config: dict = None):
+def create_presentation(file_path: str, config: PresentationConfig = None):
     """创建PowerPoint演示文稿。file_path: 保存路径, config: 演示文稿配置"""
     if not PPT_AVAILABLE:
         return json.dumps({"success": False, "message": "需要安装python-pptx库: pip install python-pptx"})
@@ -234,7 +205,9 @@ def create_presentation(file_path: str, config: dict = None):
                     slide.shapes.add_picture(image_path, left, top, width=Inches(8))
         
         # 保存演示文稿
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        dir_name = os.path.dirname(os.path.abspath(file_path))
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         prs.save(file_path)
         
         result = {
@@ -248,9 +221,22 @@ def create_presentation(file_path: str, config: dict = None):
     except Exception as e:
         return json.dumps({"success": False, "message": f"创建演示文稿失败: {str(e)}"}, ensure_ascii=False)
 
+# ── SlideConfig TypedDict（为 LLM 提供 slide_config 完整类型）──
+class SlideConfig(TypedDict, total=False):
+    """add_slide_content 的 slide_config 参数结构"""
+    type: str          # "title" | "content" | "bullet" | "image" | "blank"
+    title: str
+    content: List[str]  # 用于 content 类型
+    bullets: List[str] # 用于 bullet 类型
+    image_path: str    # 用于 image 类型（文件路径从 slide_config 内取）
+    subtitle: str
+    layout_name: str
+
+
+@schema_override("add_slide_content")
 @register_tool(timeout=30)
-@path_params("file_path", "image_path")  # 需要导入 path_params
-def add_slide_content(file_path: str, slide_config: dict) -> str:
+@path_params("file_path")   # 只保留实际存在的函数参数（Bug4 修复）
+def add_slide_content(file_path: str, slide_config: SlideConfig) -> str:
     """
     向PPT添加幻灯片（支持文字、项目符号、图片、标题页）
     
@@ -269,7 +255,9 @@ def add_slide_content(file_path: str, slide_config: dict) -> str:
     
     try:
         # 1. 确保目录存在
-        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        dir_name = os.path.dirname(os.path.abspath(file_path))
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         
         # 2. 加载或新建
         if os.path.exists(file_path):
@@ -367,8 +355,6 @@ def add_slide_content(file_path: str, slide_config: dict) -> str:
                     p = text_frame.add_paragraph() if i > 0 else text_frame.paragraphs[0]
                     p.text = item
                     p.level = slide_config.get("level", 0)  # 默认一级
-                    # 设置项目符号样式（可选）
-                    p.bullet = True
 
         elif slide_type == "image":
             # 图片幻灯片（新增支持）

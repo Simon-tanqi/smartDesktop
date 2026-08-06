@@ -27,6 +27,7 @@ def run_agent(
     on_success: Optional[Callable] = None,
     resumed_checkpoint: Optional[TaskCheckpoint] = None,
     cancel_event: Optional[threading.Event] = None,
+    engine: Optional[ReActEngine] = None,
 ) -> Generator[str, None, None]:
     """Agent 调度入口：协调各核心模块完成对话任务。
 
@@ -45,6 +46,8 @@ def run_agent(
         on_success: callable(user_message, tool_name, params) 成功回调，任务完成后触发
         resumed_checkpoint: TaskCheckpoint 实例，用于恢复中断的任务
         cancel_event: 可选的取消信号，设置后引擎在下一个检查点终止任务
+        engine: 可复用的 ReActEngine 实例（跨 turn 保持 context_detector 等状态）；
+                不传则内部新建。
 
     生成器 yield 的 event 类型（SSE 格式字符串）:
         - step: 执行步骤进度，{"type": "step", "text": "...", "status": "进行中|完成|error"}
@@ -60,7 +63,8 @@ def run_agent(
     本函数不再重复调用 route()，直接进入 ReAct 引擎。
     """
     logger = get_logger()
-    engine = ReActEngine(trace_id=trace_id, session_id=session_id, session_name=session_name)
+    if engine is None:
+        engine = ReActEngine(trace_id=trace_id, session_id=session_id, session_name=session_name)
 
     last_tool_call = {"tool_name": "", "params": None}
     # v2 workflow: 累积本次运行中所有 tool_call 事件（按顺序）
