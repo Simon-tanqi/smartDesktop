@@ -127,7 +127,7 @@ def _is_noise(text: str) -> bool:
     return normalized in set(NOISE_PHRASES) or text.strip() in set(NOISE_PHRASES)
 
 
-_session_lock = threading.Lock()
+_session_lock = threading.RLock()
 
 
 def generate_session_id():
@@ -247,6 +247,26 @@ def get_session(session_id):
     return db.get(session_id)
 
 
+def _remove_active_session_file():
+    """删除 active_session.txt，带重试窗口兜底瞬态占用（0.5s x 3）。
+
+    前端轮询 active 会话接口时可能短暂持有读句柄导致 WinError 32；
+    重试仍失败则降级保留，残留的失效 sid 会被 get_active_session_id 自动重建。
+    """
+    import time
+    for attempt in range(3):
+        try:
+            os.remove(ACTIVE_SESSION_FILE)
+            return True
+        except OSError as e:
+            if attempt < 2:
+                time.sleep(0.5)
+            else:
+                get_logger().warning(f"active_session.txt 删除失败（已降级保留）: {e}")
+                return False
+    return False
+
+
 def delete_session(session_id):
     from memory.stores.sqlite_store import delete_chat_session
     db = load_sessions_db()
@@ -255,9 +275,12 @@ def delete_session(session_id):
         save_sessions_db(db)
         delete_chat_session(session_id)
         if os.path.exists(ACTIVE_SESSION_FILE):
-            with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
-                if f.read().strip() == session_id:
-                    os.remove(ACTIVE_SESSION_FILE)
+            try:
+                with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
+                    if f.read().strip() == session_id:
+                        _remove_active_session_file()
+            except OSError as e:
+                get_logger().warning(f"读取 active_session.txt 失败，跳过清理: {e}")
 
 
 def update_last_turn(session_id, turn):
@@ -930,13 +953,36 @@ def _finalize_entry_v2(entry, tool_calls, last_tool_name, last_tool_args, last_t
         entry["task_status"] = "in_progress"
 
 
+def _get_latest_cover_end(session_id):
+    """获取已压缩覆盖的最大轮次游标（1-based cover_turn_end 语义）。
+
+    摘要覆盖区间为 [cover_turn_start, cover_turn_end]（1-based 轮次号），
+    最新一条的 cover_turn_end 即"已覆盖到第几轮"。返回 0 表示尚未压缩。
+    """
+    try:
+        from memory.stores.sqlite_store import get_session_summaries_db
+        import sqlite3
+        db_path = get_session_summaries_db(session_id)
+        if not os.path.exists(db_path):
+            return 0
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT MAX(cover_turn_end) FROM summaries WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception:
+        return 0
+
+
 def _trigger_increment_compression(session_id, history_entries):
     """触发增量合并压缩。
     
     设计要点：
     1. 轮次触发：每完成1个用户轮次，且结构化轮次 > 3时，取出最老1轮数据合并进摘要
     2. 存储统一：写入 summaries.db，与 compress_conversation_async 共用存储
-    3. 去重保护：避免同一轮次重复压缩
+    3. 去重保护：以 summaries 最新 cover_turn_end 为游标，只压缩未覆盖轮次；
+       已覆盖轮次不再重复合并（修复恒取 history_entries[0] 导致后续轮次永不进摘要的问题）
     
     Args:
         session_id: 会话ID
@@ -945,12 +991,22 @@ def _trigger_increment_compression(session_id, history_entries):
     if len(history_entries) <= 3:
         return
 
-    oldest_round = history_entries[0]
-    
-    new_summary = increment_merge_summary(session_id, oldest_round)
+    # 已覆盖游标：round_index < latest_cover_end 的轮次均已入摘要
+    latest_cover_end = _get_latest_cover_end(session_id)
+
+    # 取未覆盖轮次中最老的一轮（round_index 0-based，与 cover_turn_end 1-based 对齐比较）
+    target_round = None
+    for entry in history_entries:
+        if entry.get("round_index", 0) >= latest_cover_end:
+            target_round = entry
+            break
+    if target_round is None:
+        return  # 全部已覆盖，去重跳过
+
+    new_summary = increment_merge_summary(session_id, target_round)
     if new_summary:
         try:
-            cover_end = oldest_round.get("round_index", 1) + 1
+            cover_end = target_round.get("round_index", 0) + 1
             add_summary(session_id, new_summary,
                         cover_turn_start=1,
                         cover_turn_end=cover_end,

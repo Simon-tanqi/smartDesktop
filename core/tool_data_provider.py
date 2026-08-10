@@ -711,9 +711,30 @@ class ToolExecutionPipeline:
         """
         import time
 
+        # ── P0-1/P0-2: 副作用工具自动写后验证 + 失败自动回滚（管线自动消费验证器） ──
+        try:
+            from tools.post_action_verify import auto_verify_tool_result, _AUTO_VERIFY_TOOL_NAMES
+            from tools.side_effect_journal import side_effect_journal as _sej
+        except ImportError:
+            auto_verify_tool_result = None
+            _AUTO_VERIFY_TOOL_NAMES = ()
+            _sej = None
+
+        def _auto_rollback(reason: str):
+            """后续工具失败时，自动补偿已执行的有副作用工具（P0-2 事务语义）。"""
+            if _sej is not None and _sej.count() > 0:
+                try:
+                    results = _sej.rollback_all()
+                    get_logger().warning(
+                        f"[{trace_id}] 工具 '{action}' {reason}，已自动回滚 {len(results)} 条已执行副作用操作"
+                    )
+                except Exception as _e:
+                    get_logger().warning(f"[{trace_id}] 自动回滚副作用操作异常: {_e}")
+
         if action == "web_search":
             # 熔断器检查：连续失败/低质量后跳过搜索
             if self._search_breaker.should_skip_search():
+                _auto_rollback("触发搜索熔断降级")
                 return {
                     "status": "degraded",
                     "message": self._search_breaker.get_degradation_message(),
@@ -730,6 +751,7 @@ class ToolExecutionPipeline:
                 get_logger().warning(
                     f"[{trace_id}] 搜索结果相关性校验未通过，query={action_input.get('query')}"
                 )
+                _auto_rollback("搜索结果相关性校验未通过")
                 return {
                     "status": "low_quality",
                     "message": "搜索结果与查询无关，已全部过滤。",
@@ -743,6 +765,7 @@ class ToolExecutionPipeline:
             results = result_data.get("results", [])
             if len(results) == 0:
                 self._search_breaker.record_result(False, False)
+                _auto_rollback("搜索结果为空")
                 return {
                     "status": "empty",
                     "message": "未找到相关结果。",
@@ -769,11 +792,31 @@ class ToolExecutionPipeline:
             get_logger().warning(
                 f"[{trace_id}] 工具 '{action}' 返回空结果",
             )
+            _auto_rollback("返回空结果")
             return {
                 "status": "empty",
                 "success": False,
                 "message": f"工具 {action} 返回空结果。引擎已注入占位提示，请勿重复调用同一工具，改用其他方案。",
             }
+
+        # ── P0-1: 管线自动消费写后验证器（原 post_action_verify 为 LLM 可选工具，现自动执行） ──
+        if _AUTO_VERIFY_TOOL_NAMES and action in _AUTO_VERIFY_TOOL_NAMES and auto_verify_tool_result is not None:
+            try:
+                _vrep = auto_verify_tool_result(action, action_input, raw_result)
+                if _vrep is not None and not _vrep.get("verified"):
+                    _vmsg = str(_vrep.get("verify_message", "验证失败"))
+                    get_logger().warning(
+                        f"[{trace_id}] 工具 '{action}' 写后验证失败: {_vmsg}"
+                    )
+                    _auto_rollback("写后验证失败")
+                    return {
+                        "success": False,
+                        "status": "verify_failed",
+                        "message": f"工具 {action} 执行后验证失败：{_vmsg}。已按失败处理，请勿重复执行。",
+                        "verification": _vrep,
+                    }
+            except Exception:
+                pass  # 验证器自身异常不阻塞主流程（保留原结果）
 
         # 结构化日志（若 structured_logger 存在）
         try:
@@ -963,6 +1006,26 @@ def _safe_result_summary(result) -> str:
         return str(result)[:300]
 
 
+def _build_tool_call_kwargs(func, arguments, confirmed_approved=False):
+    """构建实际传给工具的参数：确认标记与工具 kwargs 分离。
+
+    - 工具接受 **kwargs：透传全部参数（含 confirmed 确认标记，工具内部自行消费）；
+    - 固定签名工具：仅保留签名接受的参数，避免 confirmed 等内部参数引发 TypeError；
+    - inspect 无法解析（内置/包装函数）时回退透传全部参数，保持原有行为。
+    """
+    kwargs = dict(arguments)
+    if confirmed_approved:
+        kwargs["confirmed"] = True
+    try:
+        sig = inspect.signature(func)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_var_kw:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in sig.parameters}
+    except (ValueError, TypeError):
+        return kwargs
+
+
 def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                       full_content: str, full_reasoning: str,
                       _tl, _sl, cancel_event, confirmation_handler,
@@ -1008,12 +1071,6 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 "content": "[系统] 工具调用格式异常，已忽略。",
             })
             return "continue"
-
-        # DEBUG
-        try:
-            with open("D:/tmp/debug_execute_one_step.jsonl", "a", encoding="utf-8") as _df:
-                _df.write(json.dumps({"step": step, "tool_name": tool_name, "tc_id": tool_call_id, "phase": "before_log"}, ensure_ascii=False) + "\n")
-        except Exception: pass
 
         get_logger().info(f"LLM决定调用工具: {tool_name}",
                       trace_id=engine.trace_id, session_id=engine.session_id)
@@ -1114,10 +1171,13 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
 
             # ── 安全分级检查（P0/P1 需确认） ──
             risk_msg, challenge_phrase, risk_level = engine.tool_pipeline.check_tool_risk_level(tool_name, arguments)
+            _confirm_approved = False
             if risk_msg:
                 yield engine.streamer.emit_reasoning(risk_msg)
-                # ── 确认缓存：同一工具+同一关键参数 120s 内已确认过 → 直接放行，不再弹确认框 ──
-                cache_key = f"{tool_name}:{json.dumps({k: v for k, v in sorted(arguments.items()) if k in ('file_path', 'path', 'command')}, sort_keys=True, ensure_ascii=False, default=str)}"
+                # ── 确认缓存：同一工具+完整参数（120s 内）已确认过 → 直接放行，不再弹确认框 ──
+                # 注：key 绑定全部参数而非仅 file_path/path/command，避免不同 operation/key 的
+                # 注册表等高风险调用因空缓存键互相命中而绕过确认（安全加固）。
+                cache_key = f"{tool_name}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)}"
                 _cached_at = engine._confirmed_cache.get(cache_key)
                 if _cached_at is not None and (time.time() - _cached_at) < 120:
                     get_logger().info(f"confirm cache hit: {tool_name}, skip",
@@ -1168,10 +1228,36 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                     # system_tools 不存在该属性（AttributeError 被吞），且 execute_command
                     # 已从 Path A 移除，该预注册从不生效，属死代码。
                     if not challenge_phrase:
-                        arguments["confirmed"] = True
+                        _confirm_approved = True
 
                     # ✅ 确认通过：写入确认缓存（同工具+同关键参数 120s 内不再重复确认）
                     engine._confirmed_cache[cache_key] = time.time()
+                else:
+                    # ── P0-3 fail-closed：无确认处理器时拒绝执行高风险工具，绝不默认放行 ──
+                    get_logger().warning(
+                        f"安全确认处理器缺失（confirmation_handler=None），已拒绝执行高风险工具 {tool_name}（{risk_level}）",
+                        trace_id=engine.trace_id, session_id=engine.session_id)
+                    yield engine.streamer.emit_step(
+                        f"安全确认处理器缺失，已拒绝执行高风险工具 '{tool_name}'（{risk_level}）。"
+                        f"请在具备确认能力的会话中重试。", "warning")
+                    args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
+                    if len(json.dumps(arguments, ensure_ascii=False)) > 500:
+                        args_preview += "..."
+                    _tool_call_history.append({
+                        "name": tool_name, "args": args_preview,
+                        "status": "rejected", "result": "安全确认处理器缺失，已拒绝执行"
+                    })
+                    step_msg = engine.tool_pipeline.build_step_summary(tool_name, arguments, "", "failed",
+                        f"安全确认处理器缺失，已拒绝执行高风险工具 '{tool_name}'", step)
+                    _persist_tool_pair(engine, full_content, tool_call_id, tc, full_reasoning,
+                                       json.dumps({"success": False, "message": "安全确认处理器缺失，已拒绝执行高风险工具"}, ensure_ascii=False))
+                    conversation_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": json.dumps({"success": False, "message": "安全确认处理器缺失，已拒绝执行高风险工具"}, ensure_ascii=False)
+                    })
+                    return "continue"
 
             # 注入 session_id 到 load_domain_skills 等需要会话上下文的工具
             if tool_name == "load_domain_skills":
@@ -1183,7 +1269,8 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 try:
                     import time as _vt
                     _vt0 = _vt.time()
-                    raw_result = tool_func(**arguments)
+                    _call_kwargs = _build_tool_call_kwargs(tool_func, arguments, _confirm_approved)
+                    raw_result = tool_func(**_call_kwargs)
                     _latency = (_vt.time() - _vt0) * 1000
                     validated = engine.tool_pipeline.execute_with_validation(
                         tool_name, arguments, raw_result, engine.trace_id, _latency
@@ -1196,7 +1283,52 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                             result_data = {"success": True, "result": raw_result}
                 except Exception as _e:
                     result_data = {"success": False, "message": f"{type(_e).__name__}: {_e}"}
-                
+
+                # ===== 修复：ask_user_clarification 统一走 Path B 确认分支 =====
+                # 内联工具返回 confirmation_required 时，必须与 handle_tool_success 一致，
+                # 执行 emit_confirm → wait_for_confirmation → 超时/拒绝处理；
+                # 否则 confirmation_required 被当作普通工具结果回传 LLM，
+                # LLM 会生成"等待确认" final_answer 结束任务，确认弹窗/超时提示从未触发。
+                if (tool_name == "ask_user_clarification" and confirmation_handler
+                        and isinstance(result_data, dict) and result_data.get("confirmation_required")):
+                    token = result_data.get("confirmation_token") or result_data.get("challenge_token")
+                    if token:
+                        title = result_data.get("title", result_data.get("message", "操作需要确认"))
+                        command = result_data.get("command", "")
+                        details = result_data.get("details", {})
+                        yield engine.streamer.emit_confirm(token, title=title, command=command,
+                                                          details=details, tool_name=tool_name)
+                        confirmation_result = engine.tool_pipeline.wait_for_confirmation(
+                            token, confirmation_handler, timeout=engine.CONFIRMATION_TIMEOUT)
+                        if confirmation_result.get("confirmed"):
+                            if cancel_event is not None and cancel_event.is_set():
+                                yield from safe_final(engine, state, "任务已取消", outcome="cancelled")
+                                final_reply_saved = True
+                                return "return"
+                            confirmed_args = {**arguments, "confirmation_token": token}
+                            try:
+                                confirm_result = tool_func(**_build_tool_call_kwargs(tool_func, confirmed_args))
+                            except Exception as e:
+                                yield engine.streamer.emit_step(f"工具执行失败: {e}", "failed")
+                                final_reply_saved = True
+                                return "return"
+                            raw_data = _safe_json_loads(confirm_result) if isinstance(confirm_result, str) else confirm_result
+                            result_data = raw_data if isinstance(raw_data, dict) else {"success": True, "result": raw_data}
+                        else:
+                            if confirmation_result.get("timeout"):
+                                timeout_msg = confirmation_result.get("message", "确认超时，任务已取消")
+                                # 持久化确认超时状态到 checkpoint，恢复时可感知
+                                save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                                tool_name, arguments, progress="确认超时，任务已取消",
+                                                messages_param=conversation_messages)
+                                yield engine.streamer.emit_step(timeout_msg, "failed")
+                                yield from safe_final(engine, state, timeout_msg, outcome="cancelled")
+                            else:
+                                yield from safe_final(engine, state, "用户拒绝了操作，任务已取消", outcome="cancelled")
+                            final_reply_saved = True
+                            return "return"
+                    # 无 token 时降级为普通结果返回（保持原行为）
+
                 yield engine.streamer.emit_tool_result(tool_name, result_data)
                 
                 args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
@@ -1275,10 +1407,11 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                                        trace_id=engine.trace_id, session_id=engine.session_id)
 
             result_container = {"result": None, "error": None}
+            _call_kwargs = _build_tool_call_kwargs(tool_func, arguments, _confirm_approved)
 
             def _tool_thread():
                 try:
-                    result_container["result"] = tool_func(**arguments)
+                    result_container["result"] = tool_func(**_call_kwargs)
                 except Exception as e:
                     result_container["error"] = f"{type(e).__name__}: {e}"
 
@@ -1291,6 +1424,15 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 get_logger().warning(f"工具 '{tool_name}' 执行超时，正在终止线程",
                                   trace_id=engine.trace_id, session_id=engine.session_id)
                 yield engine.streamer.emit_step(f"工具 '{tool_name}' 执行超时（{timeout}秒），已终止线程", "failed")
+                # P0-2: 后续工具失败时，自动补偿已执行的有副作用工具（避免半配置状态）
+                try:
+                    from tools.side_effect_journal import side_effect_journal as _sej
+                    if _sej.count() > 0:
+                        _rollback_results = _sej.rollback_all()
+                        get_logger().warning(f"工具 '{tool_name}' 执行超时，自动回滚 {len(_rollback_results)} 条已执行副作用操作",
+                                             trace_id=engine.trace_id, session_id=engine.session_id)
+                except Exception:
+                    pass
                 _timeout_sig = tool_call_signature(tool_name, arguments)
                 if _timeout_sig == engine._breaker_state.last_tool_call_signature:
                     engine._breaker_state.consecutive_fail_count += 1
@@ -1339,6 +1481,15 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 # 确保 LLM 上下文中包含完整错误类型信息
                 full_error_msg = f"{raw_err} | {error_msg}" if raw_err not in error_msg else error_msg
                 yield engine.streamer.emit_step(f"工具执行失败: {full_error_msg}", "failed")
+                # P0-2: 后续工具失败时，自动补偿已执行的有副作用工具（避免半配置状态）
+                try:
+                    from tools.side_effect_journal import side_effect_journal as _sej
+                    if _sej.count() > 0:
+                        _rollback_results = _sej.rollback_all()
+                        get_logger().warning(f"工具 '{tool_name}' 执行失败，自动回滚 {len(_rollback_results)} 条已执行副作用操作",
+                                             trace_id=engine.trace_id, session_id=engine.session_id)
+                except Exception:
+                    pass
                 _error_sig = tool_call_signature(tool_name, arguments)
                 if _error_sig == engine._breaker_state.last_tool_call_signature:
                     engine._breaker_state.consecutive_fail_count += 1
@@ -1391,8 +1542,13 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 and _validated_data.get("success", False) is True
                 and _validated_data.get("status") not in ("empty", "low_quality", "error")
             )
+            # 检测确认请求：工具返回 success=False + confirmation_required=True 是正常确认流程，不应路由到失败处理
+            is_confirmation_required = (
+                isinstance(_validated_data, dict)
+                and _validated_data.get("confirmation_required") is True
+            )
 
-            if not is_valid_success:
+            if not is_valid_success and not is_confirmation_required:
                 # ── 阶段方法：工具失败路径处理（_handle_tool_failure） ──
                 rs.conversation_messages = conversation_messages
                 rs.tool_call_history = _tool_call_history
@@ -1435,6 +1591,15 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
         except Exception as e:
             error_msg = f"{type(e).__name__}: {translate_error(str(e))}"
             yield engine.streamer.emit_step(f"工具执行失败: {error_msg}", "failed")
+            # P0-2: 兜底——工具执行链路任意异常时，自动补偿已执行的有副作用工具
+            try:
+                from tools.side_effect_journal import side_effect_journal as _sej
+                if _sej.count() > 0:
+                    _rollback_results = _sej.rollback_all()
+                    get_logger().warning(f"工具执行链路异常，自动回滚 {len(_rollback_results)} 条已执行副作用操作",
+                                         trace_id=engine.trace_id, session_id=engine.session_id)
+            except Exception:
+                pass
             # 回填工具执行失败结果到 LLM 调用日志
             get_logger().update_tool_result(
                 session_id=engine.session_id,
@@ -1725,6 +1890,7 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
         get_logger().debug(f"confirmation_required={result_data.get('confirmation_required')}, confirmation_handler={confirmation_handler}",
                       trace_id=engine.trace_id, session_id=engine.session_id)
         if result_data.get("confirmation_required"):
+            get_logger().info(f"[CONFIRM-DEBUG] handle_tool_success detected confirmation_required for {tool_name}")
             get_logger().debug(f"confirmation_required is True", trace_id=engine.trace_id, session_id=engine.session_id)
             get_logger().debug(f"confirmation_handler: {confirmation_handler}", trace_id=engine.trace_id, session_id=engine.session_id)
             get_logger().debug(f"confirmation_token: {result_data.get('confirmation_token')}", trace_id=engine.trace_id, session_id=engine.session_id)
@@ -1740,6 +1906,7 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
                     yield engine.streamer.emit_confirm(token, title=title, command=command,
                                                       details=details, tool_name=tool_name,
                                                       challenge_phrase=challenge_phrase)
+                    get_logger().info(f"[CONFIRM-DEBUG] emit_confirm yielded, entering wait_for_confirmation")
                     get_logger().debug(f"Waiting for confirmation...", trace_id=engine.trace_id, session_id=engine.session_id)
                     confirmation_result = engine.tool_pipeline.wait_for_confirmation(token, confirmation_handler, timeout=engine.CONFIRMATION_TIMEOUT)
                     get_logger().debug(f"Confirmation result: {confirmation_result}", trace_id=engine.trace_id, session_id=engine.session_id)
@@ -1754,25 +1921,39 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
                             confirmed_args = {**arguments, "challenge_token": token, "challenge_response": challenge_response}
                         else:
                             confirmed_args = {**arguments, "confirmation_token": token}
-                        # 预注册 token：仅 web_download 需要引擎代写（工具不自存 token）。
-                        # 统一写入 core.confirmation_manager；execute_command 等工具自身
-                        # create_challenge/create_confirmation 已自存，引擎不重复预注册
-                        # （原 _st._pending_confirmations 预注册因属性不存在从不生效，已删除）。
-                        if tool_name == "web_download":
+                        # 预注册 token 到主进程 confirmation_manager。
+                        # web_download：工具不自存 token，引擎代写。
+                        # execute_command：工具在子进程中 create_challenge，
+                        #   子进程结束后 token 丢失，需引擎在主进程补注册，否则重放时
+                        #   _get_confirmation_manager().pop(token) 返回 None。
+                        # 注意：这里必须无条件 store（不能先 pop 探测）——
+                        #   pop 是破坏性操作，会消耗 token，导致重放时 execute_command L442
+                        #   pop 失败而报"挑战验证失败"；无条件覆盖写同一 command 可保持 token 有效。
+                        if tool_name == "web_download" or (tool_name == "execute_command" and challenge_phrase):
                             try:
                                 import time as _time
                                 from core.confirmation_manager import confirmation_manager as _cm
-                                if not _cm.pop(token):
+                                if tool_name == "web_download":
                                     _cm.store(token, {
                                         "type": "download",
                                         "url": arguments.get("url", ""),
                                         "output_dir": arguments.get("output_dir", ""),
                                         "expiry": _time.time() + 300,
                                     })
+                                else:
+                                    _cm.store(token, {
+                                        "type": "challenge",
+                                        "command": arguments.get("command", ""),
+                                        "desc": "execute_command 确认（引擎预注册）",
+                                        "source": "system_tools",
+                                        "level": "high",
+                                        "timestamp": _time.time(),
+                                        "_expiry": _time.time() + 300,
+                                    })
                             except Exception:
                                 pass
                         try:
-                            confirm_result = tool_func(**confirmed_args)
+                            confirm_result = tool_func(**_build_tool_call_kwargs(tool_func, confirmed_args))
                         except Exception as e:
                             yield engine.streamer.emit_step(f"工具执行失败: {e}", "failed")
                             final_reply_saved = True
@@ -1791,8 +1972,15 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
                             return ("return", final_reply_saved)
                     else:
                         if confirmation_result.get("timeout"):
+                            # 持久化确认超时状态到 checkpoint，恢复时可感知
+                            save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                            tool_name, arguments, progress="确认超时，任务已取消",
+                                            messages_param=conversation_messages)
                             yield from safe_final(engine,state, confirmation_result.get("message", "确认超时，任务已取消"), outcome="cancelled")
                         else:
+                            save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                            tool_name, arguments, progress="用户拒绝确认，任务已取消",
+                                            messages_param=conversation_messages)
                             yield from safe_final(engine,state, "用户拒绝了操作，任务已取消", outcome="cancelled")
                         final_reply_saved = True
                         return ("return", final_reply_saved)
@@ -1816,7 +2004,7 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
                         # confirmation_required 前自行 create_challenge 存入 confirmation_manager，
                         # 引擎此处重复预注册到 _st._pending_confirmations（属性不存在）从不生效。
                         try:
-                            confirm_result = tool_func(**confirmed_args)
+                            confirm_result = tool_func(**_build_tool_call_kwargs(tool_func, confirmed_args))
                         except Exception as e:
                             yield engine.streamer.emit_step(f"工具执行失败: {e}", "failed")
                             final_reply_saved = True
@@ -1835,8 +2023,15 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
                             return ("return", final_reply_saved)
                     else:
                         if confirmation_result.get("timeout"):
+                            # 持久化确认超时状态到 checkpoint，恢复时可感知
+                            save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                            tool_name, arguments, progress="确认超时，任务已取消",
+                                            messages_param=conversation_messages)
                             yield from safe_final(engine,state, confirmation_result.get("message", "确认超时，任务已取消"), outcome="cancelled")
                         else:
+                            save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                            tool_name, arguments, progress="用户拒绝确认或挑战短语验证失败，任务已取消",
+                                            messages_param=conversation_messages)
                             yield from safe_final(engine,state, "用户拒绝了操作或挑战短语验证失败，任务已取消", outcome="cancelled")
                         final_reply_saved = True
                         return ("return", final_reply_saved)

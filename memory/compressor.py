@@ -58,6 +58,253 @@ SUMMARY_PROMPT_TEMPLATE = (
 )
 
 
+# ═══════════════════════════════════════════════
+# 结构化摘要（增量合并链路专用）
+# ═══════════════════════════════════════════════
+# 设计目标：关键参数（工作目录/路径/参数值）由代码确定性提取、不经过 LLM
+# 压缩；仅非必要内容（任务状态/未完成任务/决策/工具轨迹简述）交给 LLM 合并。
+
+# 结构化摘要必要字段白名单：这些字段在注入 LLM 前不允许被截断/改写
+STRUCTURED_SUMMARY_KEYS = (
+    "key_context",        # 工作目录/关键路径/关键参数（代码提取，原样保留）
+    "tasks",              # 用户任务列表（user_task 原文保留，仅 ai_reply 压缩）
+    "unfinished_tasks",   # 未完成任务（不压缩）
+    "user_forbidden",     # 用户否定/偏好指令（不压缩）
+)
+
+# 从工具参数中识别"路径类"参数的键名（用于提取 key_paths）
+_PATH_ARG_KEYS = ("file_path", "path", "working_dir", "cwd", "target_path",
+                  "source_path", "dest_path", "output_path", "input_path",
+                  "directory", "folder", "dir")
+
+# 从工具参数中识别"工作目录"参数的键名
+_WORKDIR_ARG_KEYS = ("working_dir", "cwd", "work_dir", "directory", "folder", "dir")
+
+
+def _is_path_like(value) -> bool:
+    """粗略判断一个字符串是否像路径（含盘符/反斜杠/正斜杠/常见目录词）。"""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if not v:
+        return False
+    if len(v) > 512:
+        return False
+    if ":" in v and ("\\" in v or "/" in v):
+        return True
+    if v.startswith(("C:\\", "D:\\", "E:\\", "F:\\", "C:/", "D:/", "E:/", "F:/", "/", "~/")):
+        return True
+    return False
+
+
+def _extract_structured_fields(new_round_data: dict) -> dict:
+    """从单轮结构化数据中确定性提取必要字段（不经过 LLM，不压缩）。
+
+    返回值结构：
+    {
+        "key_context": {"work_dir": str, "key_paths": [str], "key_params": {}},
+        "tasks": [{"user_task": str, "ai_reply_brief": str, "status": str}],
+        "unfinished_tasks": [str],
+        "user_forbidden": [str],
+        "decisions": [str],
+        "tool_trace_brief": str,
+    }
+    """
+    key_paths: list = []
+    work_dir: str = ""
+    key_params: dict = {}
+
+    # 1) 用户任务原文（放大上限，避免长路径/长指令被截断）
+    user_task = str(new_round_data.get("user_task", "") or "")[:3000]
+    ai_reply = str(new_round_data.get("ai_reply", "") or "")[:300]
+    status = str(new_round_data.get("status", new_round_data.get("task_status", "")) or "")
+
+    # 2) 工具调用：提取路径类参数与工作目录
+    tool_lines = []
+    for tc in new_round_data.get("tool_calls", []) or []:
+        if not isinstance(tc, dict):
+            continue
+        tool_name = tc.get("tool_name", "") or ""
+        args = tc.get("tool_arguments", {}) or {}
+        result = tc.get("tool_result", "") or ""
+        if not isinstance(args, dict):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if not isinstance(result, str):
+            result = str(result)
+
+        # 提取 work_dir
+        for k in _WORKDIR_ARG_KEYS:
+            if args.get(k):
+                cand = str(args[k])
+                if _is_path_like(cand) or cand.startswith("C:") or cand.startswith("D:"):
+                    work_dir = cand
+                    break
+        # 提取路径类参数
+        for k, v in args.items():
+            if k in _PATH_ARG_KEYS and _is_path_like(v):
+                if v not in key_paths:
+                    key_paths.append(v)
+            elif k not in _WORKDIR_ARG_KEYS and isinstance(v, str):
+                # 命令/字符串参数：提取引号内的路径片段（如 'C:\Program Files\a.exe'）
+                for cand in re.findall(r"['\"]([^'\"]+)['\"]", v):
+                    if _is_path_like(cand) and cand not in key_paths:
+                        key_paths.append(cand)
+                # 参数本身整体是路径也保留
+                if _is_path_like(v) and v not in key_paths:
+                    key_paths.append(v)
+        # 关键参数：记录该工具全部参数（不做截断，通常量级可控）
+        if tool_name:
+            key_params[tool_name] = args
+            tool_lines.append(f"{tool_name}({json.dumps(args, ensure_ascii=False)})"
+                              f" -> {result[:200]}")
+
+    return {
+        "key_context": {
+            "work_dir": work_dir,
+            "key_paths": key_paths,
+            "key_params": key_params,
+        },
+        "tasks": [{
+            "user_task": user_task,
+            "ai_reply_brief": ai_reply,
+            "status": status,
+        }],
+        "unfinished_tasks": [],
+        "user_forbidden": [],
+        "decisions": [],
+        "tool_trace_brief": "\n".join(tool_lines)[:2000],
+    }
+
+
+def _parse_structured_summary(text: str):
+    """容错解析结构化摘要 JSON 文本。
+
+    支持：纯 JSON、```json 围栏包裹、前后混有说明文字。
+    解析失败返回 None（调用方负责回退）。
+    """
+    if not text:
+        return None
+    raw = str(text).strip()
+    # 剥离 ```json ... ``` 围栏
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+    # 提取第一个 { 到最后一个 } 之间的内容
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    raw = raw[start:end + 1]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _legacy_summary_to_struct(old_summary: str) -> dict:
+    """将旧的自然语言摘要（或任意无法解析的文本）转换为结构化外壳。
+
+    旧摘要信息不丢失：放入 tool_trace_brief 供后续 LLM 合并参考；
+    若已是结构化 JSON 则原样返回。
+    """
+    parsed = _parse_structured_summary(old_summary)
+    if parsed is not None:
+        return parsed
+    return {
+        "key_context": {"work_dir": "", "key_paths": [], "key_params": {}},
+        "tasks": [],
+        "unfinished_tasks": [],
+        "user_forbidden": [],
+        "decisions": [],
+        "tool_trace_brief": str(old_summary)[:2000] or "",
+    }
+
+
+# 结构化摘要合并提示词：要求输出 JSON，且必须原样保留 key_context 全部字段
+STRUCTURED_SUMMARY_PROMPT_TEMPLATE = (
+    "你是对话压缩助手。请把【之前摘要】与【新对话】合并，输出一份结构化 JSON 摘要。\n"
+    "硬性要求：\n"
+    "1. 只输出 JSON，不要输出任何解释文字，不要使用 Markdown 围栏。\n"
+    "2. 必须包含字段：key_context / tasks / unfinished_tasks / user_forbidden / decisions / tool_trace_brief。\n"
+    "3. key_context 中的 work_dir、key_paths、key_params 必须【原样保留】全部值，禁止删减、改写、省略任何路径或参数。\n"
+    "4. tasks 数组：保留每条 user_task 原文（不得截断），ai_reply_brief 可压缩为一行。\n"
+    "5. unfinished_tasks / user_forbidden 如有新增必须合并进去，不得丢失旧条目。\n"
+    "6. decisions 记录已确认的技术方案；tool_trace_brief 压缩为简要工具轨迹。\n"
+    "7. 若之前摘要是自然语言旧格式，请将其中的关键路径/参数/任务信息吸收到对应字段。\n"
+    "{old_summary_block}"
+    "新对话：\n{dialogue}"
+)
+
+
+def _merge_with_fallback(old_struct: dict, new_struct: dict, parsed):
+    """合并结构化摘要；parsed 为 LLM 输出（可为 None）。
+
+    必要字段（key_context / tasks.user_task / unfinished_tasks / user_forbidden）
+    以确定性数据为准：LLM 输出只允许补充，不允许删改。
+    解析失败（parsed=None）时退化为纯代码拼接，保证关键信息不丢。
+    """
+    merged = {
+        "key_context": dict(old_struct.get("key_context") or {}),
+        "tasks": list(old_struct.get("tasks") or []),
+        "unfinished_tasks": list(old_struct.get("unfinished_tasks") or []),
+        "user_forbidden": list(old_struct.get("user_forbidden") or []),
+        "decisions": list(old_struct.get("decisions") or []),
+        "tool_trace_brief": str(old_struct.get("tool_trace_brief") or ""),
+    }
+
+    # 1) key_context：确定性字段强制覆盖（LLM 不得删改路径/参数）
+    #    注意：key_paths 必须做并集而非整体覆盖，否则旧路径丢失
+    old_kc = merged["key_context"]
+    new_kc = dict(new_struct.get("key_context") or {})
+    old_paths = list(old_kc.get("key_paths") or [])
+    new_paths = list(new_kc.get("key_paths") or [])
+    old_kc["key_paths"] = old_paths + [p for p in new_paths if p not in old_paths]
+    for k, v in new_kc.items():
+        if k == "key_paths":
+            continue
+        old_kc[k] = v
+
+    # 2) tasks：新轮次 user_task 原文覆盖同任务条目；新任务追加
+    for t in (new_struct.get("tasks") or []):
+        ut = t.get("user_task")
+        found = False
+        for i, x in enumerate(merged["tasks"]):
+            if x.get("user_task") == ut:
+                merged["tasks"][i] = t
+                found = True
+                break
+        if not found:
+            merged["tasks"].append(t)
+
+    # 3) unfinished_tasks / user_forbidden / decisions：LLM 输出可用则合并补充
+    for key in ("unfinished_tasks", "user_forbidden", "decisions"):
+        llm_vals = (parsed.get(key) or []) if isinstance(parsed, dict) else []
+        if isinstance(llm_vals, list):
+            for v in llm_vals:
+                if v not in merged[key]:
+                    merged[key].append(v)
+        for v in (new_struct.get(key) or []):
+            if v not in merged[key]:
+                merged[key].append(v)
+
+    # 4) tool_trace_brief：LLM 压缩版优先，失败则代码拼接
+    if isinstance(parsed, dict) and parsed.get("tool_trace_brief"):
+        merged["tool_trace_brief"] = str(parsed["tool_trace_brief"])[:2000]
+    else:
+        old_trace = str(merged.get("tool_trace_brief") or "")
+        new_trace = str(new_struct.get("tool_trace_brief") or "")
+        merged["tool_trace_brief"] = (old_trace + "\n" + new_trace).strip()[:2000]
+
+    return merged
+
+
 # ── 防并发锁 ──
 _compression_locks = {}
 _compression_lock_timestamps = {}
@@ -128,56 +375,48 @@ def _generate_summary(messages, old_summary="", max_len=MAX_SUMMARY_CHARS):
 
 
 def increment_merge_summary(session_id, new_round_data, max_len=MAX_SUMMARY_CHARS):
-    """增量合并摘要：接收旧摘要 + 单轮结构化数据，输出合并后的新摘要。
-    
+    """增量合并摘要（结构化版）：接收旧摘要 + 单轮结构化数据，输出结构化 JSON 摘要。
+
     设计要点：
-    1. 算力恒定：仅合并最新一轮数据，不重算全部历史
-    2. 保持连续性：基于旧摘要增量更新，避免内容漂移
-    3. 统一存储：写入 summaries.db，与 compress_conversation_async 共用存储
-    
+    1. 关键参数不压缩：key_context（工作目录/路径/参数）由代码确定性提取，
+       不经过 LLM，原样保留；只有非必要内容（任务状态/工具轨迹简述）交给 LLM 合并。
+    2. 兼容旧格式：旧摘要若是自然语言（无法解析为 JSON），转入 tool_trace_brief
+       供 LLM 吸收，不丢失信息。
+    3. 失败回退：LLM 输出解析失败时，返回 旧摘要 + 新轮次必要字段 的代码拼接结果，
+       保证关键信息不丢。
+    4. 统一存储：写入 summaries.db，与 compress_conversation_async 共用存储。
+
     Args:
         session_id: 会话ID
         new_round_data: 单轮结构化数据，包含 user_task、ai_reply、tool_calls
-        max_len: 摘要最大字符数
-    
+        max_len: 摘要最大字符数（兼容参数，结构化摘要主要受字段白名单控制）
+
     Returns:
-        合并后的新摘要字符串
+        合并后的结构化摘要 JSON 字符串
     """
-    old_summary = get_latest_summary(session_id)
-    
-    round_text = []
-    user_task = new_round_data.get("user_task", "")
-    if user_task:
-        round_text.append(f"用户: {user_task[:500]}")
-    ai_reply = new_round_data.get("ai_reply", "")
-    if ai_reply:
-        round_text.append(f"AI: {ai_reply[:500]}")
-    for tc in new_round_data.get("tool_calls", []):
-        tool_name = tc.get("tool_name", "")
-        tool_args = tc.get("tool_arguments", {})
-        tool_result = tc.get("tool_result", "")
-        args_preview = json.dumps(tool_args, ensure_ascii=False)[:100]
-        result_preview = tool_result[:100] if isinstance(tool_result, str) else str(tool_result)[:100]
-        round_text.append(f"工具[{tool_name}]: 参数={args_preview}, 结果={result_preview}")
-    
-    dialogue = "\n".join(round_text)
-    
-    old_block = f"【之前摘要】{old_summary[-2000:]}\n" if old_summary else ""
-    
+    old_summary = get_latest_summary(session_id) or ""
+    old_struct = _legacy_summary_to_struct(old_summary)
+
+    # 1) 确定性提取新轮次必要字段（不压缩）
+    new_struct = _extract_structured_fields(new_round_data)
+
+    # 2) 组装对话块：旧结构化摘要（JSON）+ 新轮次字段
+    old_block = f"【之前摘要】\n{json.dumps(old_struct, ensure_ascii=False)}\n"
+    dialogue = json.dumps(new_struct, ensure_ascii=False)
+
     system_prompt = {
         "role": "system",
-        "content": SUMMARY_PROMPT_TEMPLATE.format(
-            max_len=max_len,
-            old_summary=old_block,
+        "content": STRUCTURED_SUMMARY_PROMPT_TEMPLATE.format(
+            old_summary_block=old_block,
             dialogue=dialogue,
         ),
     }
-    
+
     resp = call_llm_with_config(
-        [system_prompt, {"role": "user", "content": "请将新对话内容合并到摘要中，保持简洁"}],
+        [system_prompt, {"role": "user", "content": "请合并为结构化摘要 JSON"}],
         COMPRESS_MODEL_CONFIG,
     )
-    
+
     if resp and "message" in resp:
         content = resp["message"]["content"].strip()
         content = re.sub(r'<\|end[_ ]of[_ ]thinking\|>', '', content, flags=re.IGNORECASE)
@@ -185,14 +424,15 @@ def increment_merge_summary(session_id, new_round_data, max_len=MAX_SUMMARY_CHAR
         content = re.sub(r'<\|.*?\|>', '', content)
         content = content.strip()
 
-        if SUMMARY_TOKEN_BUDGET > 0:
-            while estimate_tokens(content) > SUMMARY_TOKEN_BUDGET and len(content) > 100:
-                content = content[:int(len(content) * 0.9)].strip()
-                if content and not content.endswith(('。', '!', '?', '；', ';')):
-                    content = content.rsplit('。', 1)[0] + '。'
+        parsed = _parse_structured_summary(content)
+        if parsed is not None:
+            # 3) 校验必要字段完整：缺失时用确定性字段兜底
+            merged = _merge_with_fallback(old_struct, new_struct, parsed)
+            return json.dumps(merged, ensure_ascii=False)
 
-        return content
-    return ""
+    # 4) LLM 失败回退：代码合并旧摘要 + 新必要字段，保证关键信息不丢
+    fallback = _merge_with_fallback(old_struct, new_struct, None)
+    return json.dumps(fallback, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════

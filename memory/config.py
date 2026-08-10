@@ -21,7 +21,7 @@ if getattr(sys, 'frozen', False):
 else:
     APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
 
 
 def _ensure_dir(path):
@@ -76,7 +76,7 @@ def _generate_default_policy():
     }
     try:
         with open(CONFIG_YAML, 'w', encoding='utf-8') as f:
-            f.write("# MyAgent 记忆策略配置\n")
+            f.write("# smartDesktop 记忆策略配置\n")
             f.write("# 修改后调用 reload_policy() 或重启生效\n\n")
             yaml.dump(default_policy, f, allow_unicode=True, default_flow_style=False)
     except Exception:

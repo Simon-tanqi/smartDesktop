@@ -76,7 +76,7 @@ content 支持以下格式（任选一种）：
             content = {}
     content = content if isinstance(content, dict) else {}
     config = {
-        "meta": {"title": "新建文档", "author": "MyAgent", "subject": "", "keywords": "", "company": ""},
+        "meta": {"title": "新建文档", "author": "smartDesktop", "subject": "", "keywords": "", "company": ""},
         "page": {"size": "A4", "orientation": "portrait",
                  "margin": {"top": 1, "bottom": 1, "left": 1.25, "right": 1.25}},
         "default_style": {"font_name": "宋体", "font_size": 12, "line_spacing": 1.5},

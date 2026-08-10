@@ -36,7 +36,7 @@ from pathlib import Path
 try:
     from config.settings import DATA_DIR
 except ImportError:
-    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
 
 # ── 配置 ──
 LOG_DIR = Path(DATA_DIR) / "logs"
@@ -44,7 +44,7 @@ CRASH_LOG_PATH = LOG_DIR / "crash.log"
 FLUSH_INTERVAL = 5          # 秒，缓冲刷盘间隔
 MAX_BUFFER_SIZE = 50        # 条，缓冲条数达此值立即刷盘
 MAX_LOG_SIZE_MB = 500       # MB，日志总大小超此值时提醒
-ENABLE_CONSOLE_LOG = os.environ.get('MYAGENT_DEBUG', '').lower() == 'true'
+ENABLE_CONSOLE_LOG = os.environ.get('SMARTDESKTOP_DEBUG', '').lower() == 'true'
 
 # ── 日志级别 ──
 LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
@@ -370,7 +370,7 @@ class StructuredLogger:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             return
         except PermissionError:
-            pass  # 文件被占用：进入 A' 临时文件方案
+            pass  # 文件被占用：改用同目录临时文件 + 原子替换写入（策略 A'）
         except Exception as e:
             # 其他错误（编码等）不重试
             import sys as _sys
@@ -1835,7 +1835,7 @@ def get_session_logger() -> SessionLogger:
 
 import logging as _logging
 
-_LOG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent', 'logs')
+_LOG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop', 'logs')
 os.makedirs(_LOG_DIR, exist_ok=True)
 
 _session_std_loggers: dict[str, _logging.Logger] = {}
@@ -1851,7 +1851,7 @@ def get_per_session_logger(session_id: str | int, level=_logging.DEBUG) -> _logg
     与控制台保持相同的格式化风格（带时间/级别/消息）。
     """
     sid = str(session_id)
-    logger_name = f"MyAgent.session.{sid}"
+    logger_name = f"smartDesktop.session.{sid}"
 
     # 首先尝试从缓存拿，避免重复创建 handler
     with _session_std_loggers_lock:
@@ -1899,7 +1899,7 @@ def get_per_session_logger(session_id: str | int, level=_logging.DEBUG) -> _logg
 
 def get_global_logger() -> _logging.Logger:
     """非 session 相关的全局日志，写入 logs/global.log"""
-    logger_name = "MyAgent.global"
+    logger_name = "smartDesktop.global"
     logger = _logging.getLogger(logger_name)
 
     if logger.handlers:
@@ -1925,7 +1925,7 @@ def get_global_logger() -> _logging.Logger:
 import logging.handlers as _handlers
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
-_PROJECT_LOG_DIR = _PROJECT_ROOT / "logs"
+_PROJECT_LOG_DIR = Path(DATA_DIR) / "logs"
 _PROJECT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _project_loggers: dict[str, _logging.Logger] = {}
@@ -1943,7 +1943,7 @@ def _get_project_logger(name: str, filename: str,
         if name in _project_loggers:
             return _project_loggers[name]
 
-    logger = _logging.getLogger(f"MyAgent.project.{name}")
+    logger = _logging.getLogger(f"smartDesktop.project.{name}")
     if logger.handlers:
         with _project_loggers_lock:
             _project_loggers[name] = logger

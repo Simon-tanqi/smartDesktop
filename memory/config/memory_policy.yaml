@@ -1,4 +1,4 @@
-# MyAgent 记忆策略配置
+# smartDesktop 记忆策略配置
 # 修改后重启生效，或调用 memory.config.reload_policy() 热重载
 
 compression:

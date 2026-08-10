@@ -472,3 +472,176 @@ def with_verification(tool_func: Callable) -> Callable:
         return json.dumps(result_obj, ensure_ascii=False) if isinstance(result, str) else result_obj
     
     return wrapper
+
+
+# ═══════════════════════════════════════════════════════════════
+# P0-1: 管线自动验证入口（不再依赖 LLM 主动调用可选验证工具）
+# 由 ToolExecutionPipeline.execute_with_validation 在工具返回后自动消费。
+# ═══════════════════════════════════════════════════════════════
+
+# 需要管线自动写后验证的工具名集合
+_AUTO_VERIFY_TOOL_NAMES = ("modify_registry", "execute_command")
+
+
+def _parse_registry_key(key: str):
+    """解析 'HKLM\\...' / 'HKCU\\...' → (hkey, key_path)；不支持返回 (None, None)。"""
+    import winreg
+    if key.startswith("HKLM\\"):
+        return winreg.HKEY_LOCAL_MACHINE, key[5:]
+    if key.startswith("HKCU\\"):
+        return winreg.HKEY_CURRENT_USER, key[5:]
+    return None, None
+
+
+def _read_registry_value(hkey, key_path: str, value_name):
+    """读回注册表值。
+
+    Returns:
+        (key_exists, value_exists, value, vt)
+        - 键不存在: (False, False, None, None)
+        - 键存在但值不存在: (True, False, None, None)
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_READ) as k:
+            try:
+                value, vt = winreg.QueryValueEx(k, value_name)
+                return (True, True, value, vt)
+            except FileNotFoundError:
+                return (True, False, None, None)
+    except FileNotFoundError:
+        return (False, False, None, None)
+    except OSError:
+        return (False, False, None, None)
+
+
+def verify_registry_tool(arguments: Dict[str, Any]) -> Optional[Dict]:
+    """modify_registry set/delete 写后读回验证（管线自动调用）。
+
+    - set: 读回值与期望值比对（REG_SZ/REG_DWORD/REG_BINARY 类型归一）
+    - delete: 确认值/键已不存在
+
+    Returns:
+        验证报告字典（含 verified 字段）；无匹配操作时返回 None。
+    """
+    try:
+        operation = arguments.get("operation")
+        key = arguments.get("key", "")
+        if operation not in ("set", "delete") or not key:
+            return None
+        hkey, key_path = _parse_registry_key(key)
+        if hkey is None:
+            return None
+        value_name = arguments.get("value_name")
+
+        if operation == "set":
+            expected = arguments.get("value_data")
+            vtype = arguments.get("value_type", "REG_SZ")
+            if vtype == "REG_DWORD":
+                try:
+                    expected = int(expected)
+                except (TypeError, ValueError):
+                    return None
+            elif vtype == "REG_BINARY":
+                try:
+                    expected = bytes.fromhex(expected or "")
+                except (TypeError, ValueError):
+                    return None
+            info = _read_registry_value(hkey, key_path, value_name)
+            if info is None or not info[0]:
+                return {
+                    "verified": False, "verify_result": "failed",
+                    "verify_message": f"写后验证失败：注册表键不存在 {key}",
+                    "operation_type": "registry_set",
+                }
+            if not info[1] or info[2] != expected:
+                return {
+                    "verified": False, "verify_result": "failed",
+                    "verify_message": f"写后验证失败：期望值 {expected!r}，实际值 {info[2]!r}",
+                    "operation_type": "registry_set",
+                }
+            return {
+                "verified": True, "verify_result": "success",
+                "verify_message": "写后验证通过：注册表值已生效",
+                "operation_type": "registry_set",
+            }
+
+        # operation == "delete"
+        info = _read_registry_value(hkey, key_path, value_name)
+        if info is None or not info[0]:
+            return {
+                "verified": True, "verify_result": "success",
+                "verify_message": "删除后验证通过：注册表键已不存在",
+                "operation_type": "registry_delete",
+            }
+        if value_name:
+            if info[1]:
+                return {
+                    "verified": False, "verify_result": "failed",
+                    "verify_message": f"删除后验证失败：值仍存在 {key}\\{value_name}",
+                    "operation_type": "registry_delete",
+                }
+            return {
+                "verified": True, "verify_result": "success",
+                "verify_message": "删除后验证通过：注册表值已不存在",
+                "operation_type": "registry_delete",
+            }
+        # 键删除：键仍存在即失败
+        return {
+            "verified": False, "verify_result": "failed",
+            "verify_message": f"删除后验证失败：键仍存在 {key}",
+            "operation_type": "registry_delete",
+        }
+    except Exception as e:
+        return {
+            "verified": False, "verify_result": "uncertain",
+            "verify_message": f"注册表验证器执行异常: {str(e)[:100]}",
+            "operation_type": "registry_verify",
+        }
+
+
+def auto_verify_tool_result(tool_name: str, arguments: Dict[str, Any], raw_result) -> Optional[Dict]:
+    """管线自动验证统一入口：工具返回后由 ToolExecutionPipeline 自动消费。
+
+    - modify_registry: 直接 winreg 读回比对（set/delete）
+    - execute_command: 复用现有 detect_operation_type + verifier 调度
+
+    Args:
+        tool_name: 已执行工具名
+        arguments: 工具调用参数
+        raw_result: 工具原始返回（JSON 字符串或 dict）
+
+    Returns:
+        验证报告字典；无匹配验证器或工具自报失败时返回 None。
+    """
+    if tool_name not in _AUTO_VERIFY_TOOL_NAMES:
+        return None
+
+    result_obj = None
+    if isinstance(raw_result, str):
+        try:
+            result_obj = json.loads(raw_result)
+        except (json.JSONDecodeError, TypeError):
+            result_obj = None
+    elif isinstance(raw_result, dict):
+        result_obj = raw_result
+    if result_obj is None:
+        return None
+
+    if tool_name == "modify_registry":
+        # 工具自报失败（内部已含写后读回验证）→ 无需管线再验证
+        if not bool(result_obj.get("success", False)):
+            return None
+        return verify_registry_tool(arguments)
+
+    # execute_command
+    if not bool(result_obj.get("success", True)):
+        return None
+    command = arguments.get("command", "")
+    tool_output = result_obj.get("output", "")
+    return verify_tool_result(
+        tool_name=tool_name,
+        command=command,
+        tool_output=tool_output,
+        tool_success=True,
+    )

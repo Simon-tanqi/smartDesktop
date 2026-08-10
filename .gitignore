@@ -1,7 +1,31 @@
+﻿# Python
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 密钥 / 配置
 config.enc
-.myagent_key
+.smartdesktop_key
 .env
+models.json
+
+# 备份文件
 *.bak
+*.bak_structured
+
+# 运行时产物（统一写入 %APPDATA%\smartDesktop，此处兜底）
+logs/
+temp/
+*.db
+*.db-shm
+*.db-wal
+
+# 测试报告 / IDE
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/

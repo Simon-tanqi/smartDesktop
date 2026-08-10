@@ -8,11 +8,13 @@ import re
 import shlex
 import shutil
 import threading
+import tempfile
 from datetime import datetime
 
 from . import register_tool, path_params
 from . import safe_exec
 from . import post_action_verify
+from .side_effect_journal import side_effect_journal
 from config.config_loader import get_safety_config
 from config.settings import MAX_OUTPUT_CHARS, PYTHON_TIMEOUT
 
@@ -81,20 +83,23 @@ def _win_split_command(cmdline: str) -> list:
     """
     args = []
     cur = ""
-    in_quotes = False
+    quote_char = None
     i = 0
     n = len(cmdline)
     while i < n:
         c = cmdline[i]
-        if c == '"':
-            in_quotes = not in_quotes
+        if c in ('"', "'"):
+            if quote_char is None:
+                quote_char = c
+            elif quote_char == c:
+                quote_char = None
             i += 1
             continue
         if c == '\\' and i + 1 < n and cmdline[i + 1] == '"':
             cur += '"'
             i += 2
             continue
-        if c.isspace() and not in_quotes:
+        if c.isspace() and quote_char is None:
             if cur:
                 args.append(cur)
                 cur = ""
@@ -134,6 +139,80 @@ def _parse_first_token(command: str) -> str:
         return command[:first_space]
     
     return command
+
+
+# ============================================================
+# 临时文件夹判定 —— 删除临时文件夹内文件免确认
+# ============================================================
+_TEMP_DIR_CACHE = None
+_TEMP_DIR_LOCK = threading.Lock()
+
+def _get_temp_roots() -> tuple:
+    """获取临时文件夹根目录集合（系统 TEMP + workspace\\temp）。"""
+    global _TEMP_DIR_CACHE
+    if _TEMP_DIR_CACHE is not None:
+        return _TEMP_DIR_CACHE
+    with _TEMP_DIR_LOCK:
+        if _TEMP_DIR_CACHE is not None:
+            return _TEMP_DIR_CACHE
+        roots = set()
+        try:
+            roots.add(os.path.normcase(os.path.abspath(tempfile.gettempdir())))
+        except Exception:
+            pass
+        try:
+            from config.settings import DATA_DIR
+        except Exception:
+            DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
+        workspace_temp = os.path.join(DATA_DIR, "workspace", "temp")
+        roots.add(os.path.normcase(os.path.abspath(workspace_temp)))
+        _TEMP_DIR_CACHE = tuple(sorted(roots))
+        return _TEMP_DIR_CACHE
+
+
+def _extract_delete_targets(command: str) -> list:
+    """提取删除命令中引号包裹或常见形式的路径目标（含 $env:TEMP / %TEMP% 展开）。"""
+    targets = []
+    # 引号包裹的路径（单/双引号）
+    targets += re.findall(r'"([^"]+)"', command)
+    targets += re.findall(r"'([^']+)'", command)
+    # 未加引号但以盘符\开头的路径
+    targets += re.findall(r'[A-Za-z]:\\[^\s;|&]+', command)
+    # $env:TEMP\... / %TEMP%\... 形式
+    targets += re.findall(r'(?i)\$env:TEMP\\[^\s;|&]+', command)
+    targets += re.findall(r'(?i)%TEMP%\\[^\s;|&]+', command)
+
+    expanded = []
+    for t in targets:
+        t = t.strip().strip('"').strip("'")
+        if not t:
+            continue
+        t = re.sub(r'(?i)\$env:TEMP', lambda m: tempfile.gettempdir().rstrip('\\'), t)
+        t = re.sub(r'(?i)%TEMP%', lambda m: tempfile.gettempdir().rstrip('\\'), t)
+        if re.search(r'[*?]', t):
+            # 含通配符时取通配符前的目录前缀进行判定
+            cut = re.split(r'[*?]', t, maxsplit=1)[0]
+            t = cut
+        expanded.append(t)
+    return expanded
+
+
+def _is_temp_dir_delete(command: str) -> bool:
+    """判断删除命令的目标是否全部位于临时文件夹内（是则免确认）。"""
+    if not any(re.search(pattern, command, re.IGNORECASE) for pattern in _get_cfg().delete_command_patterns):
+        return False
+    targets = _extract_delete_targets(command)
+    if not targets:
+        return False
+    roots = _get_temp_roots()
+    for t in targets:
+        try:
+            norm = os.path.normcase(os.path.normpath(os.path.abspath(t)))
+        except Exception:
+            return False
+        if not any(norm == root or norm.startswith(root + os.sep) for root in roots):
+            return False
+    return True
 
 
 def _try_redirect_audio_command(command: str) -> str | None:
@@ -246,7 +325,7 @@ def _get_confirm_log_path() -> str:
     try:
         from config.settings import DATA_DIR
     except ImportError:
-        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
     log_dir = os.path.join(DATA_DIR, "logs", "confirm")
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, "confirm_operations.log")
@@ -280,7 +359,13 @@ def _validate_uninstall_path(command: str, prevalidated_paths: list = None) -> d
         tokens = shlex.split(command.strip(), posix=False)
         if not tokens:
             return {"valid": False, "message": "无法解析命令"}
-        exe_path = tokens[0].strip('"')
+        # Bug 修复：跳过调用链前缀（如 & / cmd / Start-Process），与 _is_uninstall_command 保持一致，
+        # 否则 tokens[0]="&" 导致 os.path.exists("&") 始终 False 且注册表匹配永远失败
+        _idx = 0
+        _leading = tokens[0].strip().lower().strip('"').strip("'")
+        if _leading in ("&", "start-process", "start-process.exe", "cmd", "cmd.exe", "start", "call"):
+            _idx = 1
+        exe_path = tokens[_idx].strip('"').strip("'")
         exe_norm = os.path.normpath(exe_path).lower()
     except Exception:
         return {"valid": False, "message": "命令格式错误"}
@@ -545,16 +630,39 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                     "message": "操作被拒绝：命令匹配危险模式，需要预先授权"
                 })
             elif any(re.search(pattern, command, re.IGNORECASE) for pattern in _get_cfg().delete_command_patterns):
-                # 删除操作：无预先授权时直接拒绝
-                return json.dumps({
-                    "success": False,
-                    "message": "操作被拒绝：删除命令需要预先授权"
-                })
+                if _is_temp_dir_delete(command):
+                    # 临时文件夹豁免：删除临时文件夹内文件无需确认
+                    _is_verified = True
+                    _confirmed_note = "[临时文件夹豁免]"
+                    _log_confirmation(command, "TEMP_EXEMPT", "删除临时文件夹内文件，豁免确认")
+                else:
+                    # 危险命令（删除/卸载）：返回 confirmation_required 触发 UI 确认弹窗
+                    challenge_phrase = _get_cfg().danger_challenge_phrase
+                    token = _get_confirmation_manager().create_challenge(
+                        command=command,
+                        desc="危险命令（删除/卸载）",
+                        source="system_tools",
+                        level="high"
+                    )
+                    return json.dumps({
+                        "success": False,
+                        "confirmation_required": True,
+                        "challenge_phrase": challenge_phrase,
+                        "challenge_token": token,
+                        "message": "该命令包含删除或卸载操作，需要确认授权",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P1"
+                        }
+                    }, ensure_ascii=False)
             # 未匹配任何分类的命令：直接执行（UI 确认已在 react_engine 层完成）
             _is_verified = True
 
 
     # ── 5. 命令执行 ──
+    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
+    # 统一兜底为 None（继承当前进程工作目录），同时保证 os.makedirs 逻辑不受影响
+    working_dir = working_dir or None
     if working_dir:
         os.makedirs(working_dir, exist_ok=True)
 
@@ -570,30 +678,67 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
     safe_exec_kwargs = {}
     try:
         if challenge_response and challenge_token and _is_verified:
-            _get_confirmation_manager().create_challenge(
+            # 必须使用新建的令牌传给 safe_exec：原 challenge_token 已在 L442 pop 消耗，
+            # 若继续透传旧 token，safe_exec.verify_challenge 再次 pop 必然失败（令牌无效或已过期）。
+            _reissue_token = _get_confirmation_manager().create_challenge(
                 command=actual_command,
                 desc="execute_command 已验证",
                 source="powershell",
                 level="challenge",
             )
-            safe_exec_kwargs = {"challenge_response": challenge_response, "challenge_token": challenge_token}
+            safe_exec_kwargs = {"challenge_response": challenge_response, "challenge_token": _reissue_token}
 
         if is_uninstall:
             import subprocess
             try:
                 tokens = _win_split_command(actual_command.strip())
+                # Bug 修复：跳过 "& '...' /S" 拼接前缀，避免把 "&" 当可执行文件启动
+                if tokens and tokens[0].strip().lower() in ("&", "cmd", "cmd.exe", "start", "call"):
+                    tokens = tokens[1:]
                 exe_path = tokens[0].strip('"').strip("'") if tokens else ""
                 rest_args = tokens[1:] if len(tokens) > 1 else []
-                # 设置工作目录为卸载器所在目录（InnoSetup 需要 unins000.dat 等文件在同一目录）
-                uninstall_dir = os.path.dirname(exe_path)
-                # 统一使用 Popen 列表形式异步启动（shell=False），避免 cmd.exe 引号地狱
-                # 导致 WinError 123（如 exe 路径或参数含嵌套引号时）
-                subprocess.Popen(
-                    [exe_path] + rest_args,
-                    shell=False, cwd=uninstall_dir,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                )
-                result = {"success": True, "output": "卸载程序已启动，需要用户手动完成后续操作", "is_gui_operation": True}
+                if not exe_path or not os.path.exists(exe_path):
+                    result = {"success": False,
+                              "message": f"可执行文件不存在: {exe_path or '未知路径'}",
+                              "output": f"可执行文件不存在: {exe_path or '未知路径'}"}
+                else:
+                    # 设置工作目录为卸载器所在目录（InnoSetup 需要 unins000.dat 等文件在同一目录）
+                    uninstall_dir = os.path.dirname(exe_path)
+                    # 静默/交互式判定：带 /S、/silent、/verysilent、/qn 等参数为静默卸载，
+                    # 不应判定为 GUI 操作（不会弹窗，也无需用户手动操作）
+                    is_silent = bool(_SILENT_FLAG_RE.search(actual_command))
+                    # 统一使用 Popen 列表形式异步启动（shell=False），避免 cmd.exe 引号地狱
+                    # 导致 WinError 123（如 exe 路径或参数含嵌套引号时）
+                    proc = subprocess.Popen(
+                        [exe_path] + rest_args,
+                        shell=False, cwd=uninstall_dir,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    )
+                    if is_silent:
+                        # 静默卸载：等待进程结束并返回真实退出码，避免"假启动"误报 GUI 操作
+                        try:
+                            _exit_code = proc.wait(timeout=120)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            result = {"success": False,
+                                      "message": "静默卸载超时（120秒），已终止卸载进程",
+                                      "output": "静默卸载超时（120秒），已终止卸载进程"}
+                        else:
+                            result = {"success": _exit_code == 0,
+                                      "output": f"静默卸载进程已结束，退出码 {_exit_code}"}
+                            if _exit_code != 0:
+                                result["message"] = f"静默卸载退出码 {_exit_code}，可能未成功卸载"
+                    else:
+                        # 交互式卸载：短等待确认进程存活后移交用户手动操作
+                        time.sleep(1.5)
+                        if proc.poll() is not None:
+                            result = {"success": False,
+                                      "message": f"卸载程序启动后立即退出，退出码 {proc.returncode}，请检查权限或卸载器完整性",
+                                      "output": f"卸载程序启动后立即退出，退出码 {proc.returncode}"}
+                        else:
+                            result = {"success": True,
+                                      "output": "卸载程序已启动，需要用户手动完成后续操作",
+                                      "is_gui_operation": True}
             except FileNotFoundError:
                 result = {"success": False, "message": f"可执行文件不存在: {exe_path}", "output": f"可执行文件不存在: {exe_path}"}
             except Exception as e:
@@ -686,17 +831,37 @@ def _is_uninstall_command(command: str) -> bool:
         if not tokens:
             return False
         first_token = tokens[0]
+        # Bug 修复：跳过调用链前缀（如 "& '...\unins000.exe' /S"、"Start-Process -FilePath ..."），
+        # 找到实际卸载器 token 作为识别与执行目标，避免 tokens[0]="&" 导致识别失败走错分支
+        _leading = first_token.strip().strip('"').strip("'").lower()
+        if _leading in ("&", "start-process", "start-process.exe", "cmd", "cmd.exe", "start", "call"):
+            for tok in tokens[1:]:
+                t = tok.strip().strip('"').strip("'")
+                if not t:
+                    continue
+                base = os.path.basename(t).lower()
+                if base.startswith("unins") or "uninstall" in base or base in ("msiexec.exe", "msiexec"):
+                    first_token = t
+                    break
+            else:
+                for tok in tokens[1:]:
+                    t = tok.strip().strip('"').strip("'")
+                    if t and not t.startswith("-") and not t.startswith("/"):
+                        first_token = t
+                        break
     except Exception:
         first_token = _parse_first_token(command)
     
-    prog_name = os.path.basename(first_token).lower()
+    prog_name = os.path.basename(first_token.strip('"').strip("'")).lower()
     
     cmd_lower = command.lower()
     
     if prog_name == "msiexec" and "/x" in cmd_lower:
         return True
     
-    if prog_name.startswith("unins"):
+    # InnoSetup 卸载器命名规范：unins000.exe / unins001.exe / unins.exe 等，
+    # 严格匹配避免误伤 uninstall_test.exe 之类业务文件（原 startswith 存在误匹配）
+    if re.match(r"^unins\d*\.exe$", prog_name):
         return True
     
     if prog_name == "setup.exe" and (" /uninstall" in cmd_lower or " /remove" in cmd_lower):
@@ -715,8 +880,22 @@ def _is_uninstall_command(command: str) -> bool:
     STANDARD_UNINSTALL_NAMES = {"uninst.exe", "unins000.exe", "uninstall.exe", "uninstall_helper.exe", "uninstaller.exe"}
     if prog_name in STANDARD_UNINSTALL_NAMES:
         return True
-    
+
+    # Start-Process 包装的卸载调用（如 Start-Process -FilePath "...Uninstall.exe"）
+    if prog_name in ("start-process", "start-process.exe"):
+        import re as _uninstall_re
+        if _uninstall_re.search(r'(?:["\'])?[^"\'\\s]*unins[^"\'\\s]*\.exe', cmd_lower, _uninstall_re.IGNORECASE):
+            return True
+
     return False
+
+
+# 统一的静默卸载参数识别正则（含 /S、/silent、/verysilent、/qn、/qb、/passive 等），
+# 用于判断命令是否已是静默模式，避免重复追加静默参数。
+# 允许参数被单/双引号包裹（如 Start-Process -ArgumentList '/S'）。
+_SILENT_FLAG_RE = re.compile(
+    r"(?i)(?:^|[\s'\"])(?:['\"]*)/(?:s|silent|verysilent|quiet|qn|qn-|qb|qb!|qb-|passive)(?:['\"]*)(?=$|[\s'\";])"
+)
 
 
 def _get_silent_uninstall_command(command: str) -> str:
@@ -733,10 +912,10 @@ def _get_silent_uninstall_command(command: str) -> str:
         return command
     
     if "unins" in cmd:
-        inno_silent_patterns = ["/silent", "/verysilent"]
-        if not any(pattern in cmd for pattern in inno_silent_patterns):
-            return command + " /verysilent"
-        return command
+        # 兼容 NSIS(/S) 与 InnoSetup(/silent、/verysilent)：只要已含任一静默参数就不再追加
+        if _SILENT_FLAG_RE.search(command):
+            return command
+        return command + " /verysilent"
     
     if "setup.exe" in cmd and (" /uninstall" in cmd or " /remove" in cmd):
         setup_silent_patterns = ["/silent", "/quiet", "/qn", "/qn-", "/qb", "/passive"]
@@ -750,10 +929,9 @@ def _get_silent_uninstall_command(command: str) -> str:
         if tokens:
             prog_name = os.path.basename(tokens[0]).lower()
             if "uninstall" in prog_name and prog_name.endswith(".exe"):
-                silent_flags = ["/silent", "/S", "/quiet", "/passive", "/verysilent"]
-                existing_args = cmd
-                if not any(flag.lower() in existing_args for flag in silent_flags):
-                    return command + " /silent"
+                if _SILENT_FLAG_RE.search(command):
+                    return command
+                return command + " /silent"
     except Exception:
         pass
     
@@ -1042,8 +1220,110 @@ def verify_uninstall(program_name: str, registry_path: str = None) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# P0-1 / P0-2: 注册表写后读回验证与补偿快照辅助
+# ═══════════════════════════════════════════════════════════════
+
+def _read_registry_value_snapshot(hkey, key_path, value_name):
+    """读注册表值快照（P0-2 补偿用）。
+
+    Returns:
+        (key_exists, value_exists, value, vt)；键不存在返回 None
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_READ) as k:
+            try:
+                value, vt = winreg.QueryValueEx(k, value_name)
+                return (True, True, value, vt)
+            except FileNotFoundError:
+                return (True, False, None, None)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _restore_registry_value(hkey, key_path, value_name, old_exists, old_value, old_vt):
+    """补偿动作：恢复注册表值（P0-2）。old_exists=False 表示原值不存在→删除当前值。"""
+    import winreg
+    try:
+        if old_exists:
+            if old_vt is None:
+                old_vt = winreg.REG_SZ
+            with winreg.CreateKey(hkey, key_path) as k:
+                winreg.SetValueEx(k, value_name, 0, old_vt, old_value)
+            return f"已恢复 {key_path}\\{value_name if value_name is not None else '(默认值)'}"
+        try:
+            with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_WRITE) as k:
+                winreg.DeleteValue(k, value_name)
+            return f"已删除新增值 {key_path}\\{value_name if value_name is not None else '(默认值)'}"
+        except FileNotFoundError:
+            return f"值 {key_path}\\{value_name if value_name is not None else '(默认值)'} 已不存在，无需恢复"
+    except Exception as e:
+        raise RuntimeError(f"补偿失败: {str(e)[:200]}") from e
+
+
+def _snapshot_registry_key_tree(hkey, key_path, depth=0, max_depth=10):
+    """递归导出注册表键树快照（P0-2 删除键前备份用）。
+
+    Returns:
+        {"values": [(name, value, vt), ...], "subkeys": {sub_name: snapshot}}；失败返回 None
+    """
+    import winreg
+    if depth > max_depth:
+        return None
+    try:
+        with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_READ) as k:
+            values = []
+            for i in range(winreg.QueryInfoKey(k)[1]):
+                try:
+                    name, value, vt = winreg.EnumValue(k, i)
+                    values.append((name, value, vt))
+                except OSError:
+                    continue
+            subkeys = {}
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    sub_name = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                sub_snapshot = _snapshot_registry_key_tree(hkey, os.path.join(key_path, sub_name), depth + 1, max_depth)
+                if sub_snapshot is not None:
+                    subkeys[sub_name] = sub_snapshot
+            return {"values": values, "subkeys": subkeys}
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _restore_registry_key_tree(hkey, key_path, snapshot):
+    """补偿动作：重建注册表键树（P0-2）。"""
+    import winreg
+    if snapshot is None:
+        return f"无快照，跳过恢复 {key_path}"
+    try:
+        with winreg.CreateKey(hkey, key_path) as k:
+            for name, value, vt in snapshot.get("values", []):
+                try:
+                    winreg.SetValueEx(k, name, 0, vt, value)
+                except (OSError, TypeError):
+                    try:
+                        winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(value))
+                    except OSError:
+                        pass
+            for sub_name, sub_snapshot in snapshot.get("subkeys", {}).items():
+                _restore_registry_key_tree(hkey, os.path.join(key_path, sub_name), sub_snapshot)
+        return f"已重建注册表键 {key_path}"
+    except Exception as e:
+        raise RuntimeError(f"重建注册表键 {key_path} 失败: {str(e)[:200]}") from e
+
+
 @register_tool(timeout=30)
-def modify_registry(operation: str, key: str, value_name: str = None, value_data: str = None, value_type: str = "REG_SZ") -> str:
+def modify_registry(operation: str, key: str, value_name: str = None, value_data: str = None, value_type: str = "REG_SZ", **kwargs) -> str:
     """修改 Windows 注册表。
 
     operation: 操作类型，支持 get / set / delete
@@ -1125,18 +1405,50 @@ def modify_registry(operation: str, key: str, value_name: str = None, value_data
                 vt = winreg.REG_BINARY
                 value_data = bytes.fromhex(value_data)
 
+            # P0-2: 写前快照（补偿用，必须在 CreateKey/SetValueEx 之前抓取旧值）
+            _old = _read_registry_value_snapshot(hkey, key_path, value_name)
+            _old_exists, _old_value, _old_vt = (_old[1], _old[2], _old[3]) if _old else (False, None, None)
+
             with winreg.CreateKey(hkey, key_path) as reg_key:
                 if value_name is None:
                     winreg.SetValueEx(reg_key, None, 0, vt, value_data)
+                    # P0-1: 写后读回验证，确认实际生效（SetValueEx 不抛错 ≠ 真正写入）
+                    _readback = _read_registry_value_snapshot(hkey, key_path, None)
+                    if not _readback or not _readback[1] or _readback[2] != value_data:
+                        return json.dumps({
+                            "success": False,
+                            "message": f"写后验证失败：默认值写入未生效（期望 {value_data!r}，实际 {_readback[2] if _readback else None!r}）"
+                        }, ensure_ascii=False)
+                    # P0-2: 记录补偿动作（恢复旧值/删除新增值）
+                    side_effect_journal.record(
+                        "modify_registry",
+                        {"operation": "set", "key": key, "value_name": value_name, "value_data": value_data, "value_type": value_type},
+                        f"设置注册表默认值 {key}",
+                        lambda: _restore_registry_value(hkey, key_path, None, _old_exists, _old_value, _old_vt),
+                    )
                     return json.dumps({
                         "success": True,
-                        "message": f"注册表项默认值已设置"
+                        "message": f"注册表项默认值已设置，且读回验证通过"
                     }, ensure_ascii=False)
                 else:
                     winreg.SetValueEx(reg_key, value_name, 0, vt, value_data)
+                    # P0-1: 写后读回验证，确认实际生效
+                    _readback = _read_registry_value_snapshot(hkey, key_path, value_name)
+                    if not _readback or not _readback[1] or _readback[2] != value_data:
+                        return json.dumps({
+                            "success": False,
+                            "message": f"写后验证失败：注册表项 '{value_name}' 写入未生效（期望 {value_data!r}，实际 {_readback[2] if _readback else None!r}）"
+                        }, ensure_ascii=False)
+                    # P0-2: 记录补偿动作（恢复旧值/删除新增值）
+                    side_effect_journal.record(
+                        "modify_registry",
+                        {"operation": "set", "key": key, "value_name": value_name, "value_data": value_data, "value_type": value_type},
+                        f"设置注册表项 {key}\\{value_name}",
+                        lambda: _restore_registry_value(hkey, key_path, value_name, _old_exists, _old_value, _old_vt),
+                    )
                     return json.dumps({
                         "success": True,
-                        "message": f"注册表项 '{value_name}' 已设置"
+                        "message": f"注册表项 '{value_name}' 已设置，且读回验证通过"
                     }, ensure_ascii=False)
 
         elif operation == "delete":
@@ -1151,13 +1463,33 @@ def modify_registry(operation: str, key: str, value_name: str = None, value_data
                 return json.dumps({"success": False, "message": "不支持的注册表根键"})
 
             if value_name:
+                # P0-2: 写前快照（补偿用）
+                _old = _read_registry_value_snapshot(hkey, key_path, value_name)
+                _old_exists, _old_value, _old_vt = (_old[1], _old[2], _old[3]) if _old else (False, None, None)
                 with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_WRITE) as reg_key:
                     winreg.DeleteValue(reg_key, value_name)
+                # P0-1: 删除后读回验证，确认值确实不存在
+                _readback = _read_registry_value_snapshot(hkey, key_path, value_name)
+                if _readback is not None and _readback[0] and _readback[1]:
+                    return json.dumps({
+                        "success": False,
+                        "message": f"删除后验证失败：值 '{value_name}' 仍存在"
+                    }, ensure_ascii=False)
+                # P0-2: 记录补偿动作（恢复原值）
+                side_effect_journal.record(
+                    "modify_registry",
+                    {"operation": "delete", "key": key, "value_name": value_name},
+                    f"删除注册表值 {key}\\{value_name}",
+                    lambda: _restore_registry_value(hkey, key_path, value_name, _old_exists, _old_value, _old_vt),
+                )
                 return json.dumps({
                     "success": True,
-                    "message": f"值已删除"
+                    "message": f"值已删除，且读回验证通过"
                 }, ensure_ascii=False)
             else:
+                # P0-2: 删除前递归导出整棵键树快照（补偿用）
+                _old_tree = _snapshot_registry_key_tree(hkey, key_path)
+
                 def _delete_key_recursive(base_hkey, base_path, depth=0):
                     if depth > 10:
                         return False
@@ -1177,9 +1509,23 @@ def modify_registry(operation: str, key: str, value_name: str = None, value_data
 
                 success = _delete_key_recursive(hkey, key_path)
                 if success:
+                    # P0-1: 删除后读回验证，确认键确实不存在
+                    _readback = _read_registry_value_snapshot(hkey, key_path, None)
+                    if _readback is not None:
+                        return json.dumps({
+                            "success": False,
+                            "message": f"删除后验证失败：键仍存在 {key}"
+                        }, ensure_ascii=False)
+                    # P0-2: 记录补偿动作（重建整棵键树）
+                    side_effect_journal.record(
+                        "modify_registry",
+                        {"operation": "delete", "key": key, "value_name": value_name},
+                        f"递归删除注册表键 {key}",
+                        lambda: _restore_registry_key_tree(hkey, key_path, _old_tree),
+                    )
                     return json.dumps({
                         "success": True,
-                        "message": f"键已删除"
+                        "message": f"键已删除，且读回验证通过"
                     }, ensure_ascii=False)
                 else:
                     return json.dumps({
@@ -1576,3 +1922,42 @@ def find_program(program_name: str) -> str:
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "message": f"查找程序失败: {str(e)}", "programs": []}, ensure_ascii=False)
+
+
+@register_tool(timeout=30)
+def undo_side_effect(operation: str = "undo_last") -> str:
+    """撤销/回滚副作用工具操作（P0-2 显式回滚入口）。
+
+    副作用工具（如 modify_registry 修改注册表）执行成功后，会记录
+    "操作日志+补偿动作"（含原始值快照）。本工具提供两种回滚方式：
+
+    operation:
+      - "undo_last": 撤销最近一次有副作用的操作（推荐，精确回滚单步）
+      - "rollback_all": 回滚当前会话已记录的全部副作用操作（按逆序，后发生先撤销）
+
+    返回：JSON 格式的操作结果
+    """
+    try:
+        if operation == "rollback_all":
+            results = side_effect_journal.rollback_all()
+            return json.dumps({
+                "success": True,
+                "message": f"已回滚 {len(results)} 条副作用操作",
+                "results": results
+            }, ensure_ascii=False, default=str)
+        result = side_effect_journal.undo_last()
+        if result is None:
+            return json.dumps({
+                "success": False,
+                "message": "没有可撤销的副作用操作记录"
+            }, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "message": f"已撤销: {result.get('description', '')}",
+            "result": result
+        }, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "message": f"撤销失败: {str(e)[:200]}"
+        }, ensure_ascii=False)

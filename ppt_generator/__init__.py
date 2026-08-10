@@ -9,6 +9,6 @@ import tempfile, os
 SLIDE_W = 1920
 SLIDE_H = 1080
 
-DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
-OUTPUT_DIR = Path(os.environ.get("MYAGENT_OUTPUT", os.path.join(DATA_DIR, "workspace")))
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
+OUTPUT_DIR = Path(os.environ.get("SMARTDESKTOP_OUTPUT", os.path.join(DATA_DIR, "workspace")))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

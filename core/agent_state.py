@@ -24,7 +24,7 @@ from tools import (build_dynamic_system_prompt, build_tools_param, match_domains
 from memory import (log_session_turn, log_trace, build_context_messages,
                     get_layered_memory, clear_session_messages, update_last_turn)
 from utils.error_mapper import translate_error
-from config.settings import CONTEXT_ROUTER_ENABLED
+from config.settings import CONTEXT_ROUTER_ENABLED, DEEPSEEK_BASE_URL, OLLAMA_HOST
 from core.progress_controller import ProgressEvaluator
 from core.message_builder import build_system_prompt
 from core.streaming import inline_compress
@@ -37,7 +37,7 @@ try:
     from memory.config import DATA_DIR
     CHECKPOINT_DB_PATH = os.path.join(DATA_DIR, 'checkpoints.db')
 except ImportError:
-    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
     CHECKPOINT_DB_PATH = os.path.join(DATA_DIR, 'checkpoints.db')
 
 LOGS_DIR = os.path.dirname(CHECKPOINT_DB_PATH)
@@ -500,7 +500,7 @@ def inject_memory_if_needed(messages, layered_cache):
     for _m in messages:
         if _m.get("role") == "system":
             _c = _m.get("content", "") or ""
-            if "[长期记忆]" in _c or "[近期交互]" in _c:
+            if "[长期记忆]" in _c or "[近期交互]" in _c or "[历史摘要]" in _c:
                 return messages
 
     result = list(messages)
@@ -528,6 +528,23 @@ def inject_memory_if_needed(messages, layered_cache):
         except Exception:
             lightweight_json = json.dumps({"error": "memory serialization failed"})
         memory_parts.append(f"[近期交互]\n{lightweight_json}")
+
+    # 历史摘要：超三轮摘要（结构化 JSON 或旧自然语言），修复未注入缺陷
+    older_summary = layered_cache.get("older_summary")
+    if older_summary:
+        switch_ref = layered_cache.get("switch_ref")
+        if switch_ref:
+            _sim = switch_ref.get("similarity", "?")
+            _terms = switch_ref.get("distinguishing", []) or []
+            _terms_str = "、".join(_terms[:5]) if _terms else "（无显著区分词）"
+            memory_parts.append(
+                "[历史上下文参考]\n"
+                f"以下为上一话题的历史摘要，与本任务相似度 {_sim}，区分词：{_terms_str}。\n"
+                "仅当与当前任务相关时引用；不相关请忽略，以当前任务为准。\n"
+                "引用旧任务信息只作背景参考，严禁直接复用旧路径/旧参数执行操作，"
+                "涉及文件或系统操作必须重新确认。"
+            )
+        memory_parts.append(f"[历史摘要]\n{older_summary}")
 
     if memory_parts:
         result.insert(1, {
@@ -1169,6 +1186,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
     consecutive_empty_turns = 0
     final_reply_saved = False
     start_step = 0
+    persona_mode = ""  # BUG-FIX: 恢复分支不赋值会导致 L1476 build_system_prompt 抛 UnboundLocalError
 
     try:
         from llm_client import get_available_models
@@ -1176,7 +1194,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
         provider = model_choice["provider"]
         model_name = model_choice["model"]
         temperature = model_choice.get("temperature", 0.75)
-        base_url = model_choice.get("base_url", "https://api.deepseek.com")
+        base_url = model_choice.get("base_url", DEEPSEEK_BASE_URL)
 
         known_models = [m["model"] for m in get_available_models()]
         known_providers = {m["model"]: m["provider"] for m in get_available_models()}
@@ -1208,7 +1226,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
             provider = model_choice["provider"]
             model_name = model_choice["model"]
             model_id = model_choice.get("id")
-            base_url = model_choice.get("base_url", "http://localhost:11434")
+            base_url = model_choice.get("base_url", OLLAMA_HOST)
 
         default_model = model_name
         default_provider = provider
@@ -1250,9 +1268,10 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
 
         try:
             if resumed_checkpoint:
-                yield engine.streamer.emit_step(f"正在恢复任务，上次执行到第 {resumed_checkpoint.turn} 轮")
+                yield engine.streamer.emit_step(f"正在恢复任务，上次执行到第 {resumed_checkpoint.current_step} 轮")
                 engine.completed_steps = resumed_checkpoint.completed_steps
                 remaining_steps = resumed_checkpoint.remaining_steps
+                engine._is_first_recovery_turn = True
 
                 # 保留 build_context_messages 调用以触发增量压缩，但结果不再用于子轮次拼接
                 build_context_messages(engine.session_id, is_continuation=True)
@@ -1264,6 +1283,14 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
 
                 full_system = build_dynamic_system_prompt(domains=_matched_domains, persona_mode="")
 
+                # 检测上一轮是否因确认超时而中断，注入信号让 LLM 感知
+                _confirm_timeout_note = ""
+                if resumed_checkpoint.progress_summary and "确认超时" in str(resumed_checkpoint.progress_summary):
+                    _confirm_timeout_note = (
+                        "\n\n注意：上一轮操作在等待用户确认时超时，确认请求已过期、任务被取消。"
+                        "若用户表示愿意继续，请重新发起确认或继续执行后续步骤，不要重复已完成的工作。"
+                    )
+
                 resume_prompt = f"""【任务恢复】以下是之前未完成任务的状态，请从第{resumed_checkpoint.turn+1}步继续执行：
 
 已完成步骤：
@@ -1273,7 +1300,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
 {json.dumps(remaining_steps, ensure_ascii=False)}
 
 当前进度：{resumed_checkpoint.progress_summary}
-
+{_confirm_timeout_note}
 请继续执行后续步骤，不要重复已完成的工作。"""
 
                 full_system = full_system + "\n\n" + resume_prompt
@@ -1360,7 +1387,9 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
             get_logger().info(f"从检查点恢复，轮次设为: {state.turn}，从第 {start_step} 步继续",
                              trace_id=engine.trace_id, session_id=engine.session_id)
         else:
-            start_step = state.turn
+            # 每轮独立计数：start_step 固定 0，MAX_TURNS=15 是本轮推理预算，
+            # 不随会话累计 turn 递增而递减（修复第 N 问可用步数=15-N 的枯竭问题）
+            start_step = 0
 
         # save_ai_reply 已移除 —— AI 消息持久化收敛为前端 saveSessionToBackend 单一入口
         _cache = {}
@@ -1391,7 +1420,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
         if switch_result["is_switch"]:
             get_logger().info(
                 f"[话题切换] 旧任务 → 新任务: '{user_message[:50]}'，"
-                f"清空所有旧上下文"
+                f"清空旧消息，保留摘要+长期记忆供参考"
             )
 
             # 1. 清空引擎内存状态
@@ -1423,13 +1452,21 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
                 except (json.JSONDecodeError, TypeError):
                     layered_cache["recent_structured"] = ""
 
-            # 3b. 清理 long_term（移除任务相关记忆，只保留用户偏好）
-            if layered_cache.get("long_term"):
-                layered_cache["long_term"] = ""
-
-            # 3c. 清理 older_summary
+            # 3b. 保留 long_term（方案A：不清空，保留用户偏好与任务相关记忆供参考）
+            # 3c. 保留 older_summary 但截断 ≤800 字符（方案A：不清空，新任务可作背景参考）
             if layered_cache.get("older_summary"):
-                layered_cache["older_summary"] = ""
+                layered_cache["older_summary"] = _truncate_str(layered_cache["older_summary"], 800)
+
+            # 写入切换参考标记：注入端据此附加边界指令（相似度/区分词/只读参考约束）
+            try:
+                _switch_sim = round(float(switch_result.get("norm_similarity", 0.0)), 2)
+            except (TypeError, ValueError):
+                _switch_sim = 0.0
+            _switch_terms = switch_result.get("new_unique_terms", []) or []
+            layered_cache["switch_ref"] = {
+                "similarity": _switch_sim,
+                "distinguishing": [str(t) for t in _switch_terms[:5]],
+            }
 
             # 4. 用新域重建 system prompt
             full_system = build_dynamic_system_prompt(
@@ -1484,6 +1521,25 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
                 conversation_messages[0]["content"] = _system_content
             else:
                 conversation_messages.insert(0, {"role": "system", "content": _system_content})
+            # 恢复路径也必须注入当前用户消息（含确认超时/继续信号），
+            # 否则用户新指令对 LLM 不可见，导致"重新发起任务失忆/重复澄清"
+            confirmation_signal = _detect_confirmation_signal(layered_cache, user_message)
+            # 确认超时恢复场景：checkpoint 标记了确认超时，且用户消息为继续/肯定回复时，
+            # 注入"请重新发起确认"信号，避免 LLM 重复澄清或误解已确认
+            if not confirmation_signal and resumed_checkpoint.progress_summary and "确认超时" in str(resumed_checkpoint.progress_summary):
+                if _is_user_confirmation(user_message):
+                    confirmation_signal = ("[系统] 检测到您对上一轮确认请求的肯定回复，但该请求已超时过期。"
+                                           "请重新发起确认流程或直接继续执行当前任务。")
+            if confirmation_signal:
+                get_logger().info(
+                    f"[确认信号] 恢复路径检测到用户确认/继续指令，注入信号到用户消息",
+                    trace_id=engine.trace_id, session_id=engine.session_id,
+                )
+            initial_user_content = build_user_content(engine, user_message, _thinking_summaries, confirmation_signal)
+            conversation_messages.append({
+                "role": "user",
+                "content": initial_user_content
+            })
         else:
             conversation_messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": _system_content}

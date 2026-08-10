@@ -15,7 +15,7 @@ import threading
 import traceback
 import logging
 
-# 云端 DeepSeek（deepseek-v4-flash，API Key 取自环境变量 API_KEY / MYAGENT_API_KEY）
+# 云端 DeepSeek（deepseek-v4-flash，API Key 取自环境变量 API_KEY / SMARTDESKTOP_API_KEY）
 MODEL_CHOICE = {
     "provider": "deepseek",
     "model": "deepseek-v4-flash",
@@ -34,7 +34,7 @@ def _ensure_target_model_available():
 
     同时把目标模型注册到配置层（get_model_from_cache / get_base_url），
     让 stream_llm_response / ai_concat 按 model_id 查到正确的云端 provider 与 base_url。
-    API Key 由 llm_client.get_api_key 从环境变量 API_KEY / MYAGENT_API_KEY 读取。
+    API Key 由 llm_client.get_api_key 从环境变量 API_KEY / SMARTDESKTOP_API_KEY 读取。
     """
     import llm_client as _lc
 

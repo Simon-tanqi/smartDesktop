@@ -151,7 +151,7 @@ def create_presentation(file_path: str, config: PresentationConfig = None):
         "slides": [
             {
                 "type": "title",
-                "title": "欢迎使用MyAgent",
+                "title": "欢迎使用smartDesktop",
                 "subtitle": "PowerPoint演示文稿自动生成"
             },
             {

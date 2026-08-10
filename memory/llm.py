@@ -7,6 +7,7 @@ import json
 import threading
 import logging
 from memory.config import COMPRESS_MODEL_CONFIG, EXTRACT_MODEL_CONFIG, SUMMARY_MODEL_CONFIG
+from config.settings import DEFAULT_OLLAMA_BASE_URL
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -57,7 +58,7 @@ def _ollama_call(model_config, messages):
     """调用 Ollama API。"""
     try:
         import requests
-        url = model_config.get("base_url", "http://localhost:11434/v1").rstrip("/")
+        url = model_config.get("base_url", DEFAULT_OLLAMA_BASE_URL).rstrip("/")
         model_name = model_config.get("model_name", "deepseek-r1:7b")
 
         resp = requests.post(

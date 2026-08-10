@@ -1,19 +1,8 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: ef5b15bc948ed1a80cab91ca175eedba_2b2f501b8e9311f196d8525400f8a581
-    ReservedCode1: GkQ/fY7bzFHCu8YqAKZYUY5xZApP8KAB0W44p14xK7QUEFDOUwXAIMMN4NAxnRSoKHKP8hOBc+doyQDgoBwJECklofWm6jxQUvzL+xKSiyOxdOlDyINBEj4A+FMFZPikdjqUjOfKiShbwxqtQMT1eehpVNObpPZEi7zYgHQ+7kG8npGrRH2OzCGiLPQ=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: ef5b15bc948ed1a80cab91ca175eedba_2b2f501b8e9311f196d8525400f8a581
-    ReservedCode2: GkQ/fY7bzFHCu8YqAKZYUY5xZApP8KAB0W44p14xK7QUEFDOUwXAIMMN4NAxnRSoKHKP8hOBc+doyQDgoBwJECklofWm6jxQUvzL+xKSiyOxdOlDyINBEj4A+FMFZPikdjqUjOfKiShbwxqtQMT1eehpVNObpPZEi7zYgHQ+7kG8npGrRH2OzCGiLPQ=
----
-
-# MyAgent 四任务端到端验证报告
+# smartDesktop 四任务端到端验证报告
 
 > 生成时间：2026-08-03 00:55:16
 > **验证模式：方案B（离线模拟）**
-> 项目路径：D:\PyCharm Project\MyAgent
+> 项目路径：<项目根目录>
 
 > [!NOTE]
 > 方案A（真实LLM调用）因 API 请求超时无法完成，故切换为方案B。
@@ -83,7 +72,7 @@ AIGC:
 **system[1]** (271 chars):
 ```
 [长期记忆]
-测试长期记忆：MyAgent 上下文拼接验证场景
+测试长期记忆：smartDesktop 上下文拼接验证场景
 
 [近期交互]
 {
@@ -153,7 +142,7 @@ AIGC:
 **system[1]** (271 chars):
 ```
 [长期记忆]
-测试长期记忆：MyAgent 上下文拼接验证场景
+测试长期记忆：smartDesktop 上下文拼接验证场景
 
 [近期交互]
 {
@@ -229,7 +218,7 @@ AIGC:
 **system[1]** (271 chars):
 ```
 [长期记忆]
-测试长期记忆：MyAgent 上下文拼接验证场景
+测试长期记忆：smartDesktop 上下文拼接验证场景
 
 [近期交互]
 {
@@ -250,7 +239,7 @@ AIGC:
 
 ### 任务4：Excel透视表分析
 
-- **用户输入**：对数据文件 C:\Users\username\AppData\Roaming\MyAgent\workspace\kc_train.xlsx 进行透视表分析并生成图表
+- **用户输入**：对数据文件 <用户目录>\AppData\Roaming\smartDesktop\workspace\kc_train.xlsx 进行透视表分析并生成图表
 - **模拟工具调用次数**：2
 - **构建消息总数**：23
 - **结果**：成功
@@ -307,7 +296,7 @@ AIGC:
 **system[1]** (271 chars):
 ```
 [长期记忆]
-测试长期记忆：MyAgent 上下文拼接验证场景
+测试长期记忆：smartDesktop 上下文拼接验证场景
 
 [近期交互]
 {
@@ -330,7 +319,7 @@ AIGC:
 
 ## 3. 日志回溯索引
 
-日志目录：`C:\Users\username\AppData\Roaming\MyAgent\logs`
+日志目录：`<用户目录>\AppData\Roaming\smartDesktop\logs`
 
 离线模拟模式未产生新的日志条目。
 
@@ -382,7 +371,7 @@ DeepSeek API 返回极慢或网络链路不通。已确认 `API_KEY` 环境变�
 
 ## 6. 附件
 
-- 验证脚本（方案B）：`D:\PyCharm Project\MyAgent\test\simulate_four_tasks.py`
-- 报告路径：`D:\PyCharm Project\MyAgent\docs\four_tasks_validation_report.md`
-- 项目路径：`D:\PyCharm Project\MyAgent`
+- 验证脚本（方案B）：`<项目根目录>\test\simulate_four_tasks.py`
+- 报告路径：`<项目根目录>\docs\four_tasks_validation_report.md`
+- 项目路径：`<项目根目录>`
 *（内容由AI生成，仅供参考）*

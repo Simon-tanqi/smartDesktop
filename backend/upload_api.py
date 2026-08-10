@@ -15,7 +15,7 @@ from flask import Blueprint, request, jsonify
 try:
     from config.settings import DATA_DIR
 except ImportError:
-    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+    DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
 
 upload_bp = Blueprint("upload", __name__)
 

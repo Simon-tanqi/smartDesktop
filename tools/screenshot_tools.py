@@ -7,13 +7,19 @@ from pathlib import Path
 
 from . import register_tool
 
+try:
+    from config.settings import AGENT_HOST, AGENT_PORT
+except ImportError:
+    AGENT_HOST = '127.0.0.1'
+    AGENT_PORT = 8765
+
 
 def _get_screenshot_dir():
     """截图保存目录"""
     try:
         from config.settings import DATA_DIR
     except ImportError:
-        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
     ss_dir = Path(DATA_DIR) / "workspace" / "screenshots"
     os.makedirs(ss_dir, exist_ok=True)
     return str(ss_dir)
@@ -53,7 +59,7 @@ def take_screenshot(left: int = None, top: int = None,
         img.save(filepath, "PNG")
 
         file_size_kb = os.path.getsize(filepath) / 1024
-        img_md = f"![截图](http://localhost:8765/screenshots/{filename})"
+        img_md = f"![截图](http://{AGENT_HOST}:{AGENT_PORT}/screenshots/{filename})"
         return json.dumps({
             "success": True,
             "file_path": filepath,

@@ -1393,7 +1393,9 @@
 		async function saveSessionToBackend(sessionId) {
 			try {
 				const sessionData = sessions[sessionId];
-				const allMessages = sessionData.messages.filter(m => m.text && m.text.trim());
+				const allMessages = sessionData.messages
+					.filter(m => m.text && m.text.trim())
+					.map(m => m.timestamp ? m : { ...m, timestamp: new Date().toISOString() });
 				await fetch('/api/sessions', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },

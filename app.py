@@ -26,6 +26,7 @@ for _name in _tk_patched:
 
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
+from config.settings import AGENT_PORT, AGENT_HOST, AGENT_CORS_ORIGINS
 
 from backend.chat import chat_bp
 from backend.upload_api import upload_bp
@@ -39,14 +40,14 @@ logger = get_logger()
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
-_PORT = int(os.environ.get('AGENT_PORT', '8765'))
-_HOST = os.environ.get('AGENT_HOST', '127.0.0.1')
+_PORT = AGENT_PORT
+_HOST = AGENT_HOST
 
 
 class Config:
     PORT = _PORT
     HOST = _HOST
-    CORS_ORIGINS = os.environ.get('AGENT_CORS_ORIGINS', 'http://localhost:8765,http://127.0.0.1:8765').split(',')
+    CORS_ORIGINS = AGENT_CORS_ORIGINS
     RATELIMIT_STORAGE_URI = os.environ.get('AGENT_RATELIMIT_STORAGE', 'memory://')
     RATELIMIT_ENABLED = os.environ.get('AGENT_RATELIMIT_ENABLED', 'true').lower() == 'true'
     DEBUG = os.environ.get('AGENT_DEBUG', 'false').lower() == 'true'
@@ -203,7 +204,7 @@ try:
     for _m in _models:
         logger.info(f"  - id={_m.get('id')!r} display={_m.get('display')!r} provider={_m.get('provider')!r} model={_m.get('model')!r}")
     import os
-    _env_key = os.environ.get("API_KEY", "") or os.environ.get("MYAGENT_API_KEY", "")
+    _env_key = os.environ.get("API_KEY", "") or os.environ.get("SMARTDESKTOP_API_KEY", "")
     _env_model = os.environ.get("API_MODEL", "")
     logger.info(f"[STARTUP] 环境变量 API_KEY={'已设置' if _env_key else '未设置'} API_MODEL={_env_model!r}")
 except Exception as e:

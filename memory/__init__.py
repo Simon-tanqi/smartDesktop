@@ -1,5 +1,5 @@
 """
-MyAgent 记忆系统 — 对外统一 API
+smartDesktop 记忆系统 — 对外统一 API
 
 v4：APP_DIR/DATA_DIR 分离，per-session 短期记忆，Ollama 本地模型压缩/提取，
     自定义技能目录支持。

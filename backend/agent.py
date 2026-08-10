@@ -160,6 +160,20 @@ def run_agent(
         # 异常兜底：记录日志并 yield 错误事件
         import traceback
         logger.error(f"Agent 执行异常: {e}\n{traceback.format_exc()}", trace_id=trace_id, session_id=session_id)
+        # 异常消息落库，确保刷新页面后聊天记录仍可见（BUG-FIX: 原实现仅 SSE 推送不落库）
+        # 前端 renderChatHistory 仅渲染 chat/text/final_answer/think，故用 assistant+chat 而非 error
+        try:
+            if session_id:
+                from memory import append_session_message
+                append_session_message(
+                    session_id, "assistant",
+                    f"任务执行异常，请重试。错误详情：{e}",
+                    trace_id=trace_id, user_id=user_id,
+                    skip_compress=True, msg_type="chat",
+                )
+        except Exception as _persist_err:
+            logger.warning(f"异常消息落库失败（不影响主流程）: {_persist_err}",
+                           trace_id=trace_id, session_id=session_id)
         try:
             yield f'data: {{"type": "error", "text": "任务执行异常，请重试。"}}\n\n'
         except Exception:

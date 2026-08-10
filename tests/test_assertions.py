@@ -20,7 +20,7 @@ import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
-APP_LOG = os.path.join(os.environ.get("APPDATA", ""), "MyAgent", "logs", "llm_requests.log")
+APP_LOG = os.path.join(os.environ.get("APPDATA", ""), "smartDesktop", "logs", "llm_requests.log")
 
 
 class AssertionResult:
@@ -165,7 +165,7 @@ def _chrome_exe_exists(text):
     for pat in (
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Users\username\AppData\Local\Google\Chrome\Application\chrome.exe",
+        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
     ):
         if os.path.exists(pat):
             return True

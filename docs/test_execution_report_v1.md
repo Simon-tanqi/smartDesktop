@@ -3,7 +3,7 @@
 **生成时间**: 2026-08-05 10:25 GMT+8  
 **测试框架**: Tank Smart Test Suite  
 **测试运行 ID**: `run_20260805_001525`  
-**执行引擎**: MyAgent + Ollama Qwen3.5-9B（Q4_K_M）  
+**执行引擎**: smartDesktop + Ollama Qwen3.5-9B（Q4_K_M）  
 **测试用例数**: 55（文档定义） / 55（实际执行）
 
 ---
@@ -276,4 +276,4 @@ tool_calls = 0
 
 ---
 
-*报告生成: Tank Smart Diagnostic Tool | MyAgent + Ollama Qwen3.5-9B*
+*报告生成: Tank Smart Diagnostic Tool | smartDesktop + Ollama Qwen3.5-9B*

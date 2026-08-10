@@ -108,7 +108,7 @@ def web_download(url: str, output_dir: str = None, **kwargs):
     try:
         from config.settings import DATA_DIR
     except ImportError:
-        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
     workspace_dir = os.path.join(DATA_DIR, "workspace")
 
     # 确定输出目录并进行路径安全检查

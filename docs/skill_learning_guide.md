@@ -33,7 +33,7 @@
 **Agent**：✅ 经验内化完成！
 
 技能名称：**excel_department_stats**
-保存路径：`D:\PyCharm Project\MyAgent\prompts\skills\excel_department_stats.md`
+保存路径：`<项目根目录>\prompts\skills\excel_department_stats.md`
 
 你可以查看并修改这个技能文件，下次处理类似任务时我会自动使用这个技能。
 
@@ -48,7 +48,7 @@
 **Agent**：✅ 经验内化完成！
 
 技能名称：**batch_rename_files**
-保存路径：`D:\PyCharm Project\MyAgent\prompts\skills\batch_rename_files.md`
+保存路径：`<项目根目录>\prompts\skills\batch_rename_files.md`
 
 ## 技能文件格式
 

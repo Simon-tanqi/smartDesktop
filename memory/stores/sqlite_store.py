@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import datetime
+import time
 from contextlib import contextmanager
 from memory.config import (
     TRACE_DB, OPERATION_LOG_DB,
@@ -40,6 +41,7 @@ class _ThreadLocalPool(threading.local):
                     with _global_conn_lock:
                         if path in _global_conns and conn in _global_conns[path]:
                             _global_conns[path].remove(conn)
+                        _conn_locks.pop(conn, None)
                 except Exception:
                     pass  # 解释器关闭时锁可能已失效
             self.conn_pool.clear()
@@ -52,6 +54,47 @@ _tl_pool = _ThreadLocalPool()
 # 全局连接注册表：跟踪所有线程持有的连接，用于跨线程关闭
 _global_conn_lock = threading.Lock()
 _global_conns = {}  # db_path -> list of sqlite3.Connection
+
+# 连接级互斥锁：conn -> RLock
+# 串行化"连接使用（execute/commit）"与"跨线程关闭（delete_chat_session）"，
+# 避免在其它线程仍持有连接时并发 close 导致 sqlite3 C 层访问冲突
+_conn_locks = {}
+
+
+def _get_conn_lock(conn):
+    """获取连接级互斥锁（懒创建）。"""
+    with _global_conn_lock:
+        lock = _conn_locks.get(conn)
+        if lock is None:
+            lock = threading.RLock()
+            _conn_locks[conn] = lock
+        return lock
+
+
+def _drop_conn_lock(conn):
+    """连接关闭后移除其锁条目，避免泄漏引用。"""
+    with _global_conn_lock:
+        _conn_locks.pop(conn, None)
+
+# 删除中路径标记：delete_chat_session 删除目录期间置位，
+# 防止其它线程在 rmtree 窗口内重新打开连接导致 WinError 32
+_deleting_paths = set()
+
+
+def _wait_deleting_done(db_path, timeout=2.0):
+    """等待 db_path 的删除中标记解除。
+
+    删除会话目录期间，其它线程可能通过 _get_conn 重新打开连接；
+    此函数让它们短暂等待删除完成，避免在 rmtree 窗口内重新持有句柄。
+    返回 True 表示可以继续；False 表示超时仍处于删除中。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _global_conn_lock:
+            if db_path not in _deleting_paths:
+                return True
+        time.sleep(0.05)
+    return False
 
 
 @contextmanager
@@ -71,34 +114,43 @@ def _get_conn(db_path, row_factory=False):
             # 检查现有连接的健康状态
             if db_path in pool:
                 conn = pool[db_path]
-                try:
-                    conn.execute("SELECT 1").fetchone()
-                    access.remove(db_path)
-                except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+                conn_lock = _get_conn_lock(conn)
+                with conn_lock:
                     try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    del pool[db_path]
-                    if db_path in access:
+                        conn.execute("SELECT 1").fetchone()
                         access.remove(db_path)
-                    with _global_conn_lock:
-                        if db_path in _global_conns and conn in _global_conns[db_path]:
-                            _global_conns[db_path].remove(conn)
-                    conn = None
+                    except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        del pool[db_path]
+                        if db_path in access:
+                            access.remove(db_path)
+                        with _global_conn_lock:
+                            if db_path in _global_conns and conn in _global_conns[db_path]:
+                                _global_conns[db_path].remove(conn)
+                        _drop_conn_lock(conn)
+                        conn = None
             
             if conn is None:
+                if not _wait_deleting_done(db_path):
+                    raise sqlite3.OperationalError(
+                        f"database is being deleted: {db_path}")
                 if len(pool) >= _MAX_CONNS_PER_THREAD:
                     oldest = access.pop(0)
                     oldest_conn = pool[oldest]
-                    try:
-                        oldest_conn.close()
-                    except Exception:
-                        pass
+                    oldest_conn_lock = _get_conn_lock(oldest_conn)
+                    with oldest_conn_lock:
+                        try:
+                            oldest_conn.close()
+                        except Exception:
+                            pass
                     del pool[oldest]
                     with _global_conn_lock:
                         if oldest in _global_conns and oldest_conn in _global_conns[oldest]:
                             _global_conns[oldest].remove(oldest_conn)
+                    _drop_conn_lock(oldest_conn)
                 
                 print(f"[DEBUG] Opening SQLite: {db_path}")
                 print(f"[DEBUG] Exists: {os.path.exists(db_path)}")
@@ -136,7 +188,9 @@ def _get_conn(db_path, row_factory=False):
                 raise
     
     try:
-        yield conn
+        conn_lock = _get_conn_lock(conn)
+        with conn_lock:
+            yield conn
     finally:
         if conn:
             try:
@@ -576,31 +630,55 @@ def delete_chat_session(session_id):
     sess_dir = get_session_dir(session_id)
     db_path = get_session_messages_db(session_id)
     sum_db_path = get_session_summaries_db(session_id)
+    target_paths = {db_path, sum_db_path}
 
-    # 第一步：通过全局注册表关闭所有线程持有的相关连接
-    for path in [db_path, sum_db_path]:
+    # 第一步：标记删除中，阻止其它线程在删除窗口内重新打开连接
+    with _global_conn_lock:
+        _deleting_paths.update(target_paths)
+
+    try:
+        # 第二步：通过全局注册表关闭所有线程持有的相关连接
+        # （-wal/-shm 文件句柄随 conn.close() 一并释放）
+        # 每个连接先取连接级锁等待使用者退出，再关闭，避免并发 close 崩溃
+        for path in target_paths:
+            with _global_conn_lock:
+                conns_to_close = _global_conns.pop(path, [])[:]
+            for conn in conns_to_close:
+                conn_lock = _get_conn_lock(conn)
+                with conn_lock:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                _drop_conn_lock(conn)
+
+        # 第三步：清理当前线程本地池中的残留，保持注册表一致性
+        for path in target_paths:
+            if path in _tl_pool.conn_pool:
+                conn = _tl_pool.conn_pool[path]
+                conn_lock = _get_conn_lock(conn)
+                with conn_lock:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                _drop_conn_lock(conn)
+                del _tl_pool.conn_pool[path]
+                while path in _tl_pool.access:
+                    _tl_pool.access.remove(path)
+
+        # 第四步：删除目录，带重试窗口兜底瞬态占用（0.5s x 3）
+        if os.path.exists(sess_dir):
+            for attempt in range(3):
+                shutil.rmtree(sess_dir, ignore_errors=True)
+                if not os.path.exists(sess_dir):
+                    break
+                if attempt < 2:
+                    time.sleep(0.5)
+    finally:
+        # 第五步：解除删除标记
         with _global_conn_lock:
-            conns_to_close = _global_conns.pop(path, [])[:]
-        for conn in conns_to_close:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    # 第二步：清理当前线程本地池中的残留
-    for path in [db_path, sum_db_path]:
-        if path in _tl_pool.conn_pool:
-            try:
-                _tl_pool.conn_pool[path].close()
-            except Exception:
-                pass
-            del _tl_pool.conn_pool[path]
-            if path in _tl_pool.access:
-                _tl_pool.access.remove(path)
-
-    # 第三步：删除目录
-    if os.path.exists(sess_dir):
-        shutil.rmtree(sess_dir, ignore_errors=True)
+            _deleting_paths.difference_update(target_paths)
 
 
 def clear_session_messages(session_id: str, keep_system: bool = True):

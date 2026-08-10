@@ -18,9 +18,10 @@ import keyring
 
 from core.streaming import parse_reasoning_trace, _build_context_memory_summary, strip_code_blocks, inline_compress, strip_temp_system_messages
 from utils.error_mapper import translate_error
+from config.settings import DEEPSEEK_BASE_URL, OLLAMA_HOST, DEEPSEEK_MODEL_NAMES
 
-DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
-KEYRING_SERVICE = "MyAgent"
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
+KEYRING_SERVICE = "smartDesktop"
 KEYRING_USERNAME = "api_key"
 
 _KEYRING_AVAILABLE = None
@@ -120,7 +121,7 @@ def _try_keyring_set(api_key, model_id=None):
 
 def load_config():
     """加载配置:模型配置从 models.json 读取,API Key 从环境变量读取"""
-    config = {"backend": "deepseek", "model": "deepseek-chat", "models": {}, "base_url": "https://api.deepseek.com"}
+    config = {"backend": "deepseek", "model": "deepseek-chat", "models": {}, "base_url": DEEPSEEK_BASE_URL}
 
     # 从 models.json 读取模型配置
     try:
@@ -134,7 +135,7 @@ def load_config():
                     config["models"][m_id] = {
                         "provider": m.get("provider", "deepseek"),
                         "model": m.get("model", "deepseek-chat"),
-                        "base_url": m.get("base_url", "https://api.deepseek.com"),
+                        "base_url": m.get("base_url", DEEPSEEK_BASE_URL),
                         "api_version": m.get("api_version", "v1"),
                         "temperature": m.get("temperature", DEFAULT_TEMPERATURE),
                         "api_key": m.get("api_key", ""),
@@ -150,7 +151,7 @@ def load_config():
         logger.warning(f"加载 models.json 失败: {e}")
 
     # API Key 仅从环境变量读取
-    env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY")
+    env_key = os.environ.get("SMARTDESKTOP_API_KEY") or os.environ.get("API_KEY")
     if env_key:
         config["api_key"] = env_key
 
@@ -161,8 +162,8 @@ def _load_config():
     """加载配置(每次重新读取,不缓存,支持运行时 env 覆盖)"""
     config = load_config()
     # 环境变量覆盖(运行时可能变化)
-    if os.environ.get("MYAGENT_API_KEY"):
-        config["api_key"] = os.environ["MYAGENT_API_KEY"]
+    if os.environ.get("SMARTDESKTOP_API_KEY"):
+        config["api_key"] = os.environ["SMARTDESKTOP_API_KEY"]
     elif os.environ.get("API_KEY"):
         config["api_key"] = os.environ["API_KEY"]
     if os.environ.get("API_BASE_URL"):
@@ -179,7 +180,7 @@ def get_config():
 def get_api_key(model_id=None):
     """获取 API Key:环境变量 → models.json 模型配置 → keyring"""
     # 环境变量优先
-    env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY")
+    env_key = os.environ.get("SMARTDESKTOP_API_KEY") or os.environ.get("API_KEY")
     if env_key:
         return env_key
 
@@ -201,8 +202,8 @@ def get_base_url(model_id=None):
     """获取 Base URL:models.json 模型配置 → 默认值"""
     config = _load_config()
     if model_id and config.get("models") and config["models"].get(model_id):
-        return config["models"][model_id].get("base_url", "https://api.deepseek.com")
-    return config.get("base_url", "https://api.deepseek.com")
+        return config["models"][model_id].get("base_url", DEEPSEEK_BASE_URL)
+    return config.get("base_url", DEEPSEEK_BASE_URL)
 
 
 def get_model_config(model_id):
@@ -229,14 +230,14 @@ def invalidate_config_cache():
     pass
 
 
-def save_config(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com", model_id=None):
+def save_config(backend, api_key=None, model="deepseek-chat", base_url=DEEPSEEK_BASE_URL, model_id=None):
     """保存 API Key 到 keyring(模型配置通过 models.json / 前端页面管理)"""
     if backend != "ollama" and api_key:
         _try_keyring_set(api_key, model_id)
     logger.info(f"配置已保存(API Key → 系统凭据管理器)")
 
 
-def _save_config_raw(backend, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com"):
+def _save_config_raw(backend, api_key=None, model="deepseek-chat", base_url=DEEPSEEK_BASE_URL):
     save_config(backend, api_key, model, base_url)
 
 _session = requests.Session()
@@ -335,7 +336,7 @@ def ai_concat(messages, model_name=None, provider=None, trace_id="",
             resolved_api_key = get_api_key(model_id)
 
             if model_cfg:
-                resolved_base_url = base_url_override or model_cfg.get("base_url", "https://api.deepseek.com")
+                resolved_base_url = base_url_override or model_cfg.get("base_url", DEEPSEEK_BASE_URL)
                 resolved_api_version = model_cfg.get("api_version", "v1")
                 resolved_temperature = temperature if temperature is not None else model_cfg.get("temperature", DEFAULT_TEMPERATURE)
             else:
@@ -437,10 +438,10 @@ def _normalize_ollama_tools(tools):
 
 def _ollama_call(messages, model, trace_id="", tools=None, response_format=None, temperature=None):
     _assert_system_first(messages, caller="ollama")
-    url = "http://localhost:11434/api/chat"
+    url = f"{OLLAMA_HOST}/api/chat"
 
     # 防御性检查:拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
-    if model and model in ("deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3"):
+    if model and model in DEEPSEEK_MODEL_NAMES:
         msg = f"拒绝路由:模型 '{model}' 是 DeepSeek 在线模型,不应调用本地 Ollama。请检查 model_choice.provider 配置。"
         get_logger().error(msg, trace_id=trace_id)
         raise ValueError(msg)
@@ -547,10 +548,10 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
 
 def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
     _assert_system_first(messages, caller="ollama_stream")
-    url = "http://localhost:11434/api/chat"
+    url = f"{OLLAMA_HOST}/api/chat"
 
     # 防御性检查:拒绝把 DeepSeek 在线模型名错误路由到本地 Ollama
-    if model and model in ("deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3"):
+    if model and model in DEEPSEEK_MODEL_NAMES:
         msg = f"拒绝路由:模型 '{model}' 是 DeepSeek 在线模型,不应调用本地 Ollama。请检查 model_choice.provider 配置。"
         get_logger().error(msg, trace_id=trace_id)
         raise ValueError(msg)
@@ -1158,9 +1159,9 @@ def get_model_from_cache(model_id):
 def get_available_models():
     global _models_cache, _models_cache_mtime
 
-    env_key = os.environ.get("MYAGENT_API_KEY") or os.environ.get("API_KEY", "")
+    env_key = os.environ.get("SMARTDESKTOP_API_KEY") or os.environ.get("API_KEY", "")
     env_model = os.environ.get("API_MODEL", "")
-    env_url = os.environ.get("API_BASE_URL", "https://api.deepseek.com")
+    env_url = os.environ.get("API_BASE_URL", DEEPSEEK_BASE_URL)
 
     try:
         config_path = os.path.join(DATA_DIR, "models.json")
@@ -1195,7 +1196,7 @@ def get_available_models():
                             "display": m.get("name", m.get("model", m_id)),
                             "provider": provider,
                             "model": m.get("model", "deepseek-chat"),
-                            "base_url": m.get("base_url", "https://api.deepseek.com"),
+                            "base_url": m.get("base_url", DEEPSEEK_BASE_URL),
                             "api_version": m.get("api_version", "v1"),
                             "temperature": m.get("temperature", DEFAULT_TEMPERATURE),
                             "stream": m.get("stream", True)
@@ -1212,7 +1213,7 @@ def get_available_models():
                     "display": "DeepSeek (deepseek-chat)",
                     "provider": "deepseek",
                     "model": "deepseek-chat",
-                    "base_url": "https://api.deepseek.com",
+                    "base_url": DEEPSEEK_BASE_URL,
                     "api_version": "v1",
                     "temperature": DEFAULT_TEMPERATURE,
                     "stream": True
@@ -1222,7 +1223,7 @@ def get_available_models():
                     "display": "本地 Ollama (deepseek-r1:7b)",
                     "provider": "ollama",
                     "model": "deepseek-r1:7b",
-                    "base_url": "http://localhost:11434",
+                    "base_url": OLLAMA_HOST,
                     "api_version": "v1",
                     "temperature": DEFAULT_TEMPERATURE,
                     "stream": True
@@ -1238,7 +1239,7 @@ def get_available_models():
                 "display": "DeepSeek (deepseek-chat)",
                 "provider": "deepseek",
                 "model": "deepseek-chat",
-                "base_url": "https://api.deepseek.com",
+                "base_url": DEEPSEEK_BASE_URL,
                 "api_version": "v1",
                 "temperature": DEFAULT_TEMPERATURE,
                 "stream": True
@@ -1248,7 +1249,7 @@ def get_available_models():
                 "display": "本地 Ollama (deepseek-r1:7b)",
                 "provider": "ollama",
                 "model": "deepseek-r1:7b",
-                "base_url": "http://localhost:11434",
+                "base_url": OLLAMA_HOST,
                 "api_version": "v1",
                 "temperature": DEFAULT_TEMPERATURE,
                 "stream": True
@@ -1324,7 +1325,7 @@ def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
             resolved_api_key = get_api_key(model_id)
 
             if model_cfg:
-                resolved_base_url = base_url_override or model_cfg.get("base_url", "https://api.deepseek.com")
+                resolved_base_url = base_url_override or model_cfg.get("base_url", DEEPSEEK_BASE_URL)
                 resolved_api_version = model_cfg.get("api_version", "v1")
                 resolved_temperature = temperature if temperature is not None else model_cfg.get("temperature", DEFAULT_TEMPERATURE)
             else:
@@ -1719,7 +1720,8 @@ def call_llm_and_parse(engine, rs, state, user_message: str, step: int,
                 layer_flags.append("L2")
 
             # ── Layer 3: 重量压缩(压缩 conversation_messages 历史轮次,~10ms 级) ──
-            if total_tokens > UNIFIED_THRESHOLD:
+            _skip_l3 = getattr(engine, '_is_first_recovery_turn', False)
+            if total_tokens > UNIFIED_THRESHOLD and not _skip_l3:
                 get_logger().warning(
                     f"Token 预算仍超限 ({total_tokens}/{UNIFIED_THRESHOLD}),Layer3: 压缩消息历史",
                     trace_id=engine.trace_id, session_id=engine.session_id
@@ -1728,6 +1730,12 @@ def call_llm_and_parse(engine, rs, state, user_message: str, step: int,
             session_id=engine.session_id, trace_id=engine.trace_id,
             max_result_chars=engine.MAX_RESULT_CHARS)
                 layer_flags.append("L3")
+            if _skip_l3:
+                get_logger().info(
+                    f"恢复首轮：跳过 Layer 3 压缩以保留完整对话历史（共 {len(conversation_messages)} 条消息）",
+                    trace_id=engine.trace_id, session_id=engine.session_id
+                )
+                engine._is_first_recovery_turn = False
 
             if layer_flags:
                 get_logger().info(

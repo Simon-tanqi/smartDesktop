@@ -52,7 +52,7 @@ class ExperienceDB:
             try:
                 from config.settings import DATA_DIR
             except ImportError:
-                DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+                DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
             db_dir = os.path.join(DATA_DIR, "experience")
             os.makedirs(db_dir, exist_ok=True)
             db_path = os.path.join(db_dir, "experience_db.json")

@@ -1,5 +1,5 @@
 """
-MyAgent 依赖管理和功能边界说明
+smartDesktop 依赖管理和功能边界说明
 
 本文件定义了：
 1. 所有第三方依赖库及其版本要求
@@ -282,7 +282,7 @@ FEATURE_BOUNDARIES = {
         "limits": {
             "database_type": "SQLite",
             "max_size": "2GB",
-            "location": "%APPDATA%/MyAgent/"
+            "location": "%APPDATA%/smartDesktop/"
         },
         "dependencies": ["sqlite3"]
     }
@@ -401,7 +401,7 @@ class DependencyChecker:
             self.check_all()
         
         lines = ["=" * 60]
-        lines.append("MyAgent 依赖检查报告")
+        lines.append("smartDesktop 依赖检查报告")
         lines.append("=" * 60)
         
         passed_count = sum(1 for r in self._results.values() if r["passed"])

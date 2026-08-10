@@ -136,7 +136,7 @@ def _get_log_path():
     try:
         from config.settings import DATA_DIR
     except ImportError:
-        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+        DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
     log_dir = os.path.join(DATA_DIR, "logs", "safe_exec")
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, "safe_exec.log")
@@ -480,6 +480,9 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
     内部确认标志（challenge_response/challenge_token/domain_confirmed/_skip_validation）
     由上层经 kwargs 透传，不出现在 LLM 可见的 JSON Schema 中。
     """
+    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
+    # 入口统一兜底为 None（继承当前进程工作目录），使下方所有 cwd=working_dir 安全
+    working_dir = working_dir or None
     # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）
     challenge_response = kwargs.get("challenge_response")
     challenge_token = kwargs.get("challenge_token")
@@ -735,6 +738,9 @@ def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="g
     内部确认标志（challenge_response/challenge_token）由上层经 kwargs 透传，
     不出现在 LLM 可见的 JSON Schema 中。
     """
+    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
+    # 入口统一兜底为 None（继承当前进程工作目录），使下方所有 cwd=working_dir 安全
+    working_dir = working_dir or None
     # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）
     challenge_response = kwargs.get("challenge_response")
     challenge_token = kwargs.get("challenge_token")

@@ -1,5 +1,5 @@
 # ============================================================
-# MyAgent 工具声明式配置 - 唯一真相源
+# smartDesktop 工具声明式配置 - 唯一真相源
 # ============================================================
 
 always_inject:
@@ -96,7 +96,7 @@ tools:
   copy_file_to_workspace:
     desc: 将外部文件（如桌面、下载文件夹）复制到工作区，以便后续操作
     params:
-      source_path: {type: str, desc: 源文件绝对路径（如 C:\Users\username\Desktop\file.xlsx）}
+      source_path: {type: str, desc: 源文件绝对路径（如 <用户目录>\Desktop\file.xlsx）}
       dest_filename: {type: str, optional: true, desc: 目标文件名（可选，默认使用源文件名）}
     tier: 1
     tags: [filesystem, copy, workspace]
@@ -237,7 +237,7 @@ tools:
     domains: [code_dev, excel_analyze]
 
   execute_command:
-    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg。注：音量/音频命令自动路由到 system_audio 执行
+    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg。注：音量/音频命令自动路由到 system_audio 执行。通用兜底工具：同一目标存在专用工具（如 extract_word_text/create_word_document/excel_analyze 域工具等）时，必须先尝试专用工具，仅当专用工具无法满足需求时才使用本工具，且须在 reasoning_trace 说明专用工具无法满足的原因
     params: {command: {type: str, desc: 要执行的PowerShell命令字符串}}
     note: 禁止 rm -rf/format/shutdown。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
     tier: 2

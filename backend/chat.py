@@ -267,7 +267,7 @@ def api_chat():
         user_input = data.get("message", "").strip()
         session_id = data.get("session_id")
         
-        # Debug: Add initial error handling
+        # 参数校验：session_id 缺失则直接返回错误
         get_logger().info(f"[/chat] API start: session_id={session_id}, trace_id={trace_id}", trace_id=trace_id)
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
@@ -384,7 +384,7 @@ def api_chat():
                     engine = _get_or_create_engine(session_id, trace_id=trace_id,
                                                    session_name=session_name)
                 # 构造带取消信号的确认处理器（捕获 cancel_event 闭包）
-                def _confirmation_handler(token, timeout=300):
+                def _confirmation_handler(token, timeout=ReActEngine.CONFIRMATION_TIMEOUT):
                     with _active_sessions_lock:
                         info = _active_sessions.get(session_id)
                         if info:
@@ -438,6 +438,8 @@ def api_chat():
                                         get_logger().info("队列满时检测到取消信号，终止任务",
                                                           trace_id=trace_id, session_id=session_id)
                                         return
+                            if isinstance(chunk, str) and '"type":"confirm"' in chunk:
+                                get_logger().info(f"[CONFIRM-DEBUG] confirm event put to queue, len={len(chunk)}")
                         get_logger().info(f"[/chat] Worker线程run_agent执行完成", trace_id=trace_id)
                     except Exception as e:
                         import traceback as _tb
@@ -452,6 +454,18 @@ def api_chat():
                                 _f.write(tb_text)
                         except Exception:
                             pass
+                        # 异常消息落库，确保刷新页面后聊天记录仍可见（BUG-FIX: 原实现仅 SSE 推送不落库）
+                        # 与 agent.py 异常兜底路径互斥：此处仅在 run_agent 生成器整体抛异常时触发
+                        try:
+                            append_session_message(
+                                session_id, "assistant",
+                                f"任务执行异常，请重试。错误详情：{str(e)}",
+                                trace_id=trace_id, user_id=user_id,
+                                skip_compress=True, msg_type="chat",
+                            )
+                        except Exception as _persist_err:
+                            get_logger().warning(f"Worker异常消息落库失败: {_persist_err}",
+                                                 trace_id=trace_id, session_id=session_id)
                         event_queue.put(("__error__", str(e)))
                     finally:
                         event_queue.put(None)  # 哨兵：通知消费端结束
@@ -478,6 +492,8 @@ def api_chat():
                         yield f"data: {json.dumps({'type': 'error', 'text': '任务执行异常，请重试。'}, ensure_ascii=False)}\n\n"
                         break
                     try:
+                        if isinstance(item, str) and '"type":"confirm"' in item:
+                            get_logger().info(f"[CONFIRM-DEBUG] confirm event yielding to SSE response, len={len(item)}")
                         yield item
                     except GeneratorExit:
                         get_logger().info("客户端连接已断开，终止任务",
@@ -790,6 +806,8 @@ def save_session():
                                 frontend_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
                             except Exception:
                                 frontend_ts = frontend_ts.replace("T", " ")[:19]
+                        else:
+                            frontend_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         sql_add_message(session_id,
                             "user" if msg.get("sender") == "user" else "assistant",
                             msg.get("text", ""),

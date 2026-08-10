@@ -1,4 +1,4 @@
-# MyAgent 桌面智能助手 - 测试集文档
+# smartDesktop 桌面智能助手 - 测试集文档
 
 > **项目定位**: 基于 ReAct 架构的桌面级 AI Agent，支持工具调用、安全确认、流式响应  
 > **技术栈**: Python + Flask + SSE + SQLite + Windows Registry API  

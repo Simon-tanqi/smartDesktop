@@ -19,7 +19,7 @@ def get_context_logger() -> logging.Logger:
     格式：[HH:MM:SS] [LEVEL] [module] message
     级别：INFO 正常流程 / WARNING 降级 / ERROR 异常
     """
-    logger = logging.getLogger("MyAgent.context_builder")
+    logger = logging.getLogger("smartDesktop.context_builder")
 
     # 单例：已配置过则直接返回
     if logger.handlers:
@@ -32,7 +32,7 @@ def get_context_logger() -> logging.Logger:
         from memory.config import DATA_DIR
         log_dir = Path(DATA_DIR) / "logs"
     except ImportError:
-        log_dir = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "MyAgent" / "logs"
+        log_dir = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "smartDesktop" / "logs"
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "context_builder.log"
@@ -58,16 +58,20 @@ def get_context_logger() -> logging.Logger:
     return logger
 
 
-# ── 项目级日志工厂（写 D:\PyCharm Project\MyAgent\logs\） ──
+# ── 项目级日志工厂（写 %APPDATA%\smartDesktop\logs\） ──
 
 def _get_project_log_dir() -> Path:
-    """确定项目级 logs/ 目录路径。"""
-    return Path(__file__).parent.parent / "logs"
+    """确定项目级 logs/ 目录路径（统一写入数据目录，与项目源码分离）。"""
+    try:
+        from memory.config import DATA_DIR
+        return Path(DATA_DIR) / "logs"
+    except ImportError:
+        return Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "smartDesktop" / "logs"
 
 
 def _make_project_logger(name: str, filename: str) -> logging.Logger:
     """创建项目级 RotatingFileHandler logger。"""
-    logger = logging.getLogger(f"MyAgent.{name}")
+    logger = logging.getLogger(f"smartDesktop.{name}")
     if logger.handlers:
         return logger
     logger.setLevel(logging.DEBUG)
@@ -114,7 +118,7 @@ def get_refactor_logger() -> logging.Logger:
     格式：[YYYY-MM-DD HH:MM:SS] [LEVEL] [阶段] 消息内容
     用途：记录 ReActEngine 重构的所有步骤、测试结果、异常
     """
-    logger = logging.getLogger("MyAgent.refactor")
+    logger = logging.getLogger("smartDesktop.refactor")
 
     # 单例：已配置过则直接返回
     if logger.handlers:
@@ -127,7 +131,7 @@ def get_refactor_logger() -> logging.Logger:
         from memory.config import DATA_DIR
         log_dir = Path(DATA_DIR) / "logs"
     except ImportError:
-        log_dir = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "MyAgent" / "logs"
+        log_dir = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "smartDesktop" / "logs"
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "refactor.log"

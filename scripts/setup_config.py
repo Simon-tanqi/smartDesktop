@@ -2,9 +2,9 @@
 import os, yaml
 import keyring
 
-KEYRING_SERVICE = "MyAgent"
+KEYRING_SERVICE = "smartDesktop"
 KEYRING_USERNAME = "api_key"
-DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
 CONFIG_YAML = os.path.join(DATA_DIR, 'config.yaml')
 
 # OpenAI 兼容 API 厂商预设（base_url + 默认模型）

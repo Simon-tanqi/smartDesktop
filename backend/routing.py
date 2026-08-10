@@ -19,7 +19,6 @@ _CACHED_ACTIONS_MAX_ENTRIES = 1000
 _CACHED_ACTIONS_MIN_SUCCESS = 6
 
 # 禁止参与高频固化的工具：任何会修改系统状态、或只是"任务中间步骤"的工具都不能直接固化命中。
-# 修复时间：2026-07-27 - 修复re模块闭包和作用域问题
 # 这些工具要么会真正破坏系统（卸载/删除/修改），要么只是查询/半步动作（get_uninstall_string 只查不卸）。
 # 用户报问题："帮我把软件Qorder卸载一下" → 命中了 get_uninstall_string（success_count=9），
 # 执行到"找到软件"就停了，卸载动作没发生。
@@ -102,8 +101,8 @@ _CHAT_MATCHES: dict[str, str] = {
     "bye": "再见，随时找我。",
     "回头见": "再见，随时找我。",
     "辛苦了": "不辛苦，分内之事。",
-    "你是谁": "我是 MyAgent，您的本地智能助手。",
-    "你叫什么": "我是 MyAgent，您的本地智能助手。",
+    "你是谁": "我是 smartDesktop，您的本地智能助手。",
+    "你叫什么": "我是 smartDesktop，您的本地智能助手。",
 }
 
 

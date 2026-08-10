@@ -1,6 +1,6 @@
-# MyAgent 功能测试用例集（55 题）
+# smartDesktop 功能测试用例集（55 题）
 
-> 项目：MyAgent（智能对话 Agent 框架）  
+> 项目：smartDesktop（智能对话 Agent 框架）  
 > 测试环境：Windows  
 > 文档版本：v1.0  
 > 测试范围：系统配置 / 软件安装卸载 / 网页浏览 / Word 文档 / PPT 演示文稿 / Excel 数据处理 / 代码编写
@@ -13,7 +13,7 @@
 2. **结果记录**：每个测试填写"✅ 通过 / ⚠️ 需用户确认 / ❌ 失败"，并附截图或日志
 3. **失败处理**：失败时检查工具是否在 `always_inject` 中、参数是否正确、依赖是否安装
 4. **安全提醒**：涉及注册表修改、软件卸载、命令执行的测试建议在非生产环境执行
-5. **前置数据**：部分测试需要准备测试数据（CSV 文件、Word/Excel 模板），可复用 `D:\PyCharm Project\MyAgent\test_data\` 目录
+5. **前置数据**：部分测试需要准备测试数据（CSV 文件、Word/Excel 模板），可复用 `<项目根目录>\test_data\` 目录
 
 ---
 
@@ -74,11 +74,11 @@
 **测试类别**：系统配置更改  
 **测试标题**：导出系统信息到文件（多步工具调用）  
 **前置条件**：无  
-**用户输入**：把系统基本信息保存到 `C:\Users\username\Desktop\sysinfo.txt`，格式清晰易读  
+**用户输入**：把系统基本信息保存到 `%USERPROFILE%\Desktop\sysinfo.txt`，格式清晰易读  
 
 **预期行为**：  
 1. Agent 调用 `execute_command` 获取 systeminfo  
-2. Agent 调用 `write_file(file_path="C:\\Users\\username\\Desktop\\sysinfo.txt", content="...", overwrite=true)`  
+2. Agent 调用 `write_file(file_path="%USERPROFILE%\\Desktop\\sysinfo.txt", content="...", overwrite=true)`  
 3. 返回文件保存成功信息  
 
 **验证方式**：  
@@ -903,7 +903,7 @@
 ## 类别六：Excel 数据处理（8 题）
 
 **测试目的**：验证 Agent 对 Excel 文件的读写、透视表、图表、公式、条件格式等操作能力。  
-**注意事项**：部分操作涉及大文件处理，注意超时设置。测试数据可复用 `D:\PyCharm Project\MyAgent` 下的 `kc_train.xlsx` 或自行创建。
+**注意事项**：部分操作涉及大文件处理，注意超时设置。测试数据可复用 `<项目根目录>` 下的 `kc_train.xlsx` 或自行创建。
 
 ---
 
@@ -912,10 +912,10 @@
 **测试编号**：T-43  
 **测试类别**：Excel 数据处理  
 **测试标题**：读取 Excel 数据  
-**前置条件**：项目目录下存在测试数据文件（如 `D:\PyCharm Project\MyAgent\test_data\sales_data.xlsx`，若无则跳过或用 CSV）  
-**用户输入**：读取 `D:\PyCharm Project\MyAgent\test_data\sales_data.xlsx` 的内容，显示前10行数据  
+**前置条件**：项目目录下存在测试数据文件（如 `<项目根目录>\test_data\sales_data.xlsx`，若无则跳过或用 CSV）  
+**用户输入**：读取 `<项目根目录>\test_data\sales_data.xlsx` 的内容，显示前10行数据  
 
-**预期行为**：Agent 调用 `excel_read(file_path="D:\\PyCharm Project\\MyAgent\\test_data\\sales_data.xlsx", max_rows=10, sheet_name="Sheet1")`  
+**预期行为**：Agent 调用 `excel_read(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", max_rows=10, sheet_name="Sheet1")`  
 
 **验证方式**：  
 - 检查点 1：返回数据包含表头行  
@@ -934,7 +934,7 @@
 **前置条件**：测试数据文件包含分类列和数值列  
 **用户输入**：用 `test_data\sales_data.xlsx` 创建一个透视表，按"部门"分组，统计"销售额"的总和，保存到新 sheet `部门汇总`  
 
-**预期行为**：Agent 调用 `excel_pivot(file_path="D:\\PyCharm Project\\MyAgent\\test_data\\sales_data.xlsx", index_cols=["部门"], value_cols=["销售额"], agg_func="sum", sheet_name="部门汇总")`  
+**预期行为**：Agent 调用 `excel_pivot(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", index_cols=["部门"], value_cols=["销售额"], agg_func="sum", sheet_name="部门汇总")`  
 
 **验证方式**：  
 - 检查点 1：新 sheet "部门汇总"被创建  
@@ -953,7 +953,7 @@
 **前置条件**：测试数据文件存在  
 **用户输入**：用 `sales_data.xlsx` 生成一个柱状图，展示各部门的销售额，保存到桌面 `chart.xlsx`  
 
-**预期行为**：Agent 调用 `excel_chart_advanced(file_path="D:\\PyCharm Project\\MyAgent\\test_data\\sales_data.xlsx", chart_config={"chart_type": "bar", "title": "部门销售额", "categories_col": "部门", "values_col": "销售额", "output_path": "C:\\Users\\username\\Desktop\\chart.xlsx"})`  
+**预期行为**：Agent 调用 `excel_chart_advanced(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", chart_config={"chart_type": "bar", "title": "部门销售额", "categories_col": "部门", "values_col": "销售额", "output_path": "C:\\Users\\username\\Desktop\\chart.xlsx"})`  
 
 **验证方式**：  
 - 检查点 1：图表文件创建成功（chart.xlsx）  
@@ -1033,7 +1033,7 @@
 **前置条件**：测试数据文件包含数值列  
 **用户输入**：对 `sales_data.xlsx` 的"销售额"列设置条件格式：数值大于 10000 的单元格标红，小于 5000 的标绿  
 
-**预期行为**：Agent 调用 `excel_conditional_format(file_path="D:\\PyCharm Project\\MyAgent\\test_data\\sales_data.xlsx", sheet_name="Sheet1", cell_range="D:D", condition_type="cell_value", rule={"operator": "greaterThan", "value": 10000}, style={"bg_color": "FF0000"})`  
+**预期行为**：Agent 调用 `excel_conditional_format(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", sheet_name="Sheet1", cell_range="D:D", condition_type="cell_value", rule={"operator": "greaterThan", "value": 10000}, style={"bg_color": "FF0000"})`  
 
 **验证方式**：  
 - 检查点 1：返回 success=true  
@@ -1052,7 +1052,7 @@
 **前置条件**：同 T-43  
 **用户输入**：将 `sales_data.xlsx` 转换为 CSV 文件，保存到桌面 `sales_data.csv`  
 
-**预期行为**：Agent 调用 `excel_convert(input_path="D:\\PyCharm Project\\MyAgent\\test_data\\sales_data.xlsx", output_format="csv")` 并指定输出路径，或通过 `write_file` 配合数据写入  
+**预期行为**：Agent 调用 `excel_convert(input_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", output_format="csv")` 并指定输出路径，或通过 `write_file` 配合数据写入  
 
 **验证方式**：  
 - 检查点 1：CSV 文件创建成功  
@@ -1078,7 +1078,7 @@
 **前置条件**：`run_python` 工具可用  
 **用户输入**：编写一个 Python 脚本，输出 "Hello, World!"，执行它并给我看输出  
 
-**预期行为**：Agent 调用 `write_file(file_path="D:\\PyCharm Project\\MyAgent\\workspace\\hello.py", content='print("Hello, World!")', overwrite=true)`，再调用 `run_python(code='print("Hello, World!")')`  
+**预期行为**：Agent 调用 `write_file(file_path="D:\\PyCharm Project\\smartDesktop\\workspace\\hello.py", content='print("Hello, World!")', overwrite=true)`，再调用 `run_python(code='print("Hello, World!")')`  
 
 **验证方式**：  
 - 检查点 1：Python 执行无报错  
@@ -1112,10 +1112,10 @@
 **测试编号**：T-53  
 **测试类别**：代码编写  
 **测试标题**：读取文本文件并统计单词数  
-**前置条件**：创建一个测试文本文件 `D:\PyCharm Project\MyAgent\test_data\sample.txt`（包含一段英文或中文文本）  
+**前置条件**：创建一个测试文本文件 `<项目根目录>\test_data\sample.txt`（包含一段英文或中文文本）  
 **用户输入**：读取 `test_data\sample.txt`，统计文件中的单词数并输出  
 
-**预期行为**：Agent 先用 `read_file(file_path="D:\\PyCharm Project\\MyAgent\\test_data\\sample.txt")` 读取内容，再用 `run_python` 统计单词数  
+**预期行为**：Agent 先用 `read_file(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sample.txt")` 读取内容，再用 `run_python` 统计单词数  
 
 **验证方式**：  
 - 检查点 1：成功读取文件内容  
@@ -1132,9 +1132,9 @@
 **测试类别**：代码编写  
 **测试标题**：列出工作目录下的所有 Python 文件  
 **前置条件**：无  
-**用户输入**：列出 `D:\PyCharm Project\MyAgent\workspace` 目录下所有的 `.py` 文件，并告诉我文件名和大小  
+**用户输入**：列出 `<项目根目录>\workspace` 目录下所有的 `.py` 文件，并告诉我文件名和大小  
 
-**预期行为**：Agent 调用 `get_project_summary(directory="D:\\PyCharm Project\\MyAgent\\workspace")` 或 `execute_command(command="dir /b /s D:\\PyCharm Project\\MyAgent\\workspace\\*.py")`  
+**预期行为**：Agent 调用 `get_project_summary(directory="D:\\PyCharm Project\\smartDesktop\\workspace")` 或 `execute_command(command="dir /b /s D:\\PyCharm Project\\smartDesktop\\workspace\\*.py")`  
 
 **验证方式**：  
 - 检查点 1：返回文件列表（应包含至少 1 个 .py 文件）  
@@ -1153,7 +1153,7 @@
 **前置条件**：无  
 **用户输入**：编写一个简单的 Flask Web 服务器代码，监听 5000 端口，访问 `/` 返回 "Hello Flask"，访问 `/status` 返回 JSON `{"status": "ok"}`，保存为 `app.py`  
 
-**预期行为**：Agent 调用 `write_file(file_path="D:\\PyCharm Project\\MyAgent\\workspace\\app.py", content="from flask import Flask, jsonify\napp = Flask(__name__)\n\n@app.route('/')\ndef index():\n    return 'Hello Flask'\n\n@app.route('/status')\ndef status():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(port=5000)", overwrite=true)`  
+**预期行为**：Agent 调用 `write_file(file_path="D:\\PyCharm Project\\smartDesktop\\workspace\\app.py", content="from flask import Flask, jsonify\napp = Flask(__name__)\n\n@app.route('/')\ndef index():\n    return 'Hello Flask'\n\n@app.route('/status')\ndef status():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(port=5000)", overwrite=true)`  
 
 **验证方式**：  
 - 检查点 1：文件 `app.py` 成功创建在 workspace  
@@ -1171,7 +1171,7 @@
 
 ```powershell
 # 创建测试数据目录
-New-Item -ItemType Directory -Path "D:\PyCharm Project\MyAgent\test_data" -Force
+New-Item -ItemType Directory -Path "<项目根目录>\test_data" -Force
 
 # 使用 Python 生成测试 CSV（包含部门和销售额数据）
 python -c "
@@ -1183,7 +1183,7 @@ data = [['部门', '姓名', '销售额', '月份'],
         ['技术部', '赵六', random.randint(5000, 15000), 'Q1'],
         ['市场部', '孙七', random.randint(2000, 12000), 'Q1'],
         ['市场部', '周八', random.randint(2000, 12000), 'Q1']]
-with open('D:/PyCharm Project/MyAgent/test_data/sales_data.csv', 'w', newline='', encoding='utf-8') as f:
+with open('<项目根目录>/test_data/sales_data.csv', 'w', newline='', encoding='utf-8') as f:
     writer = csv.writer(f)
     writer.writerows(data)
 print('CSV created')
@@ -1205,4 +1205,4 @@ print('CSV created')
 ---
 
 *文档生成时间：2026-08-03*  
-*测试用例版本：v1.0（对应 MyAgent 项目当前代码状态）*
+*测试用例版本：v1.0（对应 smartDesktop 项目当前代码状态）*

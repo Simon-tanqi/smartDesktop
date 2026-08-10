@@ -1,0 +1,6 @@
+﻿# 开发 / 测试 / CI 依赖
+pytest==8.2.2
+pytest-cov==5.0.0
+pre-commit==3.8.0
+ruff==0.5.7
+（内容由AI生成，仅供参考）

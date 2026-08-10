@@ -1,0 +1,35 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+
+      - name: Compile check
+        run: python -m compileall -q .
+
+      - name: Run tests
+        # 仅运行冒烟测试（test_smoke.py）；test_assertions/test_orchestrator 为
+        # 本地真实 Agent 执行器，依赖 Windows 环境与本地 LLM，不纳入 CI。
+        run: python -m pytest tests/test_smoke.py -x -q

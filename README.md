@@ -1,15 +1,4 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: ef5b15bc948ed1a80cab91ca175eedba_b8452758837811f184135254006c9bbf
-    ReservedCode1: eBnPk9T/RRuNgw05XUsr/m86zCldizOM8/fftYn2+0eM6i+WBgxoTO+NKI/evxn1yz/fJxiOMfRQQVqbBsqhHFxDnN2WmGIlCk09kcfvJ1aghtgGwE9MS8b3eYdwpa3xqWb5JaYdP+ii696Fo6FqLU9BBUuRCUH42rQr8KE3WADZSi884+kpOcCAod4=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: ef5b15bc948ed1a80cab91ca175eedba_b8452758837811f184135254006c9bbf
-    ReservedCode2: eBnPk9T/RRuNgw05XUsr/m86zCldizOM8/fftYn2+0eM6i+WBgxoTO+NKI/evxn1yz/fJxiOMfRQQVqbBsqhHFxDnN2WmGIlCk09kcfvJ1aghtgGwE9MS8b3eYdwpa3xqWb5JaYdP+ii696Fo6FqLU9BBUuRCUH42rQr8KE3WADZSi884+kpOcCAod4=
----
-
-# MyAgent
+# smartDesktop
 
 个人 AI Agent 助手，基于 ReAct（Reasoning + Acting）模式的本地智能代理。支持多模型后端、工具动态注册、分层记忆系统与 BM25 上下文路由。
 
@@ -130,18 +119,17 @@ MAX_CONTEXT_TOKENS = 28000
 ## 项目结构
 
 ```
-MyAgent/
+smartDesktop/
 ├── app.py                      # 应用主入口
 ├── llm_client.py               # LLM API 客户端（DeepSeek / Ollama 流式调用）
 ├── logger.py                   # 日志系统
-├── setup_config.py             # 初始化配置
 │
 ├── core/                       # 核心引擎
 │   ├── react_engine.py         # ReAct 推理-行动循环引擎（~1700 行）
 │   ├── agent_state.py          # 任务状态管理、检查点持久化
 │   ├── streaming.py            # SSE 流式输出格式化
 │   ├── tool_data_provider.py   # 工具数据提供者（schema 管理、域匹配）
-│   └── tool_registry.py        # 工具注册基础设施
+│   └── logger.py               # 上下文构建器专用日志
 │
 ├── memory/                     # 记忆系统
 │   ├── session.py              # 会话管理、上下文构建（build_context_messages）(~1175 行)
@@ -230,17 +218,16 @@ MyAgent/
 │   ├── skill_learning_guide.md
 │   └── ...
 │
-├── scripts/                    # 工具脚本
-├── outputs/                    # 输出产物目录
-└── logs/                       # 运行日志
+└── scripts/                    # 工具脚本
+    └── setup_config.py         # 初始化配置
 ```
 
 ## 数据目录
 
-运行时数据存储于 `%APPDATA%\MyAgent\`：
+运行时数据存储于 `%APPDATA%\smartDesktop\`：
 
 ```
-%APPDATA%\MyAgent\
+%APPDATA%\smartDesktop\
 ├── config\
 │   └── memory_policy.yaml      # 记忆策略（可手动编辑，调用 reload_policy() 热重载）
 ├── memory\
@@ -278,13 +265,19 @@ MyAgent/
 
 ```bash
 # 安装依赖
-pip install -r web/api/requirements.txt
+pip install -r requirements.txt
+
+# 开发依赖（测试 / lint / pre-commit）
+pip install -r requirements-dev.txt
+
+# 安装 Git Hooks（可选）
+pre-commit install
 
 # 启动（默认使用 DeepSeek）
 python app.py
 
 # 配置 API Key
-# 首次启动后编辑 %APPDATA%\MyAgent\models.json
+# 首次启动后编辑 %APPDATA%\smartDesktop\models.json
 ```
 
 ## 关键设计原则

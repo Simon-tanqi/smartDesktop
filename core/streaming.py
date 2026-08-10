@@ -3,6 +3,7 @@ import re
 import time
 import threading
 import queue
+import datetime
 from typing import Dict, Any, Optional, Callable, Iterator, Generator
 
 from logger import get_logger
@@ -43,6 +44,10 @@ class SSEStreamer:
         return self.emit("error", text=text)
     
     def emit_final(self, text: str, timestamp: Optional[str] = None) -> str:
+        if timestamp is None:
+            # 统一本地时间：SSE 未传时间戳时兜底，避免前端收到 null 后
+            # 回传空 timestamp 触发 SQLite DEFAULT CURRENT_TIMESTAMP（UTC）导致排序错乱
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if self._on_final:
             try:
                 self._on_final(text, timestamp)
@@ -74,9 +79,11 @@ class SSEStreamer:
     def emit_confirm(self, confirmation_token: str, title: str = "操作需要确认", 
                       command: str = "", details: dict = None, tool_name: str = "",
                       challenge_phrase: str = "", expires_at: Optional[float] = None) -> str:
-        # P3: 确认请求带 5 分钟过期时间戳，前端可据此倒计时自动回传拒绝
+        # 确认请求过期时间与引擎 CONFIRMATION_TIMEOUT 统一（延迟导入避免循环依赖）
         if expires_at is None:
-            expires_at = time.time() + 300
+            from core.react_engine import ReActEngine
+            expires_at = time.time() + ReActEngine.CONFIRMATION_TIMEOUT
+        get_logger().info(f"[CONFIRM-DEBUG] emit_confirm called: token={confirmation_token[:8]}..., tool={tool_name}")
         return self.emit(
             "confirm",
             confirmation_token=confirmation_token,

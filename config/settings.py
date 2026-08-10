@@ -15,7 +15,7 @@ import os
 
 # 用户数据目录（放在 APPDATA 下，便于项目打包分发）
 # 与 memory/config.py 保持一致，确保记忆文件路径统一
-DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'MyAgent')
+DATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'smartDesktop')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 SCREENSHOTS_DIR = os.path.join(DATA_DIR, "screenshots")
@@ -30,6 +30,8 @@ DEFAULT_TEMPERATURE = 0.3
 LLM_TIMEOUT = 30               # 秒，LLM API 请求超时
 DEFAULT_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# DeepSeek 在线模型名单（llm_client 防御性路由检查用，拒绝将在线模型误路由到本地 Ollama）
+DEEPSEEK_MODEL_NAMES = ("deepseek-chat", "deepseek-coder", "deepseek-reasoner", "deepseek-v3")
 
 # ═══════════════════════════════════════════════
 #  Ollama 本地模型
@@ -37,6 +39,8 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:7b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1"
+# Ollama 服务根地址（不带路径后缀）；原生 /api/chat、/api/generate 等端点在此根上拼接
+OLLAMA_HOST = "http://localhost:11434"
 
 # ═══════════════════════════════════════════════
 #  搜索 / 网页请求
@@ -88,6 +92,13 @@ MODEL_PRESETS = {
     "ollama":       {"name": "Ollama 本地","base_url": "http://localhost:11434/v1",          "temperature": 0.7, "models": [], "warning": "本地模型功能可能受模型能力影响，效果远不如云端大模型"},
     "custom":       {"name": "自定义",     "base_url": "",                                   "temperature": 0.7, "models": []},
 }
+
+# ═══════════════════════════════════════════════
+#  服务监听 / CORS（app.py 与 screenshot_tools.py 共用）
+# ═══════════════════════════════════════════════
+AGENT_PORT = int(os.environ.get('AGENT_PORT', '8765'))
+AGENT_HOST = os.environ.get('AGENT_HOST', '127.0.0.1')
+AGENT_CORS_ORIGINS = os.environ.get('AGENT_CORS_ORIGINS', 'http://localhost:8765,http://127.0.0.1:8765').split(',')
 
 # ═══════════════════════════════════════════════
 #  功能开关

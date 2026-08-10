@@ -613,7 +613,7 @@ def save_skill(skill_name: str, content: str, version: str = "1.0", merge: bool 
     
     # 检查文件是否已存在
     if file_path.exists() and merge:
-        # 备份旧版本
+        # 合并保存前备份旧版本到 _backups 目录，便于失败回滚
         backup_dir = AGENT_SKILLS_DIR / "_backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         
@@ -813,7 +813,7 @@ def update_skill(skill_name: str, content: str, new_version: str = None) -> dict
         # 更新 YAML frontmatter 中的版本号
         content = _update_version_in_frontmatter(content, new_version)
         
-        # 备份旧版本
+        # 版本更新前备份旧版本到 _backups 目录（文件名含原版本号），便于失败回滚
         backup_dir = AGENT_SKILLS_DIR / "_backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = backup_dir / f"{skill_name}_v{existing_version}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
