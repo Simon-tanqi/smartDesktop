@@ -23,6 +23,7 @@ from config.settings import MAX_OUTPUT_CHARS, PYTHON_TIMEOUT
 _confirmation_manager = None
 
 def _get_confirmation_manager():
+    """懒加载并缓存全局确认管理器实例。"""
     global _confirmation_manager
     if _confirmation_manager is None:
         from core.confirmation_manager import confirmation_manager as _cm
@@ -194,7 +195,19 @@ def _extract_delete_targets(command: str) -> list:
             cut = re.split(r'[*?]', t, maxsplit=1)[0]
             t = cut
         expanded.append(t)
-    return expanded
+
+    # 去重（同一路径可能同时命中引号正则与盘符正则），避免单文件被误判为批量
+    seen = set()
+    unique = []
+    for t in expanded:
+        try:
+            key = os.path.normcase(os.path.normpath(t))
+        except Exception:
+            key = t
+        if key not in seen:
+            seen.add(key)
+            unique.append(t)
+    return unique
 
 
 def _is_temp_dir_delete(command: str) -> bool:
@@ -213,6 +226,85 @@ def _is_temp_dir_delete(command: str) -> bool:
         if not any(norm == root or norm.startswith(root + os.sep) for root in roots):
             return False
     return True
+
+
+def _is_c_drive_delete(command: str) -> bool:
+    """判断删除命令的目标是否位于 C 盘（C 盘禁止 Agent 删除文件）。
+
+    注意：卸载命令（uninstaller exe 等）不在本函数判定范围内，卸载走
+    execute_command 步骤 4 的卸载专用分支（C 盘内 P1、非 C 盘 P2）。
+    """
+    targets = _extract_delete_targets(command)
+    if not targets:
+        return False
+    for t in targets:
+        try:
+            norm = os.path.normpath(os.path.abspath(t))
+            drive = os.path.splitdrive(norm)[0]
+        except Exception:
+            continue
+        if drive.upper() == "C:":
+            return True
+    return False
+
+
+def _is_appdata_roaming_delete(command: str) -> bool:
+    """判断删除命令的目标是否全部位于用户 AppData\\Roaming 目录内。
+
+    该目录属于用户文件区，允许 Agent 删除（单文件 P2、批量 P1），
+    不适用「C 盘禁止删除」规则。其余 C 盘位置一律拒绝。
+    """
+    targets = _extract_delete_targets(command)
+    if not targets:
+        return False
+    roaming = os.environ.get("APPDATA", "")
+    if not roaming:
+        return False
+    try:
+        roaming_norm = os.path.normcase(os.path.normpath(os.path.abspath(roaming)))
+    except Exception:
+        return False
+    for t in targets:
+        try:
+            norm = os.path.normcase(os.path.normpath(os.path.abspath(t)))
+        except Exception:
+            return False
+        if not (norm == roaming_norm or norm.startswith(roaming_norm + os.sep)):
+            return False
+    return True
+
+
+def _is_batch_delete(command: str) -> bool:
+    """判断删除命令是否为批量删除（多目标 / 通配符 / 递归删除目录）。"""
+    if re.search(r'[*?]', command):
+        return True
+    targets = _extract_delete_targets(command)
+    if len(targets) > 1:
+        return True
+    # 递归删除目录视为批量（rmdir /s、rd /s、Remove-Item -Recurse、rm -r、rmtree 等）
+    # 注意：-Recurse 前不能用 \b（连字符是非单词字符，\b 无法在空格与 - 之间成立），
+    # 统一用 \s 或 - 直接衔接
+    if re.search(
+        r'(?i)(?:rmdir|rd)\s+/\s*s\b|\bRemove-Item\b[^;|&]*\s-Recurse\b|\brm\s+-r\b|\bshutil\.rmtree\b',
+        command,
+    ):
+        return True
+    return False
+
+
+def _get_uninstall_exe_path(command: str) -> str:
+    """提取卸载命令中的卸载器 exe 路径（用于判断卸载目标是否位于 C 盘）。"""
+    try:
+        tokens = shlex.split(command.strip(), posix=False)
+        if not tokens:
+            return ""
+        _idx = 0
+        _leading = tokens[0].strip().lower().strip('"').strip("'")
+        if _leading in ("&", "start-process", "start-process.exe", "cmd", "cmd.exe", "start", "call"):
+            _idx = 1
+        return tokens[_idx].strip('"').strip("'") if len(tokens) > _idx else ""
+    except Exception:
+        return ""
 
 
 def _try_redirect_audio_command(command: str) -> str | None:
@@ -266,6 +358,7 @@ def _try_redirect_audio_command(command: str) -> str | None:
 
 
 def _get_cfg():
+    """获取安全规则配置（便捷封装）。"""
     return get_safety_config()
 
 
@@ -322,6 +415,7 @@ def _get_cached_uninstall_paths(program_name: str) -> set:
 
 
 def _get_confirm_log_path() -> str:
+    """获取确认操作日志路径，目录不存在时自动创建。"""
     try:
         from config.settings import DATA_DIR
     except ImportError:
@@ -332,6 +426,7 @@ def _get_confirm_log_path() -> str:
 
 
 def _log_confirmation(command: str, status: str, detail: str = ""):
+    """记录一次确认操作日志（命令、状态、详情）。"""
     log_path = _get_confirm_log_path()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = (
@@ -466,6 +561,7 @@ def _run_command_threaded(command: str, working_dir: str = None, timeout: int = 
     exception_container: list = [None]
 
     def _target():
+        """子进程线程目标：执行 PowerShell 命令并将结果回写容器。"""
         try:
             result_container[0] = safe_exec.run_powershell(
                 command, working_dir=working_dir, timeout=timeout,
@@ -573,26 +669,47 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             return json.dumps(path_check, ensure_ascii=False)
 
         if not _is_verified and not confirmed:
-            # P1 风险：需要挑战短语确认，返回 confirmation_required 触发系统弹窗
-            challenge_phrase = _get_cfg().danger_challenge_phrase
-            token = _get_confirmation_manager().create_challenge(
-                command=command,
-                desc="卸载软件",
-                source="system_tools",
-                level="high"
-            )
-            return json.dumps({
-                "success": False,
-                "confirmation_required": True,
-                "challenge_phrase": challenge_phrase,
-                "challenge_token": token,
-                "message": f"卸载软件属于 P1 风险操作，需要确认。请回复以下完整短语以确认执行：\\n```\\n{challenge_phrase}\\n```",
-                "details": {
-                    "操作": "卸载软件",
-                    "风险等级": "P1",
-                    "说明": "此操作将删除软件及其相关文件，不可恢复"
-                }
-            }, ensure_ascii=False)
+            # 卸载软件分级确认：C 盘内 P1（挑战短语），非 C 盘 P2（普通确认）
+            uninstall_exe = _get_uninstall_exe_path(command)
+            try:
+                _on_c_drive = bool(uninstall_exe) and os.path.splitdrive(os.path.abspath(uninstall_exe))[0].upper() == "C:"
+            except Exception:
+                _on_c_drive = True  # 无法解析时按最严格处理（C 盘内）
+            if _on_c_drive:
+                # P1 风险：需要挑战短语确认，返回 confirmation_required 触发系统弹窗
+                challenge_phrase = _get_cfg().danger_challenge_phrase
+                token = _get_confirmation_manager().create_challenge(
+                    command=command,
+                    desc="卸载软件（C 盘内）",
+                    source="system_tools",
+                    level="high"
+                )
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "challenge_phrase": challenge_phrase,
+                    "challenge_token": token,
+                    "message": f"卸载 C 盘内软件属于 P1 风险操作，需要确认。请回复以下完整短语以确认执行：\\n```\\n{challenge_phrase}\\n```",
+                    "details": {
+                        "操作": "卸载软件（C 盘内）",
+                        "风险等级": "P1",
+                        "说明": "此操作将删除软件及其相关文件，不可恢复"
+                    }
+                }, ensure_ascii=False)
+            else:
+                # P2 风险：普通确认（确认/取消按钮）
+                token = _get_confirmation_manager().create_confirmation(command=command)
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "confirmation_token": token,
+                    "message": "卸载非 C 盘软件属于 P2 风险操作，需要确认",
+                    "details": {
+                        "操作": "卸载软件（非 C 盘）",
+                        "风险等级": "P2",
+                        "说明": "此操作将删除软件及其相关文件，不可恢复"
+                    }
+                }, ensure_ascii=False)
         # confirmed 或已验证 → 继续执行
 
     # ── 4. 原有的命令分类与风险判断（未经验证时执行）──
@@ -635,12 +752,37 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                     _is_verified = True
                     _confirmed_note = "[临时文件夹豁免]"
                     _log_confirmation(command, "TEMP_EXEMPT", "删除临时文件夹内文件，豁免确认")
+                elif _is_c_drive_delete(command) and not _is_appdata_roaming_delete(command):
+                    # C 盘禁止 Agent 删除文件（AppData\Roaming 用户文件区除外，
+                    # 该目录内文件走下方单文件 P2 / 批量 P1 分级；卸载走步骤 4 专用分支）
+                    return json.dumps({
+                        "success": False,
+                        "message": "操作被拒绝：C 盘禁止 Agent 删除文件",
+                        "details": {
+                            "命令": command[:200],
+                            "说明": "C 盘中的文件删除操作不允许 Agent 执行（AppData\\Roaming 用户目录除外），请用户手动操作"
+                        }
+                    }, ensure_ascii=False)
+                elif not _is_batch_delete(command):
+                    # 单文件删除（非 C 盘，或 C 盘 AppData\Roaming 用户目录内）：P2 普通确认（确认/取消按钮）
+                    token = _get_confirmation_manager().create_confirmation(command=command)
+                    return json.dumps({
+                        "success": False,
+                        "confirmation_required": True,
+                        "confirmation_token": token,
+                        "message": "删除文件属于 P2 风险操作，需要确认",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P2",
+                            "说明": "删除单个文件（非 C 盘或 AppData\\Roaming 用户目录内）"
+                        }
+                    }, ensure_ascii=False)
                 else:
-                    # 危险命令（删除/卸载）：返回 confirmation_required 触发 UI 确认弹窗
+                    # 批量删除（非 C 盘，或 C 盘 AppData\Roaming 用户目录内）：P1 挑战短语确认
                     challenge_phrase = _get_cfg().danger_challenge_phrase
                     token = _get_confirmation_manager().create_challenge(
                         command=command,
-                        desc="危险命令（删除/卸载）",
+                        desc="批量删除（非 C 盘或 AppData\\Roaming）",
                         source="system_tools",
                         level="high"
                     )
@@ -649,10 +791,11 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "confirmation_required": True,
                         "challenge_phrase": challenge_phrase,
                         "challenge_token": token,
-                        "message": "该命令包含删除或卸载操作，需要确认授权",
+                        "message": f"批量删除属于 P1 风险操作，需要确认。请回复以下完整短语以确认执行：\\n```\\n{challenge_phrase}\\n```",
                         "details": {
                             "命令": command[:200],
-                            "风险等级": "P1"
+                            "风险等级": "P1",
+                            "说明": "批量删除文件/目录（非 C 盘或 AppData\\Roaming 用户目录内）"
                         }
                     }, ensure_ascii=False)
             # 未匹配任何分类的命令：直接执行（UI 确认已在 react_engine 层完成）
@@ -994,6 +1137,7 @@ def get_uninstall_string(program_name: str) -> str:
                                     pass
                             if _matched:
                                 def _get_value(k, name, default=""):
+                                    """读取注册表键值，缺失时返回默认值。"""
                                     try:
                                         return str(winreg.QueryValueEx(k, name)[0])
                                     except FileNotFoundError:
@@ -1491,6 +1635,7 @@ def modify_registry(operation: str, key: str, value_name: str = None, value_data
                 _old_tree = _snapshot_registry_key_tree(hkey, key_path)
 
                 def _delete_key_recursive(base_hkey, base_path, depth=0):
+                    """递归删除注册表键，深度超过 10 层时中止。"""
                     if depth > 10:
                         return False
                     try:
@@ -1627,15 +1772,18 @@ def system_audio(operation: str, value: int = None, device: str = None) -> str:
 
     try:
         def _get_speakers():
+            """获取系统扬声器音量控制对象。"""
             return AudioUtilities.GetSpeakers().EndpointVolume
         
         def _get_microphone():
+            """获取系统麦克风音量控制对象，不存在时返回 None。"""
             mic = AudioUtilities.GetMicrophone()
             if mic is None:
                 return None
             return mic.EndpointVolume
 
         def _get_all_devices():
+            """获取系统全部音频设备列表。"""
             return AudioUtilities.GetAllDevices()
 
         if operation == "get_volume":
@@ -1823,6 +1971,7 @@ def find_program(program_name: str) -> str:
         seen: set = set()
 
         def _add(path: str, source: str) -> None:
+            """将路径加入指定集合，去除重复并规范化。"""
             if not path:
                 return
             p = os.path.normpath(path)

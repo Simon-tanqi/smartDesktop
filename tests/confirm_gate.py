@@ -32,6 +32,7 @@ DANGER_PATTERNS = [
 
 
 def is_dangerous_command(cmd: str) -> bool:
+    """判断命令是否命中灾难命令拦截规则"""
     if not cmd:
         return False
     c = cmd.lower()
@@ -43,9 +44,11 @@ def is_dangerous_command(cmd: str) -> bool:
 
 class ConfirmGate:
     # pending 条目 TTL：超过该时长未确认的 token 视为过期，handler 直接拒绝
+    """真实执行安全网关：确认回调分级批准与命令级灾难拦截"""
     PENDING_TTL = 120
 
     def __init__(self):
+        """初始化待确认表、决策日志与高危命令记录"""
         self.pending = {}
         self.decisions_log = []
         self.danger_attempts = []  # Agent 发起的被拦截高危命令
@@ -71,6 +74,7 @@ class ConfirmGate:
             })
 
     def handler(self, token, timeout=None):
+        """处理确认回调：判定期限、分级批准并记录决策"""
         self._purge_expired()
         info = self.pending.get(token, {})
         tool = info.get("tool_name") or self._tool_from_token(token)
@@ -95,10 +99,12 @@ class ConfirmGate:
 
     @staticmethod
     def _tool_from_token(token: str):
+        """从确认令牌中解析工具名"""
         m = re.match(r"risk_confirm_(.+)_(\d+)$", token or "")
         return m.group(1) if m else ""
 
     def judge(self, tool: str, args: dict, token: str) -> bool:
+        """按工具与参数判定是否批准（P0 拒绝、P1 批准）"""
         if tool == "modify_registry":
             key = str(args.get("key", "")) + " " + str(args.get("path", ""))
             if "HKLM" in key.upper():
@@ -122,6 +128,7 @@ class ConfirmGate:
             orig = st.execute_command
 
             def _guarded(command, **kwargs):
+                """包装后的 execute_command：拦截灾难命令"""
                 if is_dangerous_command(command):
                     self.danger_attempts.append(command)
                     return json.dumps({

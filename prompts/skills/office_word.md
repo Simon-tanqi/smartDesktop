@@ -46,3 +46,4 @@
 | `add_word_content` | 追加 paragraph / heading / table / image |
 | `extract_word_text` | 读取已有文档内容 |
 | `search_replace_word` | 全文查找替换 |
+| `batch_word_process` | 批量处理 Word 文档（提取信息/统计字数） |

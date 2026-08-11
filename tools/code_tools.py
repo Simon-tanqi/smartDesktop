@@ -566,6 +566,7 @@ DANGEROUS_PATTERNS = [
 
 
 def _check_dangerous_code(code):
+    """检查代码是否命中危险模式清单，返回首个命中原因"""
     for pattern, reason in DANGEROUS_PATTERNS:
         if re.search(pattern, code, re.IGNORECASE):
             return reason
@@ -573,6 +574,7 @@ def _check_dangerous_code(code):
 
 
 def _check_path_traversal(code):
+    """检查代码是否包含路径穿越写法"""
     path_patterns = [
         r'\\\.\.',
         r'/\\\.\.',
@@ -658,11 +660,13 @@ def run_python(code: str, timeout: int = 30, working_dir: str = None) -> str:
         import threading
         
         class TimeoutException(Exception):
+            """代码执行超时异常"""
             pass
         
         result_container = {}
         
         def worker():
+            """后台线程执行代码，捕获异常写入结果容器"""
             try:
                 # 创建统一的命名空间，包含常用模块
                 exec_namespace = {

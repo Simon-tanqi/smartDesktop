@@ -1,11 +1,21 @@
+"""执行进度控制器：基于工具调用历史判断循环是否推进、停滞或无用。
+
+ProgressEvaluator 依据工具契约分类（读/写/执行/搜索/交互），对同一参数
+重复调用与低信息增益结果给出 STALLED / FUTILE 判定，防止智能体在
+ReAct 循环中原地踏步；轮询类命令单独走次数与时间双预算。
+"""
 import hashlib, json, re, time
 from enum import Enum
 
 class Kind(str, Enum):
+    """工具调用类别：读、写、执行、搜索、交互，决定判定策略。"""
+
     READ, MUTATOR, EXEC, SEARCH, INTERACT = \
         "idempotent_read", "mutator", "execute", "search", "interact"
 
 class Verdict(str, Enum):
+    """进度判定结果：有进展 / 疑似停滞 / 无用功。"""
+
     PROGRESS, STALLED, FUTILE = "progress", "stalled", "futile"
 
 # 默认保守(READ)；只覆盖你确知的关键工具。未列出的工具走 READ 策略（比现状强，且不误杀）。
@@ -17,6 +27,7 @@ CONTRACTS = {
 }
 
 def _h(x):
+    """对参数/结果做稳定哈希，用于识别重复调用（忽略字段顺序与类型差异）。"""
     return hashlib.md5(json.dumps(x, sort_keys=True, ensure_ascii=False,
                                   default=str).encode()).hexdigest()
 
@@ -24,13 +35,21 @@ def _h(x):
 _POLL_RE = re.compile(r"(tasklist|findstr|ping\s+-n|Start-Sleep|timeout\s+/\d|while\s+|until\s+|--watch)", re.I)
 
 class ProgressEvaluator:
+    """进度评估器：维护最近调用窗口，按工具类别判定本轮是否值得放行。"""
+
     def __init__(self, futile_after_stall=2,
                  poll_max=20, poll_budget_s=120, gain_thr=0.15):
+        """初始化评估器；参数控制停滞容忍次数、轮询次数/时间预算与信息增益阈值。"""
         self.win, self.stall = [], {}
         self.cfg = dict(futile_after_stall=futile_after_stall,
                         poll_max=poll_max, poll_budget_s=poll_budget_s, gain_thr=gain_thr)
 
     def decide(self, tool, args, result, changed=None, polling=None):
+        """判定一次工具调用是否有进展，返回 (Verdict, 原因说明)。
+
+        changed 仅对写类工具表示是否真正修改；polling 显式标记轮询调用，
+        未传时通过正则识别常见轮询命令模式。
+        """
         kind = CONTRACTS.get(tool, Kind.READ)
         if kind == Kind.INTERACT:
             return Verdict.FUTILE, "交互类不应循环，应转引擎确认"
@@ -63,6 +82,7 @@ class ProgressEvaluator:
         return (Verdict.PROGRESS, "ok") if not bad else self._stall(tool, ah, kind)
 
     def _stall(self, tool, ah, kind):
+        """记录停滞次数；达到阈值判为无用功，否则提示换参数或直接收尾。"""
         k = f"{tool}:{ah}"
         self.stall[k] = self.stall.get(k, 0) + 1
         if self.stall[k] >= self.cfg["futile_after_stall"]:
@@ -71,6 +91,7 @@ class ProgressEvaluator:
                                  f"换参数/换工具或直接 final")
 
     def _poll_budget(self, ah):
+        """轮询类调用按次数与总时长双重预算判定，超限即判无用功。"""
         runs = [r for r in self.win if r["ah"] == ah and r["polling"]]
         if len(runs) > self.cfg["poll_max"] or \
            (runs and time.time() - runs[0]["t"] > self.cfg["poll_budget_s"]):
@@ -78,6 +99,7 @@ class ProgressEvaluator:
         return Verdict.PROGRESS, "polling: 等待中，放行"
 
     def _low_gain(self, hist):
+        """按结果新词占比判断是否低信息增益；新词比例低于阈值视为无新信息。"""
         cur = self.win[-1]["tok"]
         old = set().union(*(r["tok"] for r in hist)) if hist else set()
         if not cur:

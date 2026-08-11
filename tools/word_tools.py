@@ -592,6 +592,7 @@ def search_replace_word(file_path: str, search_text: str, replace_text: str, cas
         replacements_count = 0
 
         def _replace_in_paragraph(paragraph):
+            """在单个段落内执行文本替换并累计替换次数。"""
             nonlocal replacements_count
             full_text = paragraph.text if case_sensitive else paragraph.text.lower()
             search_target = search_text if case_sensitive else search_text.lower()

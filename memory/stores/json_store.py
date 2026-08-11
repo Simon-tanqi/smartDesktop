@@ -25,6 +25,7 @@ DEFAULT_LONG_TERM = {
 # ═══════════════════════════════════════════════
 
 def load_long_term():
+    """加载长期记忆 JSON，与默认结构合并后返回；文件不存在时返回默认结构"""
     if not os.path.exists(MEMORY_FILE):
         return DEFAULT_LONG_TERM.copy()
     with open(MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -55,6 +56,7 @@ def save_long_term(memory):
 # ═══════════════════════════════════════════════
 
 def load_compressed():
+    """加载压缩记忆列表，文件不存在时返回空列表"""
     if not os.path.exists(COMPRESSED_FILE):
         return []
     with open(COMPRESSED_FILE, "r", encoding="utf-8") as f:

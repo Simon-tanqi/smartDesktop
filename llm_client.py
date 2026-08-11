@@ -1,3 +1,4 @@
+"""LLM 客户端模块：模型配置加载、API Key 管理、Ollama/DeepSeek 调用与流式响应封装。"""
 import os
 import json
 import re
@@ -88,6 +89,7 @@ def _brief_result(result) -> str:
 
 
 def _is_keyring_available():
+    """探测系统 keyring 是否可用，结果缓存在全局变量中。"""
     global _KEYRING_AVAILABLE
     if _KEYRING_AVAILABLE is None:
         try:
@@ -99,6 +101,7 @@ def _is_keyring_available():
 
 
 def _try_keyring_get(model_id=None):
+    """尝试从 keyring 读取 API Key，失败返回 None。"""
     if not _is_keyring_available():
         return None
     try:
@@ -109,6 +112,7 @@ def _try_keyring_get(model_id=None):
 
 
 def _try_keyring_set(api_key, model_id=None):
+    """尝试将 API Key 写入 keyring，成功返回 True。"""
     if not _is_keyring_available():
         return False
     try:
@@ -174,6 +178,7 @@ def _load_config():
 
 
 def get_config():
+    """返回当前加载的模型配置副本（含运行时环境变量覆盖）。"""
     return dict(_load_config())
 
 
@@ -238,6 +243,7 @@ def save_config(backend, api_key=None, model="deepseek-chat", base_url=DEEPSEEK_
 
 
 def _save_config_raw(backend, api_key=None, model="deepseek-chat", base_url=DEEPSEEK_BASE_URL):
+    """将后端配置持久化（转发到 save_config 实现）。"""
     save_config(backend, api_key, model, base_url)
 
 _session = requests.Session()
@@ -277,6 +283,7 @@ def _assert_system_first(messages, caller="llm"):
 
 
 def _normalize_base_url(base_url):
+    """归一化 Base URL：去除末尾斜杠与接口路径后缀，仅保留服务根地址。"""
     url = base_url.rstrip('/')
     url = re.sub(r'/v\d+/chat/completions/?$', '', url)
     url = re.sub(r'/chat/completions/?$', '', url)
@@ -284,6 +291,7 @@ def _normalize_base_url(base_url):
 
 
 def _map_response_format(response_format):
+    """将 OpenAI 风格 response_format 映射为内部表示（仅支持 json_object→json）。"""
     if not response_format:
         return None
     fmt_type = response_format.get("type", "")
@@ -387,6 +395,7 @@ class OllamaAPIError(RuntimeError):
     """
 
     def __init__(self, message, status_code=None, body=None):
+        """初始化 Ollama 调用异常，携带状态码与响应体。"""
         super().__init__(message)
         self.status_code = status_code
         self.body = body
@@ -437,6 +446,7 @@ def _normalize_ollama_tools(tools):
 
 
 def _ollama_call(messages, model, trace_id="", tools=None, response_format=None, temperature=None):
+    """调用本地 Ollama 非流式接口，返回含 content/reasoning_content 的结果字典。"""
     _assert_system_first(messages, caller="ollama")
     url = f"{OLLAMA_HOST}/api/chat"
 
@@ -547,6 +557,7 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
 
 
 def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
+    """调用本地 Ollama 流式接口，逐块产出 (type, data) 事件。"""
     _assert_system_first(messages, caller="ollama_stream")
     url = f"{OLLAMA_HOST}/api/chat"
 
@@ -971,7 +982,39 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
         yield {"type": "error", "error": str(e)}
 
 
-def parse_ai_json(content):
+# ═══════════════════════════════════════════════════════════
+# 自然语言兜底工具名校验
+# Python re 默认 Unicode 模式,\w 会匹配中文,导致"调用任何工具"把"任何"
+# 捕获为 tool_name,虚构出不存在的工具调用并陷入幻觉循环。
+# 兜底解析提取的工具名必须可信:优先命中调用方传入的白名单,
+# 否则要求 ASCII 工具名形态且不在泛指词黑名单内。
+# ═══════════════════════════════════════════════════════════
+_NL_VAGUE_WORDS = frozenset({
+    "任何", "一个", "一些", "某些", "这个", "那个", "这些", "那些",
+    "其他", "其它", "别的", "工具", "函数", "一下", "下", "个",
+    "python", "shell", "代码", "命令", "脚本", "应用", "软件",
+    "系统", "文件", "数据", "信息", "结果", "内容",
+})
+_TOOL_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]*$')
+
+
+def _is_valid_tool_name(name, valid_tool_names=None):
+    """自然语言兜底提取的工具名是否可信。
+
+    valid_tool_names 提供时(推荐):必须命中白名单;
+    未提供时:必须是 ASCII 工具名形态且非泛指词(保守兜底)。
+    """
+    if not name:
+        return False
+    if valid_tool_names is not None:
+        return name in valid_tool_names
+    if name.lower() in _NL_VAGUE_WORDS:
+        return False
+    return bool(_TOOL_NAME_RE.match(name))
+
+
+def parse_ai_json(content, valid_tool_names: Optional[set] = None):
+    """从 LLM 输出中解析结构化 JSON：依次尝试 action 代码块、json 代码块、全文搜索与自然语言兜底。"""
     from json_repair import loads as repair_loads
     try:
         clean_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
@@ -1010,6 +1053,8 @@ def parse_ai_json(content):
 
         # ── 自然语言兜底解析 ──
         # 模式1:检测工具调用意图
+        # 注意:Python re 默认 Unicode 模式,\w 可匹配中文,导致"调用任何工具"
+        # 捕获"任何"等泛指词并虚构工具调用。提取后必须做工具名校验。
         tool_mention_patterns = [
             r'(?:调用|使用|执行|运行)\s*(\w+)\s*(?:工具|函数|来)',
             r'(?:我需要|我应该|接下来)\s*(?:调用|使用)\s*(\w+)',
@@ -1019,6 +1064,9 @@ def parse_ai_json(content):
             tool_match = re.search(pattern, clean_content, re.IGNORECASE)
             if tool_match:
                 tool_name = tool_match.group(1)
+                if not _is_valid_tool_name(tool_name, valid_tool_names):
+                    logger.info(f"parse_ai_json 自然语言兜底: 候选工具名 '{tool_name}' 不可信,跳过工具调用解析")
+                    continue
                 args_match = re.search(r'\{[^{}]*\}', clean_content)
                 args = {}
                 if args_match:
@@ -1141,6 +1189,7 @@ _models_cache_lock = threading.Lock()
 
 
 def invalidate_models_cache():
+    """清空模型缓存，下次调用强制重新读取 models.json。"""
     global _models_cache, _models_cache_mtime
     with _models_cache_lock:
         _models_cache = None
@@ -1148,6 +1197,7 @@ def invalidate_models_cache():
 
 
 def get_model_from_cache(model_id):
+    """从模型缓存中按 id 查找模型配置，缓存为空时先加载。"""
     global _models_cache
     if _models_cache is None:
         get_available_models()
@@ -1157,6 +1207,7 @@ def get_model_from_cache(model_id):
 
 
 def get_available_models():
+    """获取可用模型列表：优先读 models.json 缓存，缺失时返回内置默认模型。"""
     global _models_cache, _models_cache_mtime
 
     env_key = os.environ.get("SMARTDESKTOP_API_KEY") or os.environ.get("API_KEY", "")
@@ -1261,6 +1312,7 @@ def get_available_models():
 
 def _deepseek_call(messages, model, api_key, base_url,
                    provider="deepseek", trace_id="", tools=None, response_format=None):
+    """调用 DeepSeek 非流式接口（转发到通用 OpenAI 兼容协议实现）。"""
     return _openai_compatible_call(messages, model, api_key, base_url,
                                    provider=provider, trace_id=trace_id,
                                    tools=tools, response_format=response_format)
@@ -1268,6 +1320,7 @@ def _deepseek_call(messages, model, api_key, base_url,
 
 def _deepseek_call_stream(messages, model, api_key, base_url,
                           provider="deepseek", trace_id="", tools=None, response_format=None,temperature=DEFAULT_TEMPERATURE):
+    """调用 DeepSeek 流式接口（转发到通用 OpenAI 兼容协议实现）。"""
     _assert_system_first(messages, caller="deepseek_stream")
     return _openai_compatible_call_stream(messages, model, api_key, base_url,
                                           provider=provider, trace_id=trace_id,
@@ -1383,6 +1436,7 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
                         layered_cache=None,
                         *, trace_id: str = "", session_id: str = "",
                         session_name: str = "", turn_state=None) -> Generator[Any, None, None]:
+    """流式 LLM 响应入口：带重试、推理块解析与 SSE 事件归一化的生成器。"""
     idx = call_seq[0]
     call_seq[0] += 1
     t0 = time.perf_counter()
@@ -1842,7 +1896,15 @@ def call_llm_and_parse(engine, rs, state, user_message: str, step: int,
             if extracted_full_reasoning.strip():
                 yield engine.streamer.emit_reasoning(extracted_full_reasoning)
 
-        parsed_action = parse_ai_json(full_content)
+        # 自然语言兜底需工具名白名单,防止从自由文本(如"调用任何工具")
+        # 提取泛指词虚构工具调用;获取失败时降级为无白名单(仍有形态+黑名单保守校验)
+        _valid_tool_names = None
+        try:
+            from core.tool_data_provider import tool_data_provider
+            _valid_tool_names = set(tool_data_provider.get_all_tools().keys())
+        except Exception:
+            _valid_tool_names = None
+        parsed_action = parse_ai_json(full_content, valid_tool_names=_valid_tool_names)
 
         get_logger().info(f"parse_ai_json结果: parsed_action={parsed_action}",
                       trace_id=engine.trace_id, session_id=engine.session_id)

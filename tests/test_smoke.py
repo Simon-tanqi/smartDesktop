@@ -12,6 +12,7 @@ _SKIP_PARTS = {"temp", ".git", "__pycache__", ".venv", "venv", "node_modules"}
 
 
 def test_core_modules_exist():
+    """校验仓库关键模块文件存在"""
     required = [
         "core/react_engine.py",
         "core/tool_data_provider.py",
@@ -46,20 +47,24 @@ def test_no_absolute_user_path():
 
 
 def test_readme_no_aigc_header():
+    """校验 README 无 AIGC 元数据头"""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert not readme.startswith("---\nAIGC:"), "README 残留 AIGC 元数据头"
 
 
 def test_requirements_has_pandas():
+    """校验 requirements.txt 含 pandas"""
     req = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "pandas" in req, "requirements.txt 缺少 pandas"
 
 
 def test_gitignore_models_json():
+    """校验 .gitignore 忽略 models.json"""
     gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "models.json" in gi, ".gitignore 未忽略 models.json"
 
 
 def test_ci_uses_ci_requirements():
+    """校验 CI 使用 requirements-ci.txt"""
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "requirements-ci.txt" in ci, "ci.yml 未使用 requirements-ci.txt"

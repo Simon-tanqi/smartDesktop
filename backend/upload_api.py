@@ -34,6 +34,7 @@ ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".xlsx", ".pptx", ".csv",
 
 @upload_bp.route("/api/upload", methods=["POST"])
 def upload_file():
+    """处理 multipart 文件上传：校验类型与大小，按会话隔离目录保存。"""
     if "file" not in request.files:
         return jsonify({"success": False, "message": "未选择文件"}), 400
 

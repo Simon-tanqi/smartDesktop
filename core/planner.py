@@ -1,3 +1,8 @@
+"""任务规划器：调用 LLM 将用户需求拆解为多步计划，并在失败时重规划。
+
+Planner 负责首次规划（可强制至少两步），Replanner 依据最近工具消息中的
+连续失败信号决定是否需要重规划，并合并已成功步骤生成新计划。
+"""
 import json
 import time
 from typing import List, Dict, Any, Optional
@@ -6,7 +11,10 @@ from logger import get_logger
 from core.plan import TaskPlan, PlanStep
 
 class Planner:
+    """初始任务规划器：通过 LLM 生成结构化步骤计划。"""
+
     def __init__(self, model_name: str, provider: str, model_id: str = None, temperature: float = 0.3):
+        """初始化规划器：保存模型标识与采样温度等调用参数。"""
         self.model_name = model_name
         self.provider = provider
         self.model_id = model_id
@@ -104,7 +112,10 @@ class Planner:
             return None
 
 class Replanner:
+    """失败重规划器：检测连续失败信号，并在原计划基础上生成替代方案。"""
+
     def __init__(self, model_name: str, provider: str, model_id: str = None, temperature: float = 0.3):
+        """初始化重规划器：保存模型标识与采样温度等调用参数。"""
         self.model_name = model_name
         self.provider = provider
         self.model_id = model_id

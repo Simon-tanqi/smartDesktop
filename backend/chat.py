@@ -1,3 +1,4 @@
+"""聊天后端模块：SSE 聊天路由、会话生命周期管理、确认机制、模型/日志/会话配置 API。"""
 import re as _re
 import time
 import json
@@ -124,10 +125,12 @@ _cleanup_thread = threading.Thread(target=_cleanup_zombie_sessions, daemon=True,
 _cleanup_thread.start()
 
 def _is_session_active(session_id):
+    """判断指定会话当前是否处于活跃（运行中）状态。"""
     with _active_sessions_lock:
         return session_id in _active_sessions
 
 def _has_active_sessions():
+    """判断是否存在任意活跃会话。"""
     with _active_sessions_lock:
         return len(_active_sessions) > 0
 
@@ -147,6 +150,7 @@ _ATTACHMENT_END = "</attachments>"
 
 
 def _extract_attachments(user_message: str):
+    """从用户消息中提取末尾附件标记块，返回（清理后的消息, 附件路径列表）。"""
     start = user_message.find(_ATTACHMENT_START)
     if start == -1:
         return user_message, []
@@ -171,6 +175,7 @@ def _extract_attachments(user_message: str):
 
 
 def _inject_attachment_context(user_message: str, file_list: list):
+    """将附件列表重新拼接为消息尾部标记块（供上下文构建使用）。"""
     if not file_list:
         return user_message
     lines = ["", _ATTACHMENT_START]
@@ -184,6 +189,7 @@ def _inject_attachment_context(user_message: str, file_list: list):
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool-")
 
 def _shutdown_executor():
+    """关闭全局工具执行线程池（进程退出时由 atexit 触发）。"""
     _TOOL_EXECUTOR.shutdown(wait=False)
 
 atexit.register(_shutdown_executor)
@@ -229,6 +235,7 @@ default_model = available_models[0] if available_models else {"provider": "ollam
 
 
 def get_model_choice(display_name=None, model_id=None):
+    """按显示名或 id 选择模型配置，未命中时回退到默认模型。"""
     for m in available_models:
         if model_id and m.get("id") == model_id:
             return m
@@ -239,9 +246,11 @@ def get_model_choice(display_name=None, model_id=None):
 
 # ── SSE 快捷响应辅助 ──
 def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
+    """构造并落库一个简易 SSE 回复（两步：处理中 + 最终答案）。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def generate():
+        """按 SSE 协议逐行产出事件流。"""
         yield f"data: {json.dumps({'type': 'step', 'text': '处理中...', 'status': '进行中'}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'final', 'text': text, 'timestamp': now}, ensure_ascii=False)}\n\n"
 
@@ -254,12 +263,14 @@ def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
 # ── 截图静态服务 ──
 @chat_bp.route('/screenshots/<path:filename>')
 def serve_screenshot(filename):
+    """提供截图目录中的静态文件访问。"""
     return send_from_directory(SCREENSHOTS_DIR, filename)
 
 
 # ── 聊天主路由 ──
 @chat_bp.route("/api/chat", methods=["POST"])
 def api_chat():
+    """聊天主入口：多层级路由（闲聊/恢复/高频缓存）+ SSE 流式任务执行。"""
     trace_id = generate_trace_id()
     user_id = get_user_id()
     try:
@@ -352,6 +363,7 @@ def api_chat():
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
         def _run_agent_with_cleanup():
+            """SSE 生成器：注册会话、启动 worker 线程执行任务并转发事件流，退出时统一清理。"""
             # 首先发送初始 heartbeat，让前端立即知道连接已建立
             yield f"data: {json.dumps({'type': 'heartbeat', 'status': 'running'})}\n\n"
 
@@ -385,6 +397,7 @@ def api_chat():
                                                    session_name=session_name)
                 # 构造带取消信号的确认处理器（捕获 cancel_event 闭包）
                 def _confirmation_handler(token, timeout=ReActEngine.CONFIRMATION_TIMEOUT):
+                    """确认处理器：进入等待确认状态并阻塞等待用户确认，结束后恢复运行状态。"""
                     with _active_sessions_lock:
                         info = _active_sessions.get(session_id)
                         if info:
@@ -401,6 +414,7 @@ def api_chat():
                 event_queue: queue.Queue = queue.Queue(maxsize=100)
 
                 def _worker():
+                    """后台工作线程：调用 run_agent 执行任务，把结果事件放入队列，异常时落库并转发错误。"""
                     with _active_sessions_lock:
                         info = _active_sessions.get(session_id)
                         if info:
@@ -522,6 +536,7 @@ def api_chat():
 # ── 取消请求 API ──
 @chat_bp.route("/api/cancel", methods=["POST"])
 def api_cancel():
+    """取消指定会话的进行中任务。"""
     try:
         data = request.json
         session_id = data.get("session_id", "").strip()
@@ -539,6 +554,7 @@ def api_cancel():
 # ── 命令确认 API ──
 @chat_bp.route("/api/confirm", methods=["POST"])
 def api_confirm():
+    """处理前端命令确认回调：写入确认结果并唤醒等待中的确认处理器。"""
     try:
         data = request.json
         token = data.get("confirmation_token", "").strip()
@@ -563,6 +579,7 @@ def api_confirm():
 # ── 会话状态 API ──
 @chat_bp.route("/api/session/status", methods=["GET"])
 def api_session_status():
+    """查询会话活跃状态：指定会话是否运行中及全部活跃会话列表。"""
     try:
         session_id = request.args.get("session_id")
         if session_id:
@@ -585,6 +602,7 @@ def api_session_status():
 
 # ── 模型配置 API ──
 def _load_models_config():
+    """读取模型配置文件；文件不存在时返回空结构。"""
     if os.path.exists(MODELS_CONFIG_PATH):
         with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -592,11 +610,13 @@ def _load_models_config():
 
 
 def _save_models_config(config):
+    """将模型配置写入配置文件（UTF-8 缩进 JSON）。"""
     with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
 def _load_user_profile():
+    """读取用户画像文件；文件不存在时返回空字典。"""
     if os.path.exists(USER_PROFILE_PATH):
         with open(USER_PROFILE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -604,6 +624,7 @@ def _load_user_profile():
 
 
 def _save_user_profile(profile):
+    """持久化用户画像，并同步更新用户信息 Markdown 与长期事实记忆。"""
     from memory import append_fact
     with open(USER_PROFILE_PATH, "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
@@ -632,11 +653,13 @@ def _save_user_profile(profile):
 @limiter.exempt
 @chat_bp.route('/api/config/models', methods=['GET'])
 def api_get_models_config():
+    """查询当前模型配置。"""
     return jsonify({"success": True, **_load_models_config()})
 
 
 @chat_bp.route('/api/config/models', methods=['POST'])
 def api_save_models_config():
+    """保存模型配置列表。"""
     try:
         data = request.json
         if not data or "models" not in data:
@@ -649,6 +672,7 @@ def api_save_models_config():
 
 @chat_bp.route('/api/config/models/active', methods=['POST'])
 def api_set_active_model():
+    """设置当前激活模型 id。"""
     try:
         data = request.json
         model_id = data.get("model_id", "")
@@ -664,11 +688,13 @@ def api_set_active_model():
 @limiter.exempt
 @chat_bp.route('/api/config/user_profile', methods=['GET'])
 def api_get_user_profile():
+    """查询用户画像。"""
     return jsonify({"success": True, "profile": _load_user_profile()})
 
 
 @chat_bp.route('/api/config/user_profile', methods=['POST'])
 def api_save_user_profile():
+    """保存用户画像。"""
     try:
         data = request.json
         if not data or "profile" not in data:
@@ -682,24 +708,28 @@ def api_save_user_profile():
 @limiter.exempt
 @chat_bp.route('/api/config/first_run', methods=['GET'])
 def api_is_first_run():
+    """判断是否为首次运行（用户画像文件不存在即视为首次）。"""
     return jsonify({"is_first_run": not os.path.exists(USER_PROFILE_PATH)})
 
 
 @limiter.exempt
 @chat_bp.route('/api/config/model_presets', methods=['GET'])
 def api_get_model_presets():
+    """查询内置模型预设列表。"""
     return jsonify({"success": True, "presets": MODEL_PRESETS})
 
 
 # ── 日志查询 API ──
 @chat_bp.route('/logs/view')
 def log_viewer():
+    """提供日志查看页面静态文件。"""
     from flask import current_app
     return current_app.send_static_file('log_viewer.html')
 
 
 @chat_bp.route('/api/logs/query')
 def api_logs_query():
+    """按日期/级别/关键词/会话名查询运行日志，并补全会话标题。"""
     lg = get_logger()
     date_from = request.args.get("date_from", "")
     date_to = request.args.get("date_to", "")
@@ -732,6 +762,7 @@ def api_logs_query():
 
 @chat_bp.route('/api/logs/dates')
 def api_logs_available_dates():
+    """列出日志目录中可用的日期列表。"""
     from logger import LOG_DIR
     dates = []
     if LOG_DIR.exists():
@@ -742,6 +773,7 @@ def api_logs_available_dates():
 
 @chat_bp.route('/api/logs/llm_call')
 def api_logs_llm_call():
+    """按会话与轮次查询某次 LLM 调用的详细记录。"""
     session_id = request.args.get("session_id", "")
     turn = int(request.args.get("turn", 0))
     if not session_id:
@@ -757,6 +789,7 @@ def api_logs_llm_call():
 # ── 会话管理 API ──
 @chat_bp.route('/api/sessions', methods=['POST'])
 def save_session():
+    """保存前端会话（含消息增量去重入库），并设为活跃会话。"""
     from memory.session import load_sessions_db, save_sessions_db
     from memory.stores.sqlite_store import get_chat_messages as sql_get_messages, add_chat_message as sql_add_message
     try:
@@ -825,6 +858,7 @@ def save_session():
 
 @chat_bp.route('/api/sessions/new', methods=['POST'])
 def new_session():
+    """创建新会话并返回会话数据。"""
     from memory.session import create_session
     try:
         session_id = create_session(title=None)
@@ -838,6 +872,7 @@ def new_session():
 @limiter.exempt
 @chat_bp.route('/api/sessions', methods=['GET'])
 def get_sessions():
+    """获取全部会话列表。"""
     try:
         sessions = list_sessions()
         return jsonify(sessions)
@@ -849,6 +884,7 @@ def get_sessions():
 @limiter.exempt
 @chat_bp.route('/api/models', methods=['GET'])
 def get_models():
+    """获取可用模型列表；加载失败时返回本地默认模型兜底。"""
     try:
         available_models = get_available_models()
         if not available_models:
@@ -869,6 +905,7 @@ def get_models():
 
 @chat_bp.route('/api/sessions/<session_id>', methods=['DELETE'])
 def delete_session_route(session_id):
+    """删除指定会话：清理上传文件、会话数据并释放缓存引擎。"""
     from memory import delete_session
     from backend.upload_api import cleanup_session_uploads
     try:
@@ -885,6 +922,7 @@ def delete_session_route(session_id):
 @limiter.exempt
 @chat_bp.route('/api/sessions/active', methods=['GET'])
 def get_active_session():
+    """获取当前活跃会话 id。"""
     from memory import get_active_session_id
     session_id = get_active_session_id()
     return jsonify({"session_id": session_id})
@@ -893,6 +931,7 @@ def get_active_session():
 @limiter.exempt
 @chat_bp.route('/api/sessions/<session_id>', methods=['GET'])
 def get_session(session_id):
+    """获取指定会话的全部聊天消息（统一字段映射后返回）。"""
     from memory import get_chat_messages
     try:
         messages = get_chat_messages(session_id)
@@ -919,6 +958,7 @@ def get_session(session_id):
 
 @chat_bp.route('/api/sessions/<session_id>/rename', methods=['POST'])
 def api_rename_session(session_id):
+    """重命名指定会话。"""
     from memory import rename_session
     data = request.json or {}
     new_title = data.get("title", "").strip()

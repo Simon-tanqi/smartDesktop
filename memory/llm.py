@@ -38,10 +38,12 @@ def set_session_provider(provider, model=None):
 
 
 def get_session_provider():
+    """获取当前会话使用的 provider 标识"""
     return _session_provider
 
 
 def _get_ai_concat():
+    """惰性获取全局模型调用函数，导入失败时置为 False"""
     global _ai_concat
     if _ai_concat is None:
         with _ai_concat_lock:

@@ -175,6 +175,7 @@ def extract_facts_async(content, trace_id="", user_id="", session_id=""):
         categories_snapshot = list(_custom_skill_categories)
 
     def _run():
+        """后台线程执行事实提取，忽略网络类异常避免错误刷屏"""
         try:
             _extract_facts_core(content, trace_id, user_id, session_id, categories_snapshot)
         except Exception as e:

@@ -16,6 +16,7 @@ from config.config_loader import get_safety_config
 _confirmation_manager = None
 
 def _get_confirmation_manager():
+    """懒加载并缓存全局确认管理器实例。"""
     global _confirmation_manager
     if _confirmation_manager is None:
         from core.confirmation_manager import confirmation_manager as _cm

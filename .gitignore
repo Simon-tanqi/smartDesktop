@@ -29,3 +29,5 @@ temp/
 htmlcov/
 .idea/
 .vscode/
+
+docs/github_pre_push_review.md

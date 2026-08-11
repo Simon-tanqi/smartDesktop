@@ -1,3 +1,8 @@
+"""ReAct 引擎模块：实现智能体「思考-行动-观察」主循环。
+
+ReActEngine 串联 LLM 调用、工具执行、状态管理、进度控制与检查点机制，
+是桌面智能体运行时最核心的循环控制器。
+"""
 import json
 import time
 import uuid
@@ -68,6 +73,12 @@ from config.settings import (
 )
 
 class ReActEngine:
+    """ReAct 循环引擎：驱动「思考 → 工具调用 → 观察」直至任务完成。
+
+    承担对话主循环：每轮调用 LLM 解析动作，执行工具并回传结果，附带
+    进度控制、熔断、检查点、能力域加载与最终收尾清理等完整生命周期管理。
+    """
+
     MAX_TURNS = 15
     MAX_CONSECUTIVE_PROGRESS = 3
     MAX_CONSECUTIVE_FAILURES = 3   # 同名同参数连续真失败熔断阈值
@@ -117,6 +128,7 @@ class ReActEngine:
     # 未在映射表中的工具默认为 P3
     
     def __init__(self, trace_id: str = "", session_id: str = "", session_name: str = ""):
+        """初始化引擎状态组件：流式输出器、执行状态、上下文切换检测器、工具执行管线、循环检测器与确认缓存"""
         self.trace_id = trace_id
         self.session_id = session_id
         self.session_name = session_name
@@ -143,6 +155,12 @@ class ReActEngine:
             planning_extra: str = "",
             resumed_checkpoint: Optional[TaskCheckpoint] = None,
             cancel_event=None) -> Generator[str, None, None]:
+        """运行完整 ReAct 主循环，逐轮产出流式事件。
+
+        先经 prepare_run_state 初始化会话状态，然后在 MAX_TURNS 步内循环：
+        调用模型解析动作、执行工具并同步历史；支持取消信号、进度摘要、
+        检查点保存、能力域加载与引擎产物护栏，最终统一收尾清理。
+        """
 
         # 初始化状态
         # RunState 承载可变状态，PrepareResult 返回配置

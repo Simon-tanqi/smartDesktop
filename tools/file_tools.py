@@ -30,14 +30,62 @@ def _create_excel_copy(source_path: str) -> str:
 
 
 @register_tool(timeout=30)
-@path_params("path")
-def scan_directory(path: str):
-    """扫描指定路径下的第一层文件和文件夹，返回 JSON 数组。path: 要扫描的目录绝对路径"""
+@path_params("path")  # 确保路径参数被标记，便于安全审计
+def scan_directory(path: str, max_results: int = 200):
+    """
+    扫描指定路径下的第一层文件和文件夹，返回 JSON 对象。
+    
+    Args:
+        path: 要扫描的目录绝对路径（读操作不限制 workspace，任意位置可扫描）
+        max_results: 最大返回条目数，默认 200，防止上下文溢出
+    """
+    # 1. 路径安全校验（读操作放开 workspace：允许任意位置读取）
+    from .code_tools import _resolve_path_read
+    target_path = _resolve_path_read(path)
+    if not target_path:
+        return json.dumps({
+            "success": False,
+            "message": f"非法路径或路径不在 workspace 范围内: {path}"
+        }, ensure_ascii=False)
+
     try:
-        entries = [entry.name for entry in os.scandir(path)]
-        return json.dumps(entries, ensure_ascii=False)
+        entries = []
+        total_count = 0
+        truncated = False
+        
+        with os.scandir(target_path) as iterator:
+            for entry in iterator:
+                total_count += 1
+                if len(entries) < max_results:
+                    entries.append(entry.name)
+                else:
+                    truncated = True
+                    break  # 达到上限后停止遍历，节省性能
+        
+        # 2. 统一返回格式（必须有 success 键）
+        return json.dumps({
+            "success": True,
+            "data": entries,
+            "total": total_count,
+            "truncated": truncated,
+            "message": f"扫描成功，共 {total_count} 项，返回 {len(entries)} 项" + ("（已截断）" if truncated else "")
+        }, ensure_ascii=False)
+        
+    except PermissionError:
+        return json.dumps({
+            "success": False,
+            "message": f"权限不足，无法访问目录: {target_path}"
+        }, ensure_ascii=False)
+    except FileNotFoundError:
+        return json.dumps({
+            "success": False,
+            "message": f"目录不存在: {target_path}"
+        }, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"success": False, "message": f"扫描失败: {str(e)}"}, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "message": f"扫描失败: {str(e)}"
+        }, ensure_ascii=False)
 
 @register_tool(timeout=30)
 def resolve_folder(parent_dir: str, target_name: str):

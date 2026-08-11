@@ -60,6 +60,7 @@ class StructuredLogger:
     """结构化日志单例"""
 
     def __init__(self):
+        """初始化日志器：创建缓冲区、线程事件与日志目录。"""
         self._buffer: list[str] = []
         self._buffer_lock = threading.Lock()
         self._current_date = ""
@@ -304,15 +305,19 @@ class StructuredLogger:
         self._llm_flush()
 
     def debug(self, msg, **extra):
+        """记录 DEBUG 级别日志。"""
         self.log("DEBUG", msg, **extra)
 
     def info(self, msg, **extra):
+        """记录 INFO 级别日志。"""
         self.log("INFO", msg, **extra)
 
     def warning(self, msg, **extra):
+        """记录 WARNING 级别日志。"""
         self.log("WARNING", msg, **extra)
 
     def error(self, msg, **extra):
+        """记录 ERROR 级别日志。"""
         self.log("ERROR", msg, **extra)
 
     # ── LLM 调用日志 ──
@@ -327,6 +332,7 @@ class StructuredLogger:
                      user_task_time: str = "",
                      route_level: str = "",
                      context_memory: list = None):
+        """异步记录一次 LLM 调用：入队缓冲并触发刷盘，不阻塞调用方。"""
         with self._llm_buffer_lock:
             self._llm_buffer.append(("log_llm_call", (
                 trace_id, session_id, turn, child_turn, user_task,
@@ -448,7 +454,7 @@ class StructuredLogger:
                          user_task_time: str = "",
                          route_level: str = "",
                          context_memory: list = None):
-
+        """后台线程执行 LLM 调用落盘：生成 JSON 行日志并写入会话日志文件。"""
         safe_name = session_name.strip() if session_name else "untitled"
         for ch in r'<>:"/\|?*':
             safe_name = safe_name.replace(ch, '_')
@@ -599,6 +605,7 @@ class StructuredLogger:
 
     def update_tool_result(self, session_id: str, session_name: str, turn: int,
                            child_turn: int, tool_result: str):
+        """异步更新 LLM 日志中指定子轮次的工具执行结果。"""
         with self._llm_buffer_lock:
             self._llm_buffer.append(("update_tool_result", (session_id, session_name, turn, child_turn, tool_result)))
             buffer_len = len(self._llm_buffer)
@@ -608,6 +615,7 @@ class StructuredLogger:
 
     def _do_update_tool_result(self, session_id: str, session_name: str, turn: int,
                                child_turn: int, tool_result: str):
+        """后台线程更新工具结果：读-改-写加锁写入 LLM 日志文件。"""
         safe_name = session_name.strip() if session_name else "untitled"
         for ch in r'<>:"/\|?*':
             safe_name = safe_name.replace(ch, '_')
@@ -646,6 +654,7 @@ class StructuredLogger:
     def log_turn_complete(self, session_id: str, session_name: str, turn: int,
                           ai_reply: str, ai_reply_time: str = "",
                           reasoning_trace: str = ""):
+        """异步记录一轮对话完成：写入最终回复与推理轨迹并立即刷盘。"""
         with self._llm_buffer_lock:
             if len(self._llm_buffer) >= self._MAX_LLM_BUFFER:
                 self._llm_buffer.pop(0)
@@ -660,6 +669,7 @@ class StructuredLogger:
     def _do_log_turn_complete(self, session_id: str, session_name: str, turn: int,
                               ai_reply: str, ai_reply_time: str = "",
                               reasoning_trace: str = ""):
+        """后台线程落盘轮次完成记录：按 session_id 精确或前缀匹配日志文件。"""
         safe_name = session_name.strip() if session_name else "untitled"
         for ch in r'<>:"/\|?*':
             safe_name = safe_name.replace(ch, '_')
@@ -735,6 +745,7 @@ class StructuredLogger:
             self._atomic_write(str(file_path), data)
 
     def get_llm_call_file(self, session_id: str, session_name: str = "") -> str | None:
+        """定位 LLM 调用日志文件：优先精确名匹配，否则按 session_id 前缀扫描。"""
         llm_dir = LOG_DIR / "llm_calls"
         if not llm_dir.exists():
             return None
@@ -753,6 +764,7 @@ class StructuredLogger:
         return None
 
     def get_llm_turn(self, session_id: str, turn: int, session_name: str = "") -> dict | None:
+        """读取指定会话轮次的 LLM 调用日志，不存在返回 None。"""
         file_path = self.get_llm_call_file(session_id, session_name)
         if not file_path:
             return None
@@ -778,6 +790,7 @@ class StructuredLogger:
               level: str = None, keyword: str = None,
               session_id: str = None, trace_id: str = None,
               limit: int = 200) -> list[dict]:
+        """按日期/级别/关键词/会话过滤查询日志，返回匹配记录列表。"""
         if date_from:
             start = datetime.strptime(date_from, "%Y-%m-%d")
         else:
@@ -948,6 +961,7 @@ class StructuredLogger:
         original_hook = sys.excepthook
 
         def global_exception_hook(exc_type, exc_value, exc_tb):
+            """全局异常钩子：将未处理异常写入 crash.log 并调用原始钩子"""
             try:
                 LOG_DIR.mkdir(parents=True, exist_ok=True)
                 with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
@@ -990,6 +1004,7 @@ class StructuredLogger:
         return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
     def close(self):
+        """关闭日志器：等待后台线程退出并关闭文件句柄。"""
         self._flush_event.set()
         self._llm_flush_event.set()
         if self._writer_thread:
@@ -1008,6 +1023,7 @@ _logger_lock = threading.Lock()
 
 
 def get_logger() -> StructuredLogger:
+    """获取全局单例日志器（线程安全，懒初始化）。"""
     global _logger
     if _logger is None:
         with _logger_lock:
@@ -1018,18 +1034,22 @@ def get_logger() -> StructuredLogger:
 
 # ── 便捷函数 ──
 def log_debug(msg, **extra):
+    """记录 DEBUG 级别日志（使用全局单例）。"""
     get_logger().debug(msg, **extra)
 
 
 def log_info(msg, **extra):
+    """记录 INFO 级别日志（使用全局单例）。"""
     get_logger().info(msg, **extra)
 
 
 def log_warning(msg, **extra):
+    """记录 WARNING 级别日志（使用全局单例）。"""
     get_logger().warning(msg, **extra)
 
 
 def log_error(msg, **extra):
+    """记录 ERROR 级别日志（使用全局单例）。"""
     get_logger().error(msg, **extra)
 
 
@@ -1053,6 +1073,7 @@ class TankLogger:
     """
 
     def __init__(self):
+        """初始化 TankLogger：创建 trace 锁与日志目录。"""
         self._trace: dict | None = None
         self._current_turn: dict | None = None
         self._trace_lock = threading.Lock()
@@ -1061,6 +1082,7 @@ class TankLogger:
 
     @staticmethod
     def _now() -> str:
+        """返回当前时间字符串（格式：YYYY-MM-DD HH:MM:SS）。"""
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── Trace 生命周期 ──
@@ -1425,6 +1447,7 @@ class TankLogger:
 
     @property
     def trace_id(self) -> str | None:
+        """返回当前 trace 的 trace_id（无 trace 时返回 None）。"""
         with self._trace_lock:
             return self._trace["trace_id"] if self._trace else None
 
@@ -1435,6 +1458,7 @@ _tank_logger_lock = threading.Lock()
 
 
 def get_tank_logger() -> TankLogger:
+    """获取全局单例 TankLogger（线程安全，懒初始化）。"""
     global _tank_logger
     if _tank_logger is None:
         with _tank_logger_lock:
@@ -1465,6 +1489,7 @@ class SessionLogger:
     """
 
     def __init__(self):
+        """初始化会话日志器：当前会话/轮次/子轮次、会话目录与轮次计数器"""
         self._current_session: dict | None = None
         self._current_turn: dict | None = None
         self._current_sub_turn: dict | None = None
@@ -1483,6 +1508,7 @@ class SessionLogger:
 
     @staticmethod
     def _now_iso() -> str:
+        """返回当前 ISO 8601 时间字符串。"""
         return datetime.now().isoformat()
 
     @staticmethod
@@ -1821,6 +1847,7 @@ _session_logger_lock = threading.Lock()
 
 
 def get_session_logger() -> SessionLogger:
+    """获取全局单例 SessionLogger（线程安全，懒初始化）。"""
     global _session_logger
     if _session_logger is None:
         with _session_logger_lock:

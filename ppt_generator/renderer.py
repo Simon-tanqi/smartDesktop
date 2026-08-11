@@ -36,6 +36,7 @@ def _px_to_emu(x: float, y: float) -> tuple:
     return emu_x, emu_y
 
 def _px_to_wh(w: float, h: float) -> tuple:
+    """将 1920×1080 坐标系中的像素宽高转为 EMU"""
     emu_w = int(w / SLIDE_W * PPTX_W_INCHES * 914400)
     emu_h = int(h / SLIDE_H * PPTX_H_INCHES * 914400)
     return emu_w, emu_h

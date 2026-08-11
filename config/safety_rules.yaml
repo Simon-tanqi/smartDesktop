@@ -72,8 +72,8 @@ safe_exec:
 
   # 这些模式始终拦截，不进入确认流程（Layer 1 硬拦截）
   always_blocked:
-    - \bformat\s+\w:\b
-    - \bformat\b
+    - '\bformat\s+[A-Za-z]:'
+    - \bFormat-Volume\b
     - \bdel\s+/[fF]\s+/[sS]
     - \brm\s+-rf\s+/
     - \brmdir\s+/[sS]\s+C:\\\\

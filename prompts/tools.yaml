@@ -1,6 +1,13 @@
 # ============================================================
 # smartDesktop 工具声明式配置 - 唯一真相源
 # ============================================================
+# 注入策略说明：
+#   always_inject: 每轮对话始终可用的基础工具（无需加载域）
+#   domains[].tools: 需先调用 load_domain_skills 加载对应域后才可用
+#   若工具同时出现在两处，以 always_inject 为准（始终可用）
+# tier 说明: 1=基础高频  2=进阶  3=复杂/低频
+# personas: 仅用于角色模式关键词触发（match_persona），与 tools/domains 独立；
+#   如需角色绑定工具域，应在外部维护 persona → domains 映射
 
 always_inject:
   - read_file
@@ -27,6 +34,16 @@ tools:
 
   scan_directory:
     desc: 扫描目录第一层，返回 JSON 数组 [path必须已存在]
+    note: |
+      适用场景：
+      - 需要了解某个目录下有哪些文件/子目录（仅第一层，不递归）
+      - 需要确认某个目录是否存在、是否为空
+      - 需要把用户提到的文件名映射到真实绝对路径时，先扫其所在目录定位
+      不适用场景（请改用更合适的工具）：
+      - 需要递归/深层搜索文件 → 用 search_files（可按文件名关键词、扩展名过滤）
+      - 需要按文件内容搜索 → 用 search_content
+      - 需要读取文件内容 → 用 read_file
+      - 需要新建/修改/删除文件 → 用对应的文件操作工具，不要用 scan_directory
     params:
       path: {type: str, desc: 要扫描的目录绝对路径}
     tier: 1
@@ -71,8 +88,8 @@ tools:
       file_path: {type: str, desc: 文件绝对路径}
       old_str: {type: str, desc: 要替换的原文本}
       new_str: {type: str, desc: 新文本}
-      occurrence: {type: int, optional: true, default: 1, desc: 替换第几次出现}
-    note: 默认唯一匹配
+      occurrence: {type: int, optional: true, default: 1, desc: "替换第几次出现(1-based)；old_str 出现多次时只替换第 N 处，其余保留"}
+    note: 只替换第 occurrence 次出现；若 old_str 出现 0 次或次数少于 occurrence，工具会报错而非静默替换，请先用 search_content 确认出现次数
     tier: 1
     tags: [code, edit, general]
 
@@ -103,28 +120,34 @@ tools:
 
 # ==================== GUI自动化工具 ====================
   gui_click:
-    desc: 执行鼠标点击操作
+    desc: 在屏幕指定坐标执行鼠标点击
+    precondition: 坐标必须来自 gui_screenshot 或 gui_locate_image 的返回结果，禁止凭空猜测坐标
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置），用于确认点击是否生效
     params:
-      x: {type: int, desc: "X坐标"}
-      y: {type: int, desc: "Y坐标"}
-      button: {type: str, optional: true, desc: "鼠标按钮(left/right/middle)", default: "left"}
-      clicks: {type: int, optional: true, desc: "点击次数(1=单击,2=双击)", default: 1}
+      x: {type: int, desc: "屏幕X坐标(像素)，须≥0且<屏幕宽度"}
+      y: {type: int, desc: "屏幕Y坐标(像素)，须≥0且<屏幕高度"}
+      button: {type: str, optional: true, desc: "鼠标按钮", default: "left", enum: [left, right, middle]}
+      clicks: {type: int, optional: true, desc: "点击次数", default: 1, enum: [1, 2]}
     tier: 2
     tags: [gui, mouse, automation]
     domains: [gui_automation]
 
   gui_move:
-    desc: 移动鼠标到指定位置
+    desc: 移动鼠标到指定位置（不点击）
+    precondition: 坐标必须来自 gui_screenshot 或 gui_locate_image 的返回结果，禁止凭空猜测坐标
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置）
     params:
-      x: {type: int, desc: "目标X坐标"}
-      y: {type: int, desc: "目标Y坐标"}
-      duration: {type: float, optional: true, desc: "移动持续时间(秒)", default: 0.5}
+      x: {type: int, desc: "目标X坐标(像素)"}
+      y: {type: int, desc: "目标Y坐标(像素)"}
+      duration: {type: float, optional: true, desc: "移动持续时间(秒)，与 gui_tools.gui_move 实现默认值一致", default: 0.3}
     tier: 2
     tags: [gui, mouse, automation]
     domains: [gui_automation]
 
   gui_type:
-    desc: 模拟键盘输入文本
+    desc: 模拟键盘输入文本到当前焦点窗口
+    precondition: 输入前先确认目标输入框已聚焦（可用 gui_click 点击目标区域或 gui_activate 激活窗口）
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置）
     params:
       text: {type: str, desc: "要输入的文本"}
       interval: {type: float, optional: true, desc: "字符间延迟(秒)", default: 0.1}
@@ -133,7 +156,9 @@ tools:
     domains: [gui_automation]
 
   gui_keys:
-    desc: 按下键盘按键
+    desc: 按下键盘按键（组合键/功能键）
+    precondition: 使用前确认目标窗口已激活（可用 gui_activate 激活）
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置）
     params:
       keys: {type: list, desc: "按键列表，如['ctrl', 'c']或['enter']"}
     tier: 2
@@ -142,12 +167,14 @@ tools:
 
   gui_active_window:
     desc: 获取当前活动窗口信息
+    returns: 返回当前活动窗口的标题、类名、位置等信息，用于确认当前焦点窗口
     tier: 2
     tags: [gui, window, info]
     domains: [gui_automation]
 
   gui_find_window:
-    desc: 根据标题查找窗口
+    desc: 根据标题关键词查找窗口
+    returns: 返回匹配窗口的句柄、标题、位置等信息；未找到时返回空结果
     params:
       title_keyword: {type: str, desc: "窗口标题关键词"}
     tier: 2
@@ -155,7 +182,9 @@ tools:
     domains: [gui_automation]
 
   gui_activate:
-    desc: 激活指定窗口
+    desc: 激活指定窗口（将窗口带到前台并获得焦点）
+    precondition: 目标窗口需已存在（可用 gui_find_window 或 gui_active_window 确认）
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置）
     params:
       title_keyword: {type: str, desc: "窗口标题关键词"}
     tier: 2
@@ -163,7 +192,8 @@ tools:
     domains: [gui_automation]
 
   gui_screenshot:
-    desc: 屏幕截图
+    desc: 屏幕截图（全屏或指定区域）
+    returns: 返回截图保存路径；截图用于获取界面坐标、确认界面状态
     params:
       region_x: {type: int, optional: true, desc: "截图区域X坐标"}
       region_y: {type: int, optional: true, desc: "截图区域Y坐标"}
@@ -175,7 +205,9 @@ tools:
     domains: [gui_automation]
 
   gui_locate_image:
-    desc: 在屏幕上定位图像
+    desc: 在屏幕上定位模板图像，返回其中心坐标
+    precondition: 模板图像需预先存在（可用 gui_screenshot 截取目标区域保存为模板）
+    returns: 返回匹配到的中心坐标(x,y)及置信度；未匹配到时返回失败
     params:
       image_path: {type: str, desc: "模板图像路径"}
       confidence: {type: float, optional: true, desc: "匹配置信度(0-1)", default: 0.8}
@@ -184,7 +216,8 @@ tools:
     domains: [gui_automation]
 
   gui_open_app:
-    desc: 打开应用程序
+    desc: 打开应用程序（exe 或系统应用）
+    returns: 返回 success/message，并附带 environment（当前活动窗口标题+鼠标位置）
     params:
       application_path: {type: str, desc: "应用程序路径"}
       wait_time: {type: int, optional: true, desc: "等待应用程序启动时间(秒)", default: 3}
@@ -193,9 +226,17 @@ tools:
     domains: [gui_automation]
 
   gui_workflow:
-    desc: 执行GUI自动化工作流
+    desc: 按顺序执行多步GUI自动化，任一步失败则中止并返回断点环境
+    precondition: 各步骤中的坐标必须来自 gui_screenshot 或 gui_locate_image 的返回结果，禁止凭空猜测
+    returns: 成功返回全部 results（每步 result 列表）；失败返回 failed_step + current_environment，可据此修正后重试
     params:
-      steps: {type: list, desc: "步骤列表，每个步骤包含操作类型和参数"}
+      steps:
+        type: list
+        desc: |
+          步骤对象数组，每项 {action, params}。action 可选:
+          click({x,y,button?,clicks?}) / type({text}) / press_keys({keys}) /
+          move_mouse({x,y}) / wait({seconds}) / screenshot({save_path?})
+          示例: [{"action":"click","params":{"x":100,"y":200}}, {"action":"type","params":{"text":"hello"}}]
     tier: 3
     tags: [gui, automation, workflow]
     domains: [gui_automation]
@@ -205,6 +246,7 @@ tools:
     desc: "【已废弃】请改用 gui_screenshot。截取屏幕并保存为 PNG 文件。"
     deprecated: true
     replaced_by: gui_screenshot
+    inject: false   # 明确不再注入，仅在历史会话兼容时存在
     params:
       left: {type: int, optional: true, desc: 区域左边界像素}
       top: {type: int, optional: true, desc: 区域上边界像素}
@@ -217,7 +259,7 @@ tools:
     domains: []
 
   write_file:
-    desc: 创建新文件，自动建父目录，已存在则重命名
+    desc: 写入文件，自动建父目录；文件已存在且 overwrite=true（默认）时直接覆盖，overwrite=false 且文件已存在时报错不写入
     params:
       file_path: {type: str, desc: 文件绝对路径}
       content: {type: str, desc: 文件内容}
@@ -227,26 +269,27 @@ tools:
     domains: [code_dev]
 
   run_python:
-    desc: 执行 Python（数据分析/图表/文件遍历）。库：pandas/openpyxl/matplotlib/xlsxwriter
+    desc: 在受限沙箱中执行 Python（数据分析/图表/文件遍历）。库：pandas/openpyxl/matplotlib/xlsxwriter。禁止 input()/网络/系统命令/动态导入；文件读写仅限工作目录；超时默认 30s
     params:
       code: {type: str, desc: 完整Python代码，用print()输出}
-      timeout: {type: int, default: 300}
-    note: 不可用input()
+      timeout: {type: int, optional: true, default: 30, desc: 执行超时秒数（与实现默认一致）}
     tier: 2
     tags: [code, general]
     domains: [code_dev, excel_analyze]
 
   execute_command:
     desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg。注：音量/音频命令自动路由到 system_audio 执行。通用兜底工具：同一目标存在专用工具（如 extract_word_text/create_word_document/excel_analyze 域工具等）时，必须先尝试专用工具，仅当专用工具无法满足需求时才使用本工具，且须在 reasoning_trace 说明专用工具无法满足的原因
-    params: {command: {type: str, desc: 要执行的PowerShell命令字符串}}
-    note: 禁止 rm -rf/format/shutdown。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
+    params:
+      command: {type: str, desc: 要执行的PowerShell命令字符串}
+    note: 禁止 rm -rf/format/shutdown；C 盘文件删除操作一律拒绝。删除分级：临时文件夹免确认、非 C 盘单文件删除 P2 普通确认、非 C 盘批量删除 P1 挑战确认。卸载分级：C 盘内软件 P1 挑战确认、非 C 盘软件 P2 普通确认。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
     tier: 2
     tags: [shell, system, general]
     domains: [system_high_risk]
 
   get_uninstall_string:
     desc: 获取软件的卸载命令路径。卸载软件时必须首先调用此工具获取卸载程序路径，返回 DisplayName、UninstallString、InstallLocation 等信息，避免手动查询注册表。获取到卸载路径后，必须调用 execute_command 工具执行卸载程序
-    params: {program_name: {type: str, desc: 软件名称，支持模糊匹配，如"迅雷"、"Thunder"}}
+    params:
+      program_name: {type: str, desc: 软件名称，支持模糊匹配，如"迅雷"、"Thunder"}
     tier: 1
     tags: [system, uninstall, software]
     domains: [system_high_risk]
@@ -258,9 +301,21 @@ tools:
     tags: [system, config, registry]
     domains: [system_high_risk]
 
+  verify_uninstall:
+    desc: 验证软件是否已卸载成功（卸载后调用）。按软件名称模糊匹配注册表，返回残留注册表项/安装目录
+    precondition: 须先调用 get_uninstall_string 获取卸载路径并执行卸载后，再调用本工具验证
+    returns: 返回 JSON：remaining_entries（残留注册表项）、remaining_files（残留安装目录）、uninstalled（是否彻底卸载）
+    params:
+      program_name: {type: str, desc: 软件名称，支持模糊匹配}
+      registry_path: {type: str, optional: true, desc: 可选的注册表路径，用于精确验证}
+    tier: 1
+    tags: [system, uninstall, verify]
+    domains: [system_high_risk]
+
   web_search:
     desc: 网页搜索，返回标题+链接+摘要列表
-    params: {query: {type: str, desc: 搜索关键词}}
+    params:
+      query: {type: str, desc: 搜索关键词}
     tier: 2
     tags: [web, search]
     domains: [web_browse]
@@ -277,7 +332,8 @@ tools:
 
   get_weather:
     desc: 查询天气，默认深圳
-    params: {city: {type: str, default: 深圳}}
+    params:
+      city: {type: str, optional: true, default: 深圳, desc: 城市名}
     tier: 2
     tags: [web, weather]
     domains: [web_browse]
@@ -294,7 +350,7 @@ tools:
   system_audio:
     desc: 音频控制（音量/静音/麦克风/设备切换），value 0-100
     params:
-      operation: {type: str, desc: 操作类型}
+      operation: {type: str, desc: "操作类型", enum: [get_volume, set_volume, toggle_mute, get_mic_volume, set_mic_volume, toggle_mic_mute, list_devices]}
       value: {type: int, optional: true, desc: 音量值 0-100}
       device: {type: str, optional: true, desc: 设备名关键词}
     note: 仅 set_volume/set_mic_volume 需要 value 参数
@@ -305,7 +361,7 @@ tools:
   display_config:
     desc: 显示设置（分辨率/亮度/多显示器/缩放），AutoHotkey 封装
     params:
-      operation: {type: str, desc: "操作类型: set_resolution/set_brightness/list_displays"}
+      operation: {type: str, desc: "操作类型", enum: [set_resolution, set_brightness, list_displays]}
       value: {type: str, optional: true, desc: '分辨率如"1920x1080"或亮度如"80"'}
     note: 依赖 AHK 脚本，仅 Windows
     tier: 2
@@ -346,7 +402,7 @@ tools:
       file_path: {type: str, desc: 文件保存绝对路径}
       data: {type: list, desc: 数据列表(字典或列表)}
       sheet_name: {type: str, optional: true, default: "Sheet1", desc: 工作表名}
-      mode: {type: str, optional: true, default: "write", desc: write(覆盖)/append(追加)/new_sheet(新建Sheet)}
+      mode: {type: str, optional: true, default: "write", desc: "写入模式", enum: [write, append, new_sheet]}
     tier: 2
     tags: [excel, write, analysis]
     domains: [excel_analyze]
@@ -377,7 +433,7 @@ tools:
     desc: 转换Excel文件格式（xlsx/xls/csv）
     params:
       file_path: {type: str, desc: 源文件绝对路径}
-      output_format: {type: str, desc: 输出格式(xlsx/xls/csv)}
+      output_format: {type: str, desc: "输出格式", enum: [xlsx, xls, csv]}
     tier: 3
     tags: [excel, convert, format]
     domains: [excel_analyze]
@@ -389,7 +445,7 @@ tools:
       file_path: {type: str, desc: Excel文件绝对路径}
       index_cols: {type: list, desc: 行索引列名列表}
       value_cols: {type: list, desc: 数值列名列表}
-      agg_func: {type: str, default: sum, desc: 聚合函数(sum/mean/count)}
+      agg_func: {type: str, optional: true, default: sum, desc: "聚合函数", enum: [sum, mean, count]}
     tier: 3
     tags: [excel, pivot, analysis]
     domains: [excel_analyze]
@@ -402,6 +458,19 @@ tools:
       operations: {type: dict, optional: true, desc: 格式化操作配置}
     tier: 3
     tags: [excel, format, styling]
+    domains: [excel_analyze]
+
+  excel_conditional_format:
+    desc: 设置Excel条件格式（单元格颜色/图标/数据条等）
+    params:
+      file_path: {type: str, desc: Excel文件绝对路径}
+      sheet_name: {type: str, optional: true, desc: 工作表名}
+      cell_range: {type: str, desc: 单元格范围如"A1:C10"}
+      condition_type: {type: str, desc: "条件类型", enum: [cellIs, greaterThan, lessThan, between, containsText]}
+      rule: {type: dict, desc: "条件规则如 {operator: greaterThan, value: 100}"}
+      style: {type: dict, optional: true, desc: "样式配置如 {bg_color: 'FF0000'}"}
+    tier: 3
+    tags: [excel, conditional, formatting]
     domains: [excel_analyze]
 
   excel_chart_advanced:
@@ -466,7 +535,7 @@ tools:
     desc: 批量处理Word文档。内部已集成所有依赖，直接调用，禁止使用execute_command检查环境
     params:
       directory: {type: str, desc: 文件夹绝对路径}
-      operation: {type: str, desc: 操作类型(extract_info/word_count)}
+      operation: {type: str, desc: "操作类型", enum: [extract_info, word_count]}
       params: {type: dict, optional: true, desc: 操作参数}
     tier: 3
     tags: [word, batch, processing]
@@ -480,7 +549,7 @@ tools:
       slides:
         type: list
         desc: "幻灯片列表。每项 {template, data}。template 支持: cover/section/content/icon_grid/chart/table/image_text/comparison"
-      theme: {type: str, default: tech_blue, desc: "主题: tech_blue(科技蓝)/business_gray(商务灰)/gradient_purple(渐变紫)/education_orange(教育橙)/minimal_dark(极简黑)"}
+      theme: {type: str, optional: true, default: tech_blue, desc: "主题配色", enum: [tech_blue, business_gray, gradient_purple, education_orange, minimal_dark]}
       output_path: {type: str, optional: true, desc: "输出路径，默认自动生成"}
     tier: 2
     tags: [ppt, generate, visual, design]
@@ -656,8 +725,6 @@ domains:
       - 汇报
     tools:
       - generate_ppt
-      - create_presentation
-      - add_slide_content
       - extract_presentation_info
       - export_presentation_text
       - batch_ppt_process

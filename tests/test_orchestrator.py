@@ -31,11 +31,13 @@ from tests.confirm_gate import ConfirmGate
 
 
 def _load_cases():
+    """加载全部测试用例"""
     md = os.path.join(BASE, "docs", "test_cases.md")
     return parse_test_cases(md)
 
 
 def select_cases(all_cases, args):
+    """按参数筛选测试用例"""
     if args.ids:
         wanted = {i.strip().upper() for i in args.ids.split(",") if i.strip()}
         return [c for c in all_cases if c.id.upper() in wanted]
@@ -47,6 +49,7 @@ def select_cases(all_cases, args):
 
 
 def run_one(tc, run_id, gate, max_retry, per_case_timeout=900):
+    """执行单题并评分，支持重试取最佳结果"""
     rank = {"PASS": 3, "MANUAL_REVIEW": 2, "FAIL": 1}
     best = None
     for i in range(max_retry + 1):
@@ -83,6 +86,7 @@ def _run_single_with_timeout(tc, run_id, gate, retry_index, per_case_timeout):
     out = {}
 
     def _worker():
+        """后台线程执行单题真实运行"""
         try:
             rr, test_dir = run_single_test(tc, run_id, gate, retry_index=retry_index)
             out["rr"], out["dir"] = rr, test_dir
@@ -122,6 +126,7 @@ def _run_single_with_timeout(tc, run_id, gate, retry_index, per_case_timeout):
 
 
 def run_all(args):
+    """运行全部选中用例并汇总结果与报告"""
     cases = _load_cases()
     selected = select_cases(cases, args)
     if not selected:
@@ -185,6 +190,7 @@ def run_all(args):
 
 
 def main():
+    """命令行入口"""
     p = argparse.ArgumentParser(description="Tank Smart 真实测试编排器")
     p.add_argument("--all", action="store_true", help="运行全部 55 题")
     p.add_argument("--category", help="按类别筛选（子串匹配）")

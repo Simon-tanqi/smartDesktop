@@ -25,7 +25,9 @@ from logger import get_logger
 _MAX_CONNS_PER_THREAD = 8
 
 class _ThreadLocalPool(threading.local):
+    """线程本地 SQLite 连接池：按数据库路径缓存连接，配合 LRU 追踪控制每线程连接上限"""
     def __init__(self):
+        """初始化线程本地连接池与 LRU 访问追踪"""
         self.conn_pool = {}    # db_path -> conn
         self.access = []       # LRU 追踪
 
@@ -239,12 +241,14 @@ def _get_conn_simple(db_path, row_factory=False):
 # ═══════════════════════════════════════════════
 
 def _sanitize(text):
+    """将文本中的换行与制表符替换为空格并压缩连续空白"""
     if not text:
         return ""
     return " ".join(text.replace("\r", " ").replace("\n", " ").replace("\t", " ").split())
 
 
 def _truncate(s, max_len=500):
+    """截断文本到指定长度，超出时追加截断标记"""
     s = str(s) if s else ""
     return s[:max_len] + "...(截断)" if len(s) > max_len else s
 
@@ -254,6 +258,7 @@ def _truncate(s, max_len=500):
 # ═══════════════════════════════════════════════
 
 def _init_trace_tables(conn):
+    """初始化 Agent 追踪日志表结构（WAL、建表与索引）"""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_trace (
@@ -283,6 +288,7 @@ def log_trace(trace_id, span_name, node_type, duration_ms,
               provider=None, model_name=None, model_params=None,
               input_summary=None, output_summary=None,
               error=None, status="success", extra=None):
+    """写入一条 Agent 追踪日志记录，自动建表并对摘要字段截断"""
     with _get_conn_simple(TRACE_DB) as conn:
         _init_trace_tables(conn)
         conn.execute("""
@@ -302,6 +308,7 @@ def log_trace(trace_id, span_name, node_type, duration_ms,
 # ═══════════════════════════════════════════════
 
 def _init_oplog_tables(conn):
+    """初始化操作日志表结构（WAL、建表与索引）"""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS operation_log (
@@ -320,6 +327,7 @@ def _init_oplog_tables(conn):
 
 
 def log_operation(trace_id, user_id, session_id, operation, detail=""):
+    """写入一条操作日志记录，自动建表并对详情做空白清洗"""
     detail = _sanitize(detail)
     with _get_conn_simple(OPERATION_LOG_DB) as conn:
         _init_oplog_tables(conn)
@@ -386,6 +394,7 @@ def _migrate_chat_history_drop_unique(conn):
 
 
 def _init_chat_tables(conn):
+    """初始化聊天记录表结构，补齐旧表缺失列与索引"""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
@@ -426,6 +435,7 @@ def add_chat_message(session_id, role, content, msg_type="chat",
                      trace_id="", user_id="", timestamp="", msg_id="",
                      is_temporary=False, tool_calls="", thinking_summary="",
                      tool_call_id=""):
+    """写入一条聊天消息，约束冲突时记录警告日志"""
     if role not in ("user", "assistant", "system", "tool"):
         return
     db_path = get_session_messages_db(session_id)
@@ -468,6 +478,7 @@ def add_chat_message(session_id, role, content, msg_type="chat",
 
 
 def get_chat_messages(session_id, limit=200, offset=0):
+    """分页读取会话聊天消息（仅 chat 类型），数据库异常时返回空列表"""
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
@@ -594,6 +605,7 @@ def _get_chat_messages_with_ids(session_id, msg_type_filter="chat"):
 
 
 def delete_chat_messages_before(session_id, before_id):
+    """删除指定 ID 之前的全部聊天消息"""
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return
@@ -609,6 +621,7 @@ def delete_chat_messages_before(session_id, before_id):
 
 
 def count_chat_messages(session_id):
+    """统计会话聊天消息总数"""
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return 0
@@ -714,6 +727,7 @@ def clear_session_messages(session_id: str, keep_system: bool = True):
 # ═══════════════════════════════════════════════
 
 def _init_summary_tables(conn):
+    """初始化压缩摘要表结构（WAL、建表与索引）"""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS summaries (

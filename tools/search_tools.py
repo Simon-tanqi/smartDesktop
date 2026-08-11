@@ -50,6 +50,7 @@ _session_lock = threading.Lock()
 
 
 def _get_session() -> requests.Session:
+    """获取全局 requests 会话（线程安全懒加载），统一超时与重试配置。"""
     global _session
     if _session is None:
         with _session_lock:
@@ -85,12 +86,14 @@ class _SearchCache:
     """线程安全的搜索缓存"""
 
     def __init__(self, ttl: int = 300, max_size: int = 200):
+        """初始化 TTL 缓存：设置容量上限与条目过期时间。"""
         self._cache: Dict[str, Tuple[float, str]] = {}
         self._lock = threading.Lock()
         self._ttl = ttl
         self._max_size = max_size
 
     def get(self, key: str) -> Optional[str]:
+        """读取缓存项，不存在或已过期时返回 None。"""
         with self._lock:
             if key in self._cache:
                 ts, value = self._cache[key]
@@ -100,6 +103,7 @@ class _SearchCache:
         return None
 
     def set(self, key: str, value: str):
+        """写入缓存项，超出容量上限时淘汰最旧条目。"""
         with self._lock:
             if len(self._cache) >= self._max_size:
                 oldest = min(self._cache, key=lambda k: self._cache[k][0])
@@ -111,6 +115,7 @@ _cache = _SearchCache()
 
 
 def _cache_key(func_name: str, query: str) -> str:
+    """生成查询缓存键：函数名与规范化查询的 MD5 值。"""
     return hashlib.md5(f"{func_name}:{query.lower().strip()}".encode()).hexdigest()
 
 
@@ -207,12 +212,14 @@ def _compute_relevance(query: str, title: str, snippet: str) -> float:
 
 
 def _jaccard(a: set, b: set) -> float:
+    """计算两个集合的 Jaccard 相似度，任一为空时返回 0。"""
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
 
 
 def _is_blacklisted(url: str) -> bool:
+    """判断 URL 域名是否命中黑名单列表。"""
     try:
         domain = urlparse(url).netloc.lower().lstrip("www.")
         return any(bl in domain for bl in _DOMAIN_BLACKLIST)

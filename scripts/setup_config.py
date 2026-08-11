@@ -1,3 +1,9 @@
+"""交互式配置初始化脚本：引导用户选择后端并写入运行配置。
+
+独立运行（python scripts/setup_config.py），不依赖 llm_client，避免模块级
+加载配置报错。API Key 优先写入系统凭据管理器（keyring），非敏感配置
+保存至 %APPDATA%\\smartDesktop\\config.yaml。
+"""
 # setup_config.py — 独立运行，不依赖 llm_client（避免模块级 load_config 报错）
 import os, yaml
 import keyring

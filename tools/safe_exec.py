@@ -32,6 +32,7 @@ _COMMAND_NORMALIZATIONS = [
 ]
 
 def _normalize_command(script: str) -> str:
+    """规范化命令文本：按预设规则统一大小写与别名，便于后续安全匹配。"""
     for pattern, replacement in _COMMAND_NORMALIZATIONS:
         script = re.sub(pattern, replacement, script, flags=re.IGNORECASE)
     return script
@@ -64,16 +65,19 @@ def _powershell_quote(s: str) -> str:
 def _expand_env_vars(token: str) -> str:
     """展开环境变量：%VAR%、$env:VAR、${env:VAR}、$HOME、$PSHOME 等"""
     def repl_percent(m):
+        """正则替换回调：将 %VAR% 形式的 Windows 环境变量替换为实际值。"""
         var = m.group(1)
         return os.environ.get(var, m.group(0))
     token = re.sub(r'%([^%]+)%', repl_percent, token)
     
     def repl_env(m):
+        """正则替换回调：将 $env:VAR 形式的环境变量替换为实际值。"""
         var = m.group(1)
         return os.environ.get(var, m.group(0))
     token = re.sub(r'\$env:([A-Za-z_][A-Za-z0-9_]*)', repl_env, token, flags=re.IGNORECASE)
     
     def repl_env_braces(m):
+        """正则替换回调：将 ${env:VAR} 形式的环境变量替换为实际值。"""
         var = m.group(1)
         return os.environ.get(var, m.group(0))
     token = re.sub(r'\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}', repl_env_braces, token, flags=re.IGNORECASE)
@@ -92,6 +96,7 @@ def _expand_env_vars(token: str) -> str:
 _confirmation_manager = None
 
 def _get_confirmation_manager():
+    """懒加载并缓存全局确认管理器实例。"""
     global _confirmation_manager
     if _confirmation_manager is None:
         from core.confirmation_manager import confirmation_manager as _cm
@@ -103,6 +108,7 @@ _config_cache_mtime = 0
 _config_cache_lock = threading.Lock()
 
 def _get_safety_config_cached():
+    """读取安全规则配置并缓存，检测文件变更后自动刷新。"""
     global _config_cache, _config_cache_mtime
     config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "safety_rules.yaml")
     with _config_cache_lock:
@@ -123,6 +129,7 @@ def _get_safety_config_cached():
 
 @register_tool
 def invalidate_config_cache():
+    """清空安全配置缓存，强制下次调用时重新加载。"""
     global _config_cache, _config_cache_mtime
     with _config_cache_lock:
         _config_cache = None
@@ -133,6 +140,7 @@ def _evict_stale_challenges():
     return _get_confirmation_manager().cleanup_expired()
 
 def _get_log_path():
+    """获取安全执行日志文件路径，目录不存在时自动创建。"""
     try:
         from config.settings import DATA_DIR
     except ImportError:
@@ -144,6 +152,7 @@ def _get_log_path():
 _log_lock = threading.Lock()
 
 def _log(level, message):
+    """记录一条安全执行日志，转义换行后追加写入日志文件。"""
     try:
         safe_msg = message.replace('\n', '\\n').replace('\r', '\\r')
         log_path = _get_log_path()
@@ -208,10 +217,13 @@ def _extract_paths_from_command(command: str, cwd: str = None) -> list:
     return []
 
 def _is_modify_command(command: str) -> bool:
+    """判断命令是否属于修改类操作（删除/覆盖/写入等）。"""
     config = _get_safety_config_cached()
     modify_patterns = list(config.delete_command_patterns) + [
         r'\b(?:del|erase|rm|rd|ri|Remove-Item|Clear-Content|Set-Content|Add-Content|Out-File)\b',
-        r'\b(?:format|diskpart|chkdsk|defrag|sfc)\b',
+        r'\b(?:diskpart|chkdsk|defrag|sfc)\b',
+        r'\bformat\s+[A-Za-z]:',
+        r'\bFormat-Volume\b',
         r'\b(?:reg\s+(?:add|delete|import|export|save|unload))\b',
         r'\b(?:wmic\s+product\s+call\s+uninstall)\b',
         r'\b(?:sc\s+(?:delete|config|stop))\b',
@@ -227,6 +239,7 @@ def _path_matches_protected(path: str, protected_patterns: list) -> str | None:
     正确逻辑：用户路径是否会覆盖/匹配受保护目录。
     """
     def _wildcard_to_regex(pattern_str):
+        """将通配符模式（* 与 ?）转换为等价的正则表达式。"""
         escaped = re.escape(pattern_str)
         escaped = escaped.replace('\\*', '.*').replace('\\?', '.')
         return '^' + escaped + '$'
@@ -361,6 +374,7 @@ def _check_protected_paths(command: str, cwd: str = None, args_list: list = None
 # 危险检测（增强版，拼接、间接执行、变量赋值等）
 # =============================================================================
 def _check_dangerous_pipeline(command: str) -> tuple:
+    """检测命令管道中是否包含危险组合，返回（是否危险，原因说明）。"""
     safe_pipeline_prefixes = [
         r'\bGet-', r'\bSelect-', r'\bWhere-', r'\bForEach-', r'\bFormat-',
         r'\bSort-', r'\bGroup-', r'\bMeasure-', r'\bCompare-', r'\bConvert-',
@@ -377,14 +391,18 @@ def _check_dangerous_pipeline(command: str) -> tuple:
     dangerous_pipeline_targets = [
         (r'\|\s*(?:bash|sh|cmd|powershell|pwsh)\b', '跨进程命令注入', 'challenge'),
         (r'\|\s*(?:rm|del|erase|rd|ri|Remove-Item)\b', '管道后执行删除', 'challenge'),
-        (r'\|\s*(?:format|diskpart|chkdsk|sfc)\b', '管道后执行系统操作', 'challenge'),
+        (r'\|\s*format\s+[A-Za-z]:', '管道后执行磁盘格式化', 'challenge'),
+        (r'\|\s*Format-Volume\b', '管道后执行磁盘格式化', 'challenge'),
+        (r'\|\s*(?:diskpart|chkdsk|sfc)\b', '管道后执行系统操作', 'challenge'),
         (r'\|\s*(?:reg\s+add|reg\s+delete|reg\s+import)\b', '管道后执行注册表修改', 'challenge'),
         (r'\|\s*(?:wmic\s+product\s+call\s+uninstall)\b', '管道后执行卸载', 'challenge'),
         (r'\|\s*(?:sc\s+delete|sc\s+config)\b', '管道后执行服务操作', 'challenge'),
     ]
     dangerous_semicolon_patterns = [
         (r';\s*(?:rm|del|erase|rd|ri|Remove-Item)\b', '分号后执行删除', 'challenge'),
-        (r';\s*(?:format|diskpart)\b', '分号后执行系统操作', 'challenge'),
+        (r';\s*format\s+[A-Za-z]:', '分号后执行磁盘格式化', 'challenge'),
+        (r';\s*Format-Volume\b', '分号后执行磁盘格式化', 'challenge'),
+        (r';\s*(?:diskpart)\b', '分号后执行系统操作', 'challenge'),
         (r';\s*(?:reg\s+add|reg\s+delete)\b', '分号后执行注册表修改', 'challenge'),
     ]
 
@@ -422,6 +440,7 @@ def _check_dangerous_pipeline(command: str) -> tuple:
 
 
 def _check_danger(command: str):
+    """综合检查命令安全性，返回是否危险及风险说明。"""
     config = _get_safety_config_cached()
     # 先去除字符串字面量，降低误报
     stripped = _strip_string_literals(command)
@@ -432,7 +451,9 @@ def _check_danger(command: str):
         (r'(?<![A-Za-z])del\s+', '删除文件/目录 (del 别名)', 'challenge'),
         (r'(?<![A-Za-z])ri\s+', '删除文件/目录 (ri 别名)', 'challenge'),
         (r'(?<![A-Za-z])rd\s+', '删除目录 (rd 别名)', 'challenge'),
-        (r'\b(?:erase|format|diskpart)\b', '文件系统破坏操作', 'challenge'),
+        (r'\b(?:erase|diskpart)\b', '文件系统破坏操作', 'challenge'),
+        (r'\bformat\s+[A-Za-z]:', '磁盘格式化', 'challenge'),
+        (r'\bFormat-Volume\b', '磁盘格式化', 'challenge'),
         # 间接执行（& 后可跟空格或引号）
         (r'\b(?:iex|Invoke-Expression|Start-Job)\s+', '间接执行 (调用操作符)', 'challenge'),
         (r'(?<![A-Za-z])&\s*(?:["\']|[\w/\\:])', '& 调用运算符', 'challenge'),
@@ -463,6 +484,7 @@ def _check_danger(command: str):
 
 @register_tool
 def is_dangerous(command):
+    """对外暴露的命令安全判定入口。"""
     danger, _, _ = _check_danger(command)
     return danger
 

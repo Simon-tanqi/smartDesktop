@@ -297,6 +297,7 @@ class DependencyChecker:
     """依赖检查器，启动时验证所有依赖"""
     
     def __init__(self):
+        """初始化依赖检查器：结果缓存与检查状态。"""
         self._checked = False
         self._results: Dict[str, Dict[str, Any]] = {}
     
@@ -431,6 +432,7 @@ class FeatureAvailability:
     """检查各功能是否可用"""
     
     def __init__(self, checker: DependencyChecker):
+        """初始化功能代理：绑定检查器并初始化可用性缓存。"""
         self._checker = checker
         self._availability: Dict[str, bool] = {}
     

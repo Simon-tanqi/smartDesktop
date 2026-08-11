@@ -1,3 +1,4 @@
+"""请求路由模块：闲聊匹配、高频固化缓存、复杂度判断与统一路由入口。"""
 import json
 import hashlib
 import difflib
@@ -107,6 +108,7 @@ _CHAT_MATCHES: dict[str, str] = {
 
 
 def _has_task_verb(msg: str) -> bool:
+    """判断消息是否包含任务动词与名词组合（用于区分闲聊与任务请求）。"""
     msg_lower = msg.lower()
     for verb in _TASK_VERBS:
         if verb in msg_lower:
@@ -121,6 +123,7 @@ def _has_task_verb(msg: str) -> bool:
 
 
 def check_chat_layer(user_message: str, context: dict = None) -> str | None:
+    """闲聊路由层：精确/模糊匹配闲聊库，命中返回回复文本，否则返回 None。"""
     msg_lower = user_message.strip().lower()
     
     if msg_lower in _CHAT_MATCHES:
@@ -145,6 +148,7 @@ def check_chat_layer(user_message: str, context: dict = None) -> str | None:
 
 
 def _enhance_greeting_with_context(base_reply: str, context: dict) -> str:
+    """根据会话历史中的用户姓名增强问候语；失败时回退到基础回复。"""
     from memory import get_chat_messages
     
     try:
@@ -168,6 +172,7 @@ def _enhance_greeting_with_context(base_reply: str, context: dict) -> str:
 
 
 def _extract_user_name(messages: list) -> str | None:
+    """从最近消息中提取用户自报姓名（匹配"我叫 xxx"句式）。"""
     for msg in reversed(messages[-10:]):
         content = msg.get('content', '').lower()
         if '我叫' in content:
@@ -180,6 +185,7 @@ def _extract_user_name(messages: list) -> str | None:
 
 
 def _get_time_enhanced_greeting() -> str:
+    """按当前时间段返回对应的问候语。"""
     hour = time.localtime().tm_hour
     
     if 5 <= hour < 9:
@@ -205,6 +211,7 @@ _WORKFLOW_MAX_FAIL = 2
 
 
 def _msg_hash(user_message: str) -> str:
+    """对消息做归一化后生成固定长度哈希，用于固化记录精确匹配。"""
     normalized = user_message.strip().lower()
     normalized = _re.sub(r'[^\w\s]', '', normalized)
     normalized = _re.sub(r'\s+', ' ', normalized).strip()
@@ -262,6 +269,7 @@ def _resolve_param_value(value, variables: dict, step_captures: dict) -> object:
             return value
         # 替换所有 ${xxx} 引用
         def _replace(match):
+            """解析单个 ${ref} 引用：支持变量、步骤捕获与字段路径取值。"""
             ref = match.group(1).strip()
             if "." in ref:
                 # ${step_name.field} 形式
@@ -302,6 +310,7 @@ def _resolve_param_value(value, variables: dict, step_captures: dict) -> object:
 
 
 def _load_cached_actions() -> dict:
+    """读取高频固化缓存；文件缺失或损坏时回退为空结构并备份损坏文件。"""
     if not os.path.exists(_CACHED_ACTIONS_PATH):
         return {"固化记录": {}}
     try:
@@ -319,6 +328,7 @@ def _load_cached_actions() -> dict:
 
 
 def _save_cached_actions(data: dict):
+    """原子写入高频固化缓存（临时文件 + 替换）。"""
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
                                       dir=DATA_DIR, delete=False, suffix=".tmp") as tf:
         json.dump(data, tf, ensure_ascii=False, indent=2)
@@ -327,6 +337,7 @@ def _save_cached_actions(data: dict):
 
 
 def _trim_cached_actions(data: dict) -> dict:
+    """当固化记录超出上限时按成功次数排序裁剪，保留最常用的条目。"""
     records = data.get("固化记录", {})
     if len(records) <= _CACHED_ACTIONS_MAX_ENTRIES:
         return data
@@ -339,6 +350,7 @@ def _trim_cached_actions(data: dict) -> dict:
 
 
 def check_frequent_cache(user_message: str) -> tuple[bool, str | None]:
+    """高频固化路由层：依次尝试精确哈希、骨架、模糊匹配，命中即返回 (True, 回复)。"""
     try:
         with _CACHED_ACTIONS_LOCK:
             cache = _load_cached_actions()
@@ -595,6 +607,7 @@ def _increment_fail_count(label: str, record: dict):
 
 
 def _execute_cached_action(record: dict, user_message: str) -> tuple[bool, str | None]:
+    """执行 legacy 单工具固化动作，返回 (成功, 回复文本)。"""
     try:
         tool_name = record.get("固化参数", {}).get("tool", "")
         params = record.get("固化参数", {}).get("params", {})
@@ -879,6 +892,7 @@ _COMPLEXITY_CACHE_TTL = 300
 
 
 def check_complexity(user_message: str, model_choice: dict, context: dict = None) -> str:
+    """复杂度路由层：规则打分 + 可选 LLM 加权融合，返回"复杂/简单"。"""
     domains = context.get('detected_domains', []) if context else []
     domain_str = "_".join(sorted(domains))
     cache_key = hashlib.md5(f"{user_message}_{model_choice.get('model', '')}_{domain_str}".encode()).hexdigest()
@@ -973,6 +987,7 @@ def check_complexity(user_message: str, model_choice: dict, context: dict = None
 
 
 def _llm_complexity_judgment(user_message: str, model_choice: dict, base_score: float) -> str:
+    """调用 LLM 对复杂度做二次判断；API Key 缺失或调用失败时回退规则结果。"""
     # 非 Ollama 模型且未配置 API Key 时跳过 LLM 调用，直接使用规则判断
     provider = model_choice.get("provider", "")
     if provider != "ollama":
@@ -1043,6 +1058,7 @@ def _llm_complexity_judgment(user_message: str, model_choice: dict, base_score: 
 
 
 def _cleanup_complexity_cache():
+    """清理复杂度缓存中已过期的条目。"""
     with _complexity_cache_lock:
         current_time = time.time()
         expired_keys = [
@@ -1067,6 +1083,7 @@ def get_max_turns(complexity: str) -> int:
 # ============================================================
 
 def route(user_message: str, model_choice: dict, context: dict = None) -> dict:
+    """统一路由入口：依次走闲聊、高频固化、复杂度三层，返回路由结果字典。"""
     try:
         chat_reply = check_chat_layer(user_message, context)
         if chat_reply is not None:

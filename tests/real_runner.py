@@ -41,6 +41,7 @@ def _ensure_target_model_available():
     _orig = getattr(_lc, "_orig_get_available_models", None) or _lc.get_available_models
 
     def _patched(*args, **kwargs):
+        """包装可用模型列表：将目标模型置顶"""
         models = list(_orig(*args, **kwargs))
         entry_idx = None
         for i, m in enumerate(models):
@@ -75,6 +76,7 @@ def _ensure_target_model_available():
     _orig_cache = getattr(_lc, "_orig_get_model_from_cache", None) or _lc.get_model_from_cache
 
     def _patched_cache(model_id):
+        """按模型 ID 返回目标模型配置"""
         if model_id == MODEL_CHOICE["id"]:
             return dict(_CFG_ENTRY)
         return _orig_cache(model_id)
@@ -85,6 +87,7 @@ def _ensure_target_model_available():
     _orig_base_url = getattr(_lc, "_orig_get_base_url", None) or _lc.get_base_url
 
     def _patched_base_url(model_id):
+        """返回目标模型的 base_url"""
         if model_id == MODEL_CHOICE["id"]:
             return MODEL_CHOICE["base_url"]
         return _orig_base_url(model_id)
@@ -107,6 +110,7 @@ ARTIFACTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artif
 
 
 def _setup_logging(run_id):
+    """配置运行日志输出到 run 目录"""
     log_dir = os.path.join(ARTIFACTS_ROOT, "run_%s" % run_id, "logs")
     os.makedirs(log_dir, exist_ok=True)
     fh = logging.FileHandler(
@@ -117,6 +121,7 @@ def _setup_logging(run_id):
 
 
 def parse_sse(chunk):
+    """解析 SSE 数据块为 JSON，无效返回 None"""
     if not chunk:
         return None
     s = chunk
@@ -137,6 +142,7 @@ PATH_KEYS = ("file_path", "path", "output_path", "filename", "output_file", "fil
 
 
 def collect_created_files(tool_calls):
+    """从工具调用参数中收集真实存在的输出文件"""
     files = []
     for t in tool_calls:
         args = t.get("args") or {}
@@ -265,5 +271,6 @@ def run_single_test(tc, run_id, gate, retry_index=0):
 
 
 def write_result(test_dir, run_result):
+    """将单题运行结果写入 result.json"""
     with io.open(os.path.join(test_dir, "result.json"), "w", encoding="utf-8") as f:
         json.dump(run_result, f, ensure_ascii=False, indent=2)

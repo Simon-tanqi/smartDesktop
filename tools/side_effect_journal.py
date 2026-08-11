@@ -23,6 +23,7 @@ class SideEffectRecord:
 
     def __init__(self, tool_name: str, arguments: Dict[str, Any], description: str,
                  compensate: Callable[[], Optional[str]], sequence: int):
+        """初始化副作用记录：工具名、参数、描述、补偿回调与序号。"""
         self.tool_name = tool_name
         self.arguments = dict(arguments)
         self.description = description
@@ -33,6 +34,7 @@ class SideEffectRecord:
     def to_dict(self) -> Dict[str, Any]:
         """序列化为可审计字典（参数截断展示，避免超大值撑爆上下文）。"""
         def _shorten(v: Any) -> Any:
+            """将参数值截断为可读短文本，避免日志过长。"""
             if isinstance(v, (int, float, bool)) or v is None:
                 return v
             s = str(v)
@@ -53,6 +55,7 @@ class SideEffectJournal:
     """
 
     def __init__(self, max_records: int = 200):
+        """初始化副作用日志：记录列表、线程锁与序号计数器。"""
         self._records: List[SideEffectRecord] = []
         self._lock = threading.RLock()
         self._sequence = 0
@@ -107,6 +110,7 @@ class SideEffectJournal:
         return self._execute_compensate(rec)
 
     def _execute_compensate(self, rec: SideEffectRecord) -> Dict[str, Any]:
+        """执行单条记录的补偿回调，返回执行结果。"""
         try:
             detail = rec.compensate()
             return {
@@ -131,6 +135,7 @@ class SideEffectJournal:
             return [r.to_dict() for r in self._records]
 
     def count(self) -> int:
+        """返回当前已记录的副作用数量。"""
         with self._lock:
             return len(self._records)
 

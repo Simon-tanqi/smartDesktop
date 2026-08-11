@@ -1,3 +1,9 @@
+"""Agent 状态与检查点模块：轮次状态、执行状态与任务恢复。
+
+提供 TaskCheckpoint 检查点数据模型与 CheckpointManager 持久化存储、
+全局状态管理（GlobalStateManager）、跨轮历史加载与话题切换清理、
+以及 prepare_run_state 等主循环初始化辅助函数。
+"""
 import datetime
 import copy
 import json
@@ -12,6 +18,7 @@ from typing import Dict, Set, Any, Optional, List, Generator
 import logging
 _logger = logging.getLogger("agent_state")
 def get_logger_migrations():
+    """返回轻量级迁移日志器（避免模块循环导入）。"""
     return _logger
 
 # 记忆/持久化函数依赖
@@ -49,6 +56,8 @@ LOGS_DIR = os.path.dirname(CHECKPOINT_DB_PATH)
 
 @dataclass
 class TaskCheckpoint:
+    """任务检查点数据模型：记录任务中间状态用于中断恢复。"""
+
     session_id: str = ""
     trace_id: str = ""
     user_task: str = ""
@@ -68,6 +77,7 @@ class TaskCheckpoint:
     matched_domains: List[str] = field(default_factory=list)  # BUG-5: 保存时匹配的域
 
     def to_dict(self) -> Dict[str, Any]:
+        """将检查点序列化为可写库的字典（复杂字段 JSON 编码）。"""
         base = {
             "checkpoint_id": self.checkpoint_id,
             "session_id": self.session_id,
@@ -96,6 +106,7 @@ class TaskCheckpoint:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'TaskCheckpoint':
+        """从数据库字典还原检查点对象；plan 尽力还原为 TaskPlan。"""
         plan_raw = json.loads(data.get("plan", "null"))
         # BUG-L3-1: 反序列化时尝试还原为 TaskPlan 对象
         plan_obj = None
@@ -132,12 +143,15 @@ class TaskCheckpoint:
 # ═══════════════════════════════════════════════
 
 class CheckpointManager:
+    """检查点数据库单例管理器：负责建表、迁移与增删查。"""
+
     _instance = None
     _db_initialized = False
     _instance_lock = threading.Lock()
     _init_lock = threading.Lock()
 
     def __new__(cls):
+        """单例构造：线程安全地返回唯一实例。"""
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
@@ -145,6 +159,7 @@ class CheckpointManager:
         return cls._instance
 
     def _init_db(self):
+        """初始化检查点数据库：建表、兼容旧库补列、建索引（幂等）。"""
         with self._init_lock:
             if self._db_initialized:
                 return
@@ -200,6 +215,7 @@ class CheckpointManager:
                 print(f"警告：检查点数据库初始化失败，任务恢复功能将不可用: {e}")
 
     def save_checkpoint(self, **kwargs):
+        """保存检查点：写入或替换对应行，并清理超过保留时长的旧检查点。"""
         try:
             self._init_db()
             if not self._db_initialized:
@@ -236,6 +252,7 @@ class CheckpointManager:
             _logger.error(f"保存检查点失败: {e}")
 
     def get_latest_checkpoint(self, session_id: str) -> Optional[TaskCheckpoint]:
+        """取回指定会话最近一次未恢复的检查点，不存在时返回 None。"""
         self._init_db()
         if not self._db_initialized:
             return None
@@ -254,6 +271,7 @@ class CheckpointManager:
         return None
 
     def mark_as_resumed(self, checkpoint_id: str):
+        """将检查点标记为已恢复（is_resumed=1），避免重复恢复。"""
         self._init_db()
         if not self._db_initialized:
             return
@@ -265,6 +283,7 @@ class CheckpointManager:
             conn.commit()
 
     def delete_checkpoints(self, session_id: str):
+        """删除指定会话的全部检查点记录。"""
         self._init_db()
         if not self._db_initialized:
             return
@@ -274,6 +293,7 @@ class CheckpointManager:
             conn.commit()
 
     def cleanup_old_checkpoints(self, max_age_hours: int = 24):
+        """清理超过最大保留时长的旧检查点记录。"""
         self._init_db()
         if not self._db_initialized:
             return
@@ -293,6 +313,8 @@ checkpoint_manager = CheckpointManager()
 
 @dataclass
 class AgentTurnState:
+    """单轮对话状态：轮次号、任务描述与解析失败计数。"""
+
     turn: int = 0
     child_turn: int = 0
     user_task: str = ""
@@ -303,23 +325,30 @@ class AgentTurnState:
 
 @dataclass
 class SessionDomainState:
+    """会话技能域的内存态集合：记录各会话已加载的域。"""
+
     _domains: Dict[str, Set[str]] = field(default_factory=dict)
     
     def add_domain(self, session_id: str, domain: str):
+        """为会话登记一个技能域（去重）。"""
         if session_id not in self._domains:
             self._domains[session_id] = set()
         self._domains[session_id].add(domain)
     
     def get_domains(self, session_id: str) -> Set[str]:
+        """返回会话已加载的域集合副本。"""
         return self._domains.get(session_id, set()).copy()
     
     def clear_domains(self, session_id: str):
+        """清空会话的域记录。"""
         if session_id in self._domains:
             del self._domains[session_id]
 
 
 @dataclass
 class AgentExecutionState:
+    """单次任务执行状态：步骤、重试与进度统计。"""
+
     collected_steps: list = field(default_factory=list)
     retry_count: int = 0
     consecutive_progress: int = 0
@@ -330,6 +359,7 @@ class AgentExecutionState:
     _history_messages: list = field(default_factory=list)  # BUG-X-1: 从引擎同步的消息历史
     
     def reset(self):
+        """重置全部执行状态字段，供新任务复用实例。"""
         self.collected_steps = []
         self.retry_count = 0
         self.consecutive_progress = 0
@@ -425,9 +455,12 @@ class AgentState:
 
 
 class GlobalStateManager:
+    """全局状态管理器单例：聚合轮次状态、会话域与状态机委托。"""
+
     _instance = None
 
     def __new__(cls):
+        """单例构造：初始化域状态与代理状态实例。"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance.domain_state = SessionDomainState()
@@ -435,6 +468,7 @@ class GlobalStateManager:
         return cls._instance
 
     def create_turn_state(self, user_task: str) -> AgentTurnState:
+        """创建新的轮次状态（初始 turn 为 -1，由分配游标覆盖）。"""
         return AgentTurnState(
             turn=-1,
             child_turn=0,
@@ -745,6 +779,7 @@ def load_cross_turn_history(engine, user_message: str, max_entries: int = 30,
 
     # ── 第一步：过滤出可注入消息（保序） ──
     def _eligible(m: Dict[str, Any]) -> bool:
+        """判断消息是否可注入上下文（按角色与消息类型过滤）"""
         role = m.get("role")
         msg_type = m.get("msg_type") or "chat"
         if role == "user":
@@ -999,18 +1034,20 @@ def save_ai_thinking(engine, summary: str):
 
 
 def reset_breaker_state(engine):
-    engine._breaker_hits = 0
-    engine._last_error_category = ""
-    engine._last_exception_type = ""
-    engine._last_tool_call_signature = ""
-    engine._consecutive_fail_count = 0
-    engine._global_consecutive_failures = 0
-    engine._consecutive_empty_search = 0
-    engine._failure_breaker_msg_injected = False
+    """重置引擎断路器与循环检测器状态，供话题切换/新任务复用。"""
+    engine._breaker_state.breaker_hits = 0
+    engine._breaker_state.last_error_category = ""
+    engine._breaker_state.last_exception_type = ""
+    engine._breaker_state.last_tool_call_signature = ""
+    engine._breaker_state.consecutive_fail_count = 0
+    engine._breaker_state.global_consecutive_failures = 0
+    engine._breaker_state.consecutive_empty_search = 0
+    engine._breaker_state.failure_breaker_msg_injected = False
     engine._loop_detector.reset()
 
 
 def on_emit_final(engine, text: str, timestamp: Optional[str], state, _tl, _sl):
+    """emit_final 回调：记录轮次完成日志并更新会话最近轮次号。"""
     try:
         ts = timestamp or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         get_logger().log_turn_complete(
@@ -1045,6 +1082,7 @@ def on_emit_final(engine, text: str, timestamp: Optional[str], state, _tl, _sl):
 def save_checkpoint(engine, user_message, state, remaining_steps, _step: int,
                     tool_name: str = "", tool_args: Dict = None,
                     progress: str = "", messages_param=None):
+    """保存引擎当前任务状态到检查点库（无会话时跳过）。"""
     if not engine.session_id:
         return
     try:
@@ -1393,14 +1431,14 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
 
         # save_ai_reply 已移除 —— AI 消息持久化收敛为前端 saveSessionToBackend 单一入口
         _cache = {}
-        engine._last_tool_call_signature = ""      # 上次工具调用签名（失败熔断用）
-        engine._consecutive_fail_count = 0          # 同名同参数连续真失败计数
-        engine._global_consecutive_failures = 0
-        engine._consecutive_empty_search = 0         # 连续空搜索结果计数（用于自适应降级）
-        engine._failure_breaker_msg_injected = False
-        engine._breaker_hits = 0
-        engine._last_error_category = ""
-        engine._last_exception_type = ""
+        engine._breaker_state.last_tool_call_signature = ""      # 上次工具调用签名（失败熔断用）
+        engine._breaker_state.consecutive_fail_count = 0          # 同名同参数连续真失败计数
+        engine._breaker_state.global_consecutive_failures = 0
+        engine._breaker_state.consecutive_empty_search = 0         # 连续空搜索结果计数（用于自适应降级）
+        engine._breaker_state.failure_breaker_msg_injected = False
+        engine._breaker_state.breaker_hits = 0
+        engine._breaker_state.last_error_category = ""
+        engine._breaker_state.last_exception_type = ""
         _thinking_summaries = []
         _tool_call_history = []
 
@@ -1428,9 +1466,9 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
             engine.completed_steps.clear()
             _thinking_summaries.clear()
             _tool_call_history.clear()
-            engine._last_tool_call_signature = ""
-            engine._consecutive_fail_count = 0
-            engine._global_consecutive_failures = 0
+            engine._breaker_state.last_tool_call_signature = ""
+            engine._breaker_state.consecutive_fail_count = 0
+            engine._breaker_state.global_consecutive_failures = 0
 
             # 2. 清空会话域（关键！移除旧域工具）
             clear_session_domains(engine.session_id)

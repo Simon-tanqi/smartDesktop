@@ -1,3 +1,10 @@
+"""核心运行时模块包：导出对话状态、工具数据提供器与流式输出组件。
+
+- AgentTurnState / AgentExecutionState / SessionDomainState / GlobalStateManager：会话与执行状态管理
+- ToolDataProvider：向工具层提供统一的数据访问入口
+- SSEStreamer / StreamingFormatter：流式响应输出与格式化
+- ReActEngine：通过 __getattr__ 惰性导入，规避 tools → core → react_engine 循环依赖
+"""
 from .agent_state import (
     AgentTurnState, AgentExecutionState, SessionDomainState,
     GlobalStateManager, global_state_manager
@@ -10,6 +17,7 @@ from .streaming import SSEStreamer, StreamingFormatter, sse_streamer, streaming_
 _ReActEngine = None
 
 def __getattr__(name):
+    """模块级惰性属性访问：延迟加载 ReActEngine，避免循环导入"""
     global _ReActEngine
     if name == "ReActEngine":
         if _ReActEngine is None:

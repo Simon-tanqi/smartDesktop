@@ -21,6 +21,8 @@ from typing import Optional, Callable
 # ======================================================
 
 class RiskLevel(Enum):
+    """操作风险等级：低 / 中 / 高，用于决定确认策略。"""
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"

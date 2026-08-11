@@ -27,6 +27,7 @@ _file_locks_guard = threading.Lock()
 
 
 def _get_lock(filepath):
+    """获取文件级线程锁，不存在时创建并缓存"""
     with _file_locks_guard:
         if filepath not in _file_locks:
             _file_locks[filepath] = threading.Lock()
@@ -34,6 +35,7 @@ def _get_lock(filepath):
 
 
 def _migrate_from_json():
+    """从旧 JSON 记忆文件迁移到 Markdown 格式，成功后删除旧文件"""
     global _migrated
     with _migrate_lock:
         if _migrated:
@@ -91,11 +93,13 @@ def _migrate_from_json():
 
 
 def _ensure_migrated():
+    """确保旧格式迁移已完成，未迁移时触发迁移"""
     if not _migrated:
         _migrate_from_json()
 
 
 def _ensure_file(filepath, header):
+    """确保目标文件存在，不存在时创建父目录与文件头"""
     _ensure_migrated()
     if not os.path.exists(filepath):
         lock = _get_lock(filepath)
@@ -107,12 +111,14 @@ def _ensure_file(filepath, header):
 
 
 def _rewrite_md(filepath, content):
+    """直接覆写 Markdown 文件内容并创建父目录"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
 
 
 def _read_lines(filepath, skip_header=1):
+    """读取文件并过滤标题行与空行，返回内容行列表"""
     if not os.path.exists(filepath):
         return []
     lock = _get_lock(filepath)
@@ -132,6 +138,7 @@ _lines_cache: dict = {}
 
 
 def _read_lines_cached(filepath, skip_header=1):
+    """按文件修改时间缓存读取结果，文件未变更时直接返回缓存"""
     try:
         mtime = os.path.getmtime(filepath) if os.path.exists(filepath) else 0
     except OSError:
@@ -148,20 +155,24 @@ def _read_lines_cached(filepath, skip_header=1):
 
 
 def _invalidate_cache(filepath):
+    """使指定文件的缓存行失效"""
     with _cache_lock:
         if filepath in _lines_cache:
             del _lines_cache[filepath]
 
 
 def _timestamp():
+    """返回当前时间字符串（YYYY-MM-DD HH:MM）"""
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def _date_short():
+    """返回短日期字符串（MM-DD）"""
     return datetime.datetime.now().strftime("%m-%d")
 
 
 def append_skill(text):
+    """追加一条技能记录到技能文件并失效缓存"""
     _ensure_file(SKILLS_MD, "# 技能\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
     with _get_lock(SKILLS_MD):
@@ -171,6 +182,7 @@ def append_skill(text):
 
 
 def append_project(text):
+    """追加一条项目记录到项目文件并失效缓存"""
     _ensure_file(PROJECTS_MD, "# 项目\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
     with _get_lock(PROJECTS_MD):
@@ -180,6 +192,7 @@ def append_project(text):
 
 
 def append_fact(text):
+    """追加一条事实记录到事实文件并失效缓存"""
     _ensure_file(FACTS_MD, "# 事实\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
     with _get_lock(FACTS_MD):
@@ -189,6 +202,7 @@ def append_fact(text):
 
 
 def append_custom_skill(skill_key, text):
+    """追加一条记录到自定义技能文件并失效缓存"""
     filepath = os.path.join(CUSTOM_SKILLS_DIR, f"{skill_key}.md")
     _ensure_file(filepath, f"# {skill_key}\n\n")
     line = f"- [{_date_short()}] {text.strip()}\n"
@@ -199,25 +213,30 @@ def append_custom_skill(skill_key, text):
 
 
 def read_skills(limit=20):
+    """读取技能记录，返回最近 limit 条"""
     lines = _read_lines(SKILLS_MD)
     return lines[-limit:] if len(lines) > limit else lines
 
 
 def read_projects(limit=10):
+    """读取项目记录，返回最近 limit 条"""
     lines = _read_lines(PROJECTS_MD)
     return lines[-limit:] if len(lines) > limit else lines
 
 
 def read_facts(limit=10):
+    """读取事实记录，返回最近 limit 条"""
     lines = _read_lines(FACTS_MD)
     return lines[-limit:] if len(lines) > limit else lines
 
 
 def read_user_info():
+    """读取用户信息文件全部行（含标题行）"""
     return _read_lines(USER_MD, skip_header=0)
 
 
 def list_custom_skill_files():
+    """列出自定义技能目录下全部 .md 文件，返回键名到路径的映射"""
     if not os.path.isdir(CUSTOM_SKILLS_DIR):
         return {}
     files = {}
@@ -248,6 +267,7 @@ def _extract_keywords(text):
 
 
 def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
+    """按关键词检索长期记忆，返回带分类标题并按长度截断的相关记录"""
     _ensure_migrated()
 
     keywords = _extract_keywords(user_message)
@@ -326,6 +346,7 @@ def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
 
 
 def add_compressed_summary(summary, source_type="auto"):
+    """将压缩摘要作为事实追加到长期记忆"""
     prefix = "【自动压缩】" if source_type == "auto" else ""
     append_fact(f"{prefix}{summary}")
 

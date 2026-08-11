@@ -1,3 +1,4 @@
+"""工具注册中心：统一工具注册、技能域加载与系统提示词构建。"""
 import threading
 import yaml
 from pathlib import Path
@@ -19,13 +20,16 @@ AGENT_TOOLS_YAML = AGENT_SKILLS_DIR / "agent_tools.yaml"
 
 
 def path_params(*params):
+    """标记函数参数为路径参数（供工具注册中心识别路径类参数）"""
     def decorator(func):
+        """装饰器：为函数标记路径参数"""
         func._path_params = list(params)
         return func
     return decorator
 
 
 def register_tool(func=None, *, timeout=60):
+    """注册工具到全局注册表，支持直接装饰或带参装饰两种用法"""
     if func is not None:
         TOOL_REGISTRY[func.__name__] = {
             "function": func,
@@ -37,6 +41,7 @@ def register_tool(func=None, *, timeout=60):
         return func
     
     def decorator(fn):
+        """装饰器：将函数注册到全局工具注册表"""
         TOOL_REGISTRY[fn.__name__] = {
             "function": fn,
             "description": fn.__doc__.strip() if fn.__doc__ else "无描述",
@@ -86,6 +91,7 @@ def _ensure_tool_registration():
 
 
 def add_domain_to_session(session_id: str, domain: str):
+    """建立会话与技能域的关联"""
     with _SESSION_DOMAINS_LOCK:
         if session_id not in _SESSION_DOMAINS:
             _SESSION_DOMAINS[session_id] = set()
@@ -93,11 +99,13 @@ def add_domain_to_session(session_id: str, domain: str):
 
 
 def get_session_domains(session_id: str) -> set:
+    """获取会话已加载的技能域集合副本"""
     with _SESSION_DOMAINS_LOCK:
         return _SESSION_DOMAINS.get(session_id, set()).copy()
 
 
 def clear_session_domains(session_id: str):
+    """清空会话已加载的技能域集合"""
     with _SESSION_DOMAINS_LOCK:
         if session_id in _SESSION_DOMAINS:
             del _SESSION_DOMAINS[session_id]
@@ -235,14 +243,17 @@ def ask_user_clarification(question: str, options: list = None, **kwargs):
 
 
 def match_domains(user_input: str) -> list[str]:
+    """匹配用户输入命中的技能域列表"""
     return tool_data_provider.match_domains(user_input)
 
 
 def match_persona(user_input: str) -> str | None:
+    """匹配用户输入命中的角色模式"""
     return tool_data_provider.match_persona(user_input)
 
 
 def get_skill_prompt(domain: str) -> str:
+    """读取技能域提示词文本，带 mtime 缓存"""
     path = PROMPTS_DIR / f"skills/{domain}.md"
     if not path.exists():
         path = AGENT_SKILLS_DIR / f"skills/{domain}.md"
@@ -263,11 +274,13 @@ def get_skill_prompt(domain: str) -> str:
     return text
 
 def remove_domain_from_session(session_id: str, domain: str):
+    """从会话中移除指定技能域"""
     with _SESSION_DOMAINS_LOCK:
         if session_id in _SESSION_DOMAINS:
             _SESSION_DOMAINS[session_id].discard(domain)
 
 def build_dynamic_system_prompt(domains: list[str] = None, persona_mode: str = None) -> str:
+    """拼接动态系统提示词：核心、安全、输出、技能、工具清单与角色模式"""
     from logger import get_logger
     core_prompt = _load_prompt("core.md")
     output_prompt = _load_prompt("output.md")
@@ -309,10 +322,12 @@ def build_dynamic_system_prompt(domains: list[str] = None, persona_mode: str = N
 
 
 def build_tools_param(loaded_domains: list[str] = None) -> list[dict] | None:
+    """构建 API 工具参数列表"""
     return tool_data_provider.build_api_tools_param(loaded_domains)
 
 
 def _load_prompt(filename: str) -> str:
+    """读取提示词文件内容，带 mtime 缓存"""
     path = PROMPTS_DIR / filename
     if not path.exists():
         path = AGENT_SKILLS_DIR / filename

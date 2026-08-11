@@ -84,6 +84,7 @@ class BM25:
     """
 
     def __init__(self, k1: float = 1.5, b: float = 0.75):
+        """初始化 BM25 检索参数与统计缓存"""
         self.k1 = k1
         self.b = b
         self.documents: List[str] = []
@@ -153,6 +154,7 @@ class BM25:
         return scores
 
     def max_score(self, query: str) -> float:
+        """返回查询与历史文档的最大 BM25 分数，未拟合或无文档时返回 0"""
         scores = self.score_all(query)
         return max(scores) if scores else 0.0
 
@@ -223,6 +225,7 @@ class ContextSwitchDetector:
         self._fitted = False
 
     def _ensure_fitted(self):
+        """历史非空且尚未拟合时，用历史文档拟合 BM25 模型"""
         if not self._fitted and len(self.history) >= 1:
             self.bm25.fit(self.history)
             self._fitted = True

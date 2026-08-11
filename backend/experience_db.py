@@ -48,6 +48,7 @@ class ExperienceDB:
     """基于 JSON 文件的任务→工具经验存储"""
 
     def __init__(self, db_path: str = None):
+        """初始化经验数据库；未指定路径时默认位于 %APPDATA%\smartDesktop\experience\experience_db.json"""
         if db_path is None:
             try:
                 from config.settings import DATA_DIR
@@ -60,10 +61,12 @@ class ExperienceDB:
         self._ensure_db()
 
     def _ensure_db(self):
+        """数据库文件不存在时创建空结构并预置标记"""
         if not os.path.exists(self.db_path):
             self._write({"records": {}, "pre_seeded": True})
 
     def _read(self) -> dict:
+        """读取 JSON 数据库文件；文件缺失或解析失败时返回空记录"""
         try:
             with open(self.db_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -71,6 +74,7 @@ class ExperienceDB:
             return {"records": {}}
 
     def _write(self, data: dict):
+        """将数据以 UTF-8 写入 JSON 数据库文件"""
         with open(self.db_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -159,6 +163,7 @@ _experience_db: Optional[ExperienceDB] = None
 
 
 def get_experience_db() -> ExperienceDB:
+    """获取经验数据库全局单例，首次调用时初始化并预置默认经验映射"""
     global _experience_db
     if _experience_db is None:
         _experience_db = ExperienceDB()

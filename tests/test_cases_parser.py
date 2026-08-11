@@ -10,6 +10,7 @@ from typing import List, Optional
 
 @dataclass
 class TestCase:
+    """测试用例数据模型"""
     id: str                  # T-01 ~ T-55
     category: str            # 类别名称
     title: str               # 测试标题
@@ -21,6 +22,7 @@ class TestCase:
 
 
 def _norm_result(s: str) -> str:
+    """将预期结果状态标准化为 PASS / MANUAL_REVIEW / FAIL"""
     s = (s or "").strip()
     if "✅" in s or "成功" in s or "PASS" in s.upper():
         return "PASS"
@@ -81,6 +83,7 @@ CATEGORY_ORDER = [
 
 
 def group_by_category(cases: List[TestCase]) -> dict:
+    """按类别分组测试用例"""
     groups = {}
     for c in cases:
         groups.setdefault(c.category, []).append(c)

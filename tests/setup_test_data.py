@@ -15,6 +15,7 @@ TEST_DATA = os.path.join(BASE, "test_data")
 
 
 def _write_sample_txt():
+    """写入英文样例文本"""
     p = os.path.join(TEST_DATA, "sample.txt")
     text = (
         "Tank Smart is an industrial-grade agent testing framework.\n"
@@ -29,6 +30,7 @@ def _write_sample_txt():
 
 
 def _write_sales_csv():
+    """写入销售数据 CSV"""
     p = os.path.join(TEST_DATA, "sales_data.csv")
     rows = [
         ["部门", "姓名", "销售额", "月份"],
@@ -46,6 +48,7 @@ def _write_sales_csv():
 
 
 def _write_sales_xlsx():
+    """写入销售数据 Excel"""
     p = os.path.join(TEST_DATA, "sales_data.xlsx")
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -66,6 +69,7 @@ def _write_sales_xlsx():
 
 
 def _write_file(path, rows):
+    """将行数据写入指定 Excel 文件"""
     wb = openpyxl.Workbook()
     ws = wb.active
     for r in rows:
@@ -75,6 +79,7 @@ def _write_file(path, rows):
 
 
 def main():
+    """幂等生成全部测试 fixture 数据"""
     os.makedirs(TEST_DATA, exist_ok=True)
     _write_sample_txt()
     _write_sales_csv()

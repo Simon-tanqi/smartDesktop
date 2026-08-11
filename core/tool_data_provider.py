@@ -1,3 +1,6 @@
+"""统一工具数据提供器模块：加载并合并 YAML 配置与运行时注册的工具信息，
+向引擎提供工具查询、域匹配、参数 Schema 构建及工具执行管线等能力。"""
+
 from __future__ import annotations
 import json
 import time
@@ -35,6 +38,7 @@ class ToolDataProvider:
     """
     
     def __init__(self):
+        """初始化工具配置缓存、运行时工具注册表与合并视图"""
         self._prompts_dir = Path(__file__).parent.parent / "prompts"
         self._tools_config_path = self._prompts_dir / "tools.yaml"
         self._agent_skills_dir = Path(__file__).parent.parent / "agent_skills"
@@ -57,6 +61,7 @@ class ToolDataProvider:
         self._merged_lock = threading.Lock()
     
     def _load_yaml_config(self) -> Dict[str, Any]:
+        """加载并缓存 tools.yaml 配置，按文件 mtime 检测变更自动刷新"""
         if not self._tools_config_path.exists():
             return {"always_inject": [], "tools": {}, "domains": {}, "personas": {}}
         
@@ -85,6 +90,7 @@ class ToolDataProvider:
             return {"always_inject": [], "tools": {}, "domains": {}, "personas": {}}
     
     def _load_agent_config(self) -> Dict[str, Any]:
+        """加载并缓存 agent_tools.yaml 配置，按文件 mtime 检测变更自动刷新"""
         if not self._agent_tools_yaml.exists():
             self._agent_config_cache = {"domains": {}}
             return self._agent_config_cache
@@ -151,6 +157,9 @@ class ToolDataProvider:
                         # desc：运行时为空时取 YAML
                         if not pinfo.get("desc") and yml_pinfo.get("desc"):
                             pinfo["desc"] = yml_pinfo["desc"]
+                        # enum：YAML 声明的枚举值补充到运行时参数（防 LLM 发明非法取值）
+                        if not pinfo.get("enum") and yml_pinfo.get("enum"):
+                            pinfo["enum"] = yml_pinfo["enum"]
                         # optional：YAML 无 optional+无 default → 必填，覆盖运行时
                         if ("optional" not in yml_pinfo and "default" not in yml_pinfo
                                 and pinfo.get("optional")):
@@ -203,6 +212,7 @@ class ToolDataProvider:
     })
 
     def _is_internal_param(self, name: str) -> bool:
+        """判断参数名是否为内部确认/授权标志，内部参数不暴露给模型"""
         return name in self._INTERNAL_PARAM_NAMES
 
     def register_tool(self, func: Callable, *, timeout: int = 60) -> Dict[str, Any]:
@@ -350,7 +360,24 @@ class ToolDataProvider:
                 for domain in domains:
                     domain_info = self._merged_domains.get(domain, {})
                     active.update(domain_info.get("tools", []))
+            # inject: false 的工具明确不注入（历史兼容工具保留定义但不暴露给 LLM）
+            active = {name for name in active
+                      if self._merged_tools.get(name, {}).get("inject") is not False}
             return active
+
+    @staticmethod
+    def _merge_tool_desc(desc: str, tool_info: Dict[str, Any]) -> str:
+        """将 precondition / returns 结构化字段合并进 LLM 可见的 desc。
+        YAML 中这些字段是独立键（配置自解释），但 LLM 只消费 desc，
+        故渲染时统一拼接，避免描述丢失。
+        """
+        pre = tool_info.get("precondition")
+        ret = tool_info.get("returns")
+        if pre:
+            desc = f"{desc}\n前置条件: {pre}" if desc else f"前置条件: {pre}"
+        if ret:
+            desc = f"{desc}\n返回: {ret}" if desc else f"返回: {ret}"
+        return desc
 
     def build_system_prompt_tool_list(self, domains: List[str] = None) -> str:
         """构建系统提示词中的工具列表部分"""
@@ -363,7 +390,7 @@ class ToolDataProvider:
                 if tool_info:
                     if tool_info.get("deprecated"):
                         continue
-                    desc = tool_info.get("desc", "")
+                    desc = self._merge_tool_desc(tool_info.get("desc", ""), tool_info)
                     params = tool_info.get("params", {})
                     params_str = self._format_params(params)
                     if params_str:
@@ -387,7 +414,9 @@ class ToolDataProvider:
                         "type": "function",
                         "function": {
                             "name": name,
-                            "description": tool_info.get("desc", "") or tool_info.get("description", ""),
+                            "description": self._merge_tool_desc(
+                                tool_info.get("desc", "") or tool_info.get("description", ""),
+                                tool_info),
                             "parameters": self._build_parameter_schema(tool_info.get("params", {}))
                         }
                     }
@@ -396,6 +425,7 @@ class ToolDataProvider:
             return param_tools if param_tools else None
     
     def _keyword_hit(self, text: str, keywords: List[str]) -> bool:
+        """判断文本是否命中任一关键词（大小写不敏感）"""
         text_lower = text.lower()
         for kw in keywords:
             if kw.lower() in text_lower:
@@ -403,6 +433,7 @@ class ToolDataProvider:
         return False
     
     def _format_params(self, params: Dict[str, Any]) -> str:
+        """将参数字典格式化为系统提示词中的参数摘要文本"""
         if not params:
             return ""
         parts = []
@@ -463,6 +494,7 @@ class ToolDataProvider:
         return {"type": self.PYTHON_TO_JSON_TYPE.get(py_type, "string")}
     
     def _build_parameter_schema(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """构建 OpenAI 风格 JSON Schema 参数定义，跳过内部参数并合并枚举说明"""
         schema = {"type": "object", "properties": {}, "required": []}
         for pname, pinfo in params.items():
             # 双保险：即使上游 YAML/运行时合并遗漏，内部参数也不进 LLM schema
@@ -470,7 +502,13 @@ class ToolDataProvider:
                 continue
             py_type = pinfo.get("type", "string")
             prop = self._parse_complex_type(py_type)
-            prop["description"] = pinfo.get("desc", "")
+            # enum 合并进 description（YAML 的 enum 字段对 LLM 可见，防其发明非法取值）
+            desc = pinfo.get("desc", "")
+            enum_vals = pinfo.get("enum")
+            if enum_vals:
+                enum_str = ", ".join(str(v) for v in enum_vals)
+                desc = f"{desc}（可选值: {enum_str}）" if desc else f"可选值: {enum_str}"
+            prop["description"] = desc
             if "default" in pinfo and pinfo["default"] is not None:
                 prop["default"] = pinfo["default"]
             schema["properties"][pname] = prop
@@ -488,6 +526,7 @@ tool_data_provider = ToolDataProvider()
 class SearchCircuitBreaker:
     """搜索熔断器：连续 N 次失败/低质量后，自动降级跳过搜索。"""
     def __init__(self, failure_threshold: int = 3, cooldown_seconds: int = 60):
+        """初始化搜索熔断器参数与熔断状态"""
         self._consecutive_failures = 0
         self._threshold = failure_threshold
         self._cooldown = cooldown_seconds
@@ -496,6 +535,7 @@ class SearchCircuitBreaker:
         self._lock = threading.Lock()
 
     def record_result(self, success: bool, relevance_passed: bool):
+        """记录一次搜索执行结果，根据成败与相关度更新连续失败计数及熔断状态"""
         with self._lock:
             if success and relevance_passed:
                 self._consecutive_failures = 0
@@ -510,6 +550,7 @@ class SearchCircuitBreaker:
                     )
 
     def should_skip_search(self) -> bool:
+        """判断当前是否应跳过搜索：熔断开启且未过冷却期时跳过"""
         with self._lock:
             if self._state == "closed":
                 return False
@@ -521,6 +562,7 @@ class SearchCircuitBreaker:
             return False  # half_open
 
     def get_degradation_message(self) -> str:
+        """返回搜索降级提示文案，告知用户结果未经实时搜索验证"""
         return (
             "搜索服务连续失败，已自动降级。"
             "以下内容基于模型知识生成，未经实时搜索验证。"
@@ -541,6 +583,7 @@ class ToolLoopPolicy:
                  same_tool_hard_limit: int = 10,
                  global_max_turns: int = 15,
                  exempt_tools: set = None):
+        """初始化工具循环检测策略参数（精确重复限制、同工具频率限制、豁免工具集）"""
         self.exact_repeat_limit = exact_repeat_limit          # 同工具+同参数连续重复次数 → 硬终止
         self.same_tool_soft_limit = same_tool_soft_limit      # 同工具累计次数 → 软警告（不终止）
         self.same_tool_hard_limit = same_tool_hard_limit      # 同工具累计次数 → 硬终止
@@ -575,6 +618,7 @@ class ToolLoopDetector:
     """
 
     def __init__(self, policy: ToolLoopPolicy = None):
+        """初始化循环检测器状态：调用历史、最近签名与连续精确重复计数"""
         self.policy = policy or LOOP_POLICY
         # 完整调用历史: [(signature, tool_name, step_num), ...]
         self._call_history = []
@@ -652,6 +696,7 @@ class ToolExecutionPipeline:
     def __init__(self, search_breaker: SearchCircuitBreaker,
                  risk_levels: dict, write_tools: set,
                  max_result_chars: int):
+        """初始化工具执行管线：搜索熔断器、风险分级表、可写工具集与结果截断上限"""
         self._search_breaker = search_breaker
         self._risk_levels = risk_levels
         self._write_tools = write_tools
@@ -921,6 +966,7 @@ class ToolExecutionPipeline:
         result_container = {"result": None}
 
         def wait_worker():
+            """后台线程执行确认处理器并写入结果容器，异常时写入拒绝结果"""
             try:
                 result_container["result"] = confirmation_handler(token)
             except Exception as e:
@@ -1159,7 +1205,7 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 })
                 # 幻觉工具拦截强化（P1-6）：未注册工具计入全局连续失败计数，
                 # 复用 MAX_GLOBAL_FAILURES 熔断，防止模型持续虚构工具名空转。
-                engine._breaker_state._global_consecutive_failures += 1
+                engine._breaker_state.global_consecutive_failures += 1
                 return "continue"
             
             # 工具执行前检查取消信号
@@ -1410,6 +1456,7 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
             _call_kwargs = _build_tool_call_kwargs(tool_func, arguments, _confirm_approved)
 
             def _tool_thread():
+                """工作线程执行工具函数并捕获异常，结果与错误写入结果容器"""
                 try:
                     result_container["result"] = tool_func(**_call_kwargs)
                 except Exception as e:
@@ -1781,8 +1828,8 @@ def handle_tool_failure(engine, rs: RunState, state, tool_name: str, arguments: 
 
         # ── 自适应降级：连续空搜索结果 → 注入回退提示 ──
         if tool_name == "web_search" and _failure_type == "empty_result":
-            engine._consecutive_empty_search += 1
-            if engine._consecutive_empty_search >= 2:
+            engine._breaker_state.consecutive_empty_search += 1
+            if engine._breaker_state.consecutive_empty_search >= 2:
                 _degrade_hint = (
                     "[系统提示] web_search 连续多次未获取到有效素材。"
                     "请停止搜索，直接基于模型已有知识完成任务，"
@@ -1794,11 +1841,11 @@ def handle_tool_failure(engine, rs: RunState, state, tool_name: str, arguments: 
                     "content": _degrade_hint,
                 })
                 get_logger().warning(
-                    f"自适应降级: 连续 {engine._consecutive_empty_search} 次空搜索，已注入回退提示",
+                    f"自适应降级: 连续 {engine._breaker_state.consecutive_empty_search} 次空搜索，已注入回退提示",
                     trace_id=engine.trace_id, session_id=engine.session_id
                 )
         elif tool_name == "web_search":
-            engine._consecutive_empty_search = 0  # 非空结果 → 重置
+            engine._breaker_state.consecutive_empty_search = 0  # 非空结果 → 重置
 
         # 熔断检查：只有同名同参数真失败才触发熔断
         if engine._breaker_state.consecutive_fail_count >= engine.MAX_CONSECUTIVE_FAILURES:

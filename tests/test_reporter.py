@@ -16,6 +16,7 @@ ARTIFACTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artif
 
 
 def _load_run(run_id):
+    """读取 run 目录的 summary 与全部 result"""
     run_dir = os.path.join(ARTIFACTS_ROOT, "run_%s" % run_id)
     summary_path = os.path.join(run_dir, "summary.json")
     with io.open(summary_path, "r", encoding="utf-8") as f:
@@ -30,6 +31,7 @@ def _load_run(run_id):
 
 
 def compute_stats(summary, results):
+    """统计通过率、类别分布、耗时与失败/复核清单"""
     total = len(results)
     by_status = {}
     for r in results:
@@ -56,6 +58,7 @@ def compute_stats(summary, results):
 
 
 def generate_markdown(run_id, stats, summary):
+    """生成 Markdown 测试报告"""
     lines = []
     lines.append("# Tank Smart 测试执行报告")
     lines.append("")
@@ -161,6 +164,7 @@ nav a{{color:#58a6ff;margin-right:18px;font-size:13px;text-decoration:none}}
 
 
 def generate_html(run_id, stats, summary):
+    """生成 HTML 测试报告"""
     cat_rows = ""
     for cat, c in sorted(stats["by_cat"].items(), key=lambda x: -x[1]["total"]):
         rate = c["PASS"] / c["total"] * 100 if c["total"] else 0
@@ -200,6 +204,7 @@ def generate_html(run_id, stats, summary):
 
 
 def generate_reports(run_id):
+    """生成全部报告并落盘"""
     summary, results = _load_run(run_id)
     stats = compute_stats(summary, results)
     md = generate_markdown(run_id, stats, summary)

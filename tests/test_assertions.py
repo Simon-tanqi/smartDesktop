@@ -24,17 +24,21 @@ APP_LOG = os.path.join(os.environ.get("APPDATA", ""), "smartDesktop", "logs", "l
 
 
 class AssertionResult:
+    """断言结果：记录断言名称、是否通过与详情"""
     def __init__(self, name, passed, detail=""):
+        """初始化断言结果对象"""
         self.name = name
         self.passed = bool(passed)
         self.detail = detail
 
     def to_dict(self):
+        """转换为字典格式"""
         return {"name": self.name, "passed": self.passed, "detail": self.detail}
 
 
 # ---------- helpers ----------
 def _read_file(path, limit=4000):
+    """读取文本文件前 N 字符，失败返回空串"""
     try:
         with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read(limit)
@@ -43,10 +47,12 @@ def _read_file(path, limit=4000):
 
 
 def find_tool(tool_calls, name):
+    """按工具名过滤工具调用记录"""
     return [t for t in tool_calls if t.get("tool_name") == name]
 
 
 def find_tool_success(tool_calls, name):
+    """查找指定工具的成功调用记录"""
     for t in tool_calls:
         if t.get("tool_name") == name and t.get("status") == "success":
             return t
@@ -69,11 +75,13 @@ def run_code_real(code, timeout=15):
 
 
 def extract_code_blocks(text):
+    """提取文本中的代码块"""
     blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
     return [b.strip() for b in blocks if b.strip()]
 
 
 def _docx_info(path):
+    """读取 Word 文档的结构信息（段落/表格/图片/页眉页脚/样式数）"""
     try:
         import docx
         d = docx.Document(path)
@@ -103,6 +111,7 @@ def _docx_info(path):
 
 
 def _pptx_info(path):
+    """读取 PPT 文档的幻灯片文本、图表与图片数量"""
     try:
         from pptx import Presentation
         prs = Presentation(path)
@@ -128,6 +137,7 @@ def _pptx_info(path):
 
 
 def _xlsx_info(path):
+    """读取 Excel 工作簿各表结构信息"""
     try:
         import openpyxl
         wb = openpyxl.load_workbook(path)
@@ -191,6 +201,7 @@ def _pick_artifact(candidates, rr, expected_names=None, allow_stale=False):
     window = (t0 - 60) if t0 else 0
 
     def _prefer(cands):
+        """在候选中按预期文件名优先、mtime 最新选择"""
         if not cands:
             return None
         if expected_names:
@@ -222,6 +233,7 @@ def reg_query(key):
 
 # ---------- 通用健康断言 ----------
 def health_assertions(tc, rr):
+    """生成健康断言：真实响应与无致命异常"""
     a = []
     responded = bool(rr.get("final_text")) or bool(rr.get("tool_calls"))
     a.append(AssertionResult("Agent真实响应", responded,
@@ -234,6 +246,7 @@ def health_assertions(tc, rr):
 
 
 def log_assertion(tc, rr):
+    """校验推理日志可观测性（仅记录，不计入通过率）"""
     sid = "tanksmart"
     hit = False
     detail = "llm_requests.log 不存在"
@@ -253,6 +266,7 @@ def log_assertion(tc, rr):
 
 # ---------- 各类特化 ----------
 def assert_code(tc, rr):
+    """代码编写类用例断言"""
     a = list(health_assertions(tc, rr))
     text = rr.get("final_text", "")
     tool_calls = rr.get("tool_calls", [])
@@ -306,6 +320,7 @@ def assert_code(tc, rr):
 
 
 def assert_word(tc, rr):
+    """Word 文档处理类用例断言"""
     a = list(health_assertions(tc, rr))
     files = rr.get("files_created", [])
     docx_files = [f for f in files if f.lower().endswith(".docx")]
@@ -347,6 +362,7 @@ def assert_word(tc, rr):
 
 
 def assert_ppt(tc, rr):
+    """PPT 演示文稿类用例断言"""
     a = list(health_assertions(tc, rr))
     files = rr.get("files_created", [])
     text = rr.get("final_text", "")
@@ -385,6 +401,7 @@ def assert_ppt(tc, rr):
 
 
 def assert_excel(tc, rr):
+    """Excel 表格处理类用例断言"""
     a = list(health_assertions(tc, rr))
     files = rr.get("files_created", [])
     text = rr.get("final_text", "")
@@ -429,6 +446,7 @@ def assert_excel(tc, rr):
 
 
 def assert_system(tc, rr):
+    """系统配置更改类用例断言"""
     a = list(health_assertions(tc, rr))
     text = rr.get("final_text", "")
     tool_calls = rr.get("tool_calls", [])
@@ -476,6 +494,7 @@ def assert_system(tc, rr):
 
 
 def assert_software(tc, rr):
+    """软件安装卸载类用例断言"""
     a = list(health_assertions(tc, rr))
     text = rr.get("final_text", "")
     tool_calls = rr.get("tool_calls", [])
@@ -530,6 +549,7 @@ def assert_software(tc, rr):
 
 
 def assert_web(tc, rr):
+    """网页浏览类用例断言"""
     a = list(health_assertions(tc, rr))
     text = rr.get("final_text", "")
     tool_calls = rr.get("tool_calls", [])
@@ -587,6 +607,7 @@ DISPATCH = {
 
 
 def assert_test(tc, rr):
+    """按用例类别分发断言并汇总评分"""
     fn = DISPATCH.get(tc.category)
     if fn is None:
         a = list(health_assertions(tc, rr))

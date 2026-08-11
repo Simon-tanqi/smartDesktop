@@ -27,6 +27,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 def schema_override(name: str):
     """将完整 JSON Schema 关联到指定工具，优先于自动推断的 schema"""
     def decorator(fn: Callable) -> Callable:
+        """装饰器：将完整 JSON Schema 关联到指定工具"""
         _SCHEMA_OVERRIDES[name] = {
             "type": "object",
             "properties": {
@@ -66,6 +67,7 @@ def schema_override(name: str):
     return decorator
 
 def get_schema_override(name: str) -> Dict[str, Any] | None:
+    """获取指定工具的 schema 覆盖定义"""
     return _SCHEMA_OVERRIDES.get(name)
 
 

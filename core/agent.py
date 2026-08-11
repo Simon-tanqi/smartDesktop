@@ -1,3 +1,8 @@
+"""桌面智能体核心类：封装消息构建、记忆注入、历史压缩与 ReAct 循环。
+
+DesktopAgent 负责串联系统提示词、工具 Schema 与多轮对话历史，
+在每次用户输入时执行最多 5 步的 ReAct 循环（调用模型 → 执行工具 → 更新历史）。
+"""
 import json
 from typing import List, Dict, Any, Optional
 
@@ -5,7 +10,10 @@ from core.message_builder import StandardMessageBuilder
 
 
 class DesktopAgent:
+    """基于 ReAct 循环的桌面智能体：管理对话历史并驱动工具调用。"""
+
     def __init__(self, static_system_prompt: str, tools_schema: list):
+        """初始化智能体：保存静态提示词与工具 Schema，并创建消息构建器。"""
         # ✅ 静态资源初始化后不再修改
         self.static_system_prompt = static_system_prompt
         self.tools_schema = tools_schema
@@ -15,6 +23,11 @@ class DesktopAgent:
         self.builder = StandardMessageBuilder()
 
     async def run(self, user_input: str):
+        """执行一轮完整对话：注入记忆、必要时压缩历史，并运行 ReAct 循环。
+
+        生成器逐个产出模型最终回复文本；过程中产生的工具调用与结果
+        会同步写入 conversation_history，供下一轮继续使用。
+        """
         # 1. 获取记忆（独立于 system prompt）
         memory_text = self._get_memory_preamble()
 

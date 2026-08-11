@@ -41,6 +41,7 @@ def estimate_tokens(text):
 
 
 def estimate_messages_tokens(messages):
+    """估算消息列表总 token 数：每条消息内容 token 加 4 开销"""
     total = 0
     for m in messages:
         total += estimate_tokens(m.get("content", "")) + 4
@@ -313,6 +314,7 @@ _LOCK_EXPIRE_SECONDS = 3600
 
 
 def _cleanup_expired_locks():
+    """清理超过过期时间的压缩并发锁"""
     import time
     now = time.time()
     expired = []
@@ -333,6 +335,7 @@ def _cleanup_expired_locks():
 # ═══════════════════════════════════════════════
 
 def _generate_summary(messages, old_summary="", max_len=MAX_SUMMARY_CHARS):
+    """生成对话摘要：拼接对话文本调用模型，并对结果做 token 预算截断"""
     if not messages and not old_summary:
         return ""
     # Token优化：不序列化完整 JSON，只提取 role + content 拼成自然对话，去掉 tool_calls 等噪音
@@ -489,6 +492,7 @@ def _find_cut_point(messages, target_tokens):
 def compress_conversation_async(session_id, recent_token_min=RECENT_TOKEN_MIN,
                                  recent_token_max=RECENT_TOKEN_MAX,
                                  summary_model=None, trace_id="", user_id=""):
+    """异步压缩入口：先清理过期锁，再更新时间戳并启动后台压缩线程"""
     import time
     now = time.time()
     last_cleanup = _compression_lock_timestamps.get("_last_cleanup", 0)
@@ -498,6 +502,7 @@ def compress_conversation_async(session_id, recent_token_min=RECENT_TOKEN_MIN,
     _compression_lock_timestamps[session_id] = now
 
     def _run():
+        """压缩线程工作函数：获取会话消息，轮次不足时直接返回，否则生成摘要入库"""
         lock = _compression_locks.setdefault(session_id, threading.Lock())
         if not lock.acquire(blocking=False):
             return

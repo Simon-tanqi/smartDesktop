@@ -144,6 +144,7 @@ class _ConfigManager:
     """线程安全的热加载配置管理器"""
 
     def __init__(self):
+        """初始化线程锁、配置缓存与配置文件时间戳"""
         self._lock = threading.Lock()
         self._config: SafetyConfig | None = None
         self._last_mtime: float = 0.0

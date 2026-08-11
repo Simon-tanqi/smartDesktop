@@ -1,3 +1,9 @@
+"""流式输出模块：SSE 事件封装、格式化工具与 LLM 输出后处理。
+
+提供 SSEStreamer 事件发射器、StreamingFormatter 消息格式化、带心跳的
+stream_response 生成器，以及从 LLM 输出中剥离代码块/推理痕迹、解析
+reasoning_trace、分类工具失败等无状态后处理函数。
+"""
 import json
 import re
 import time
@@ -10,11 +16,15 @@ from logger import get_logger
 
 
 class SSEStreamer:
+    """SSE 事件流发射器：将内部事件封装为 data: JSON 格式文本。"""
+
     def __init__(self):
+        """初始化：维护事件回调表与最终回复回调。"""
         self._callbacks = {}
         self._on_final: Optional[Callable] = None
     
     def on_event(self, event_type: str, callback: Callable):
+        """注册指定类型事件的监听回调（broadcast 时触发）。"""
         self._callbacks[event_type] = callback
     
     def set_on_final(self, callback: Callable):
@@ -22,6 +32,7 @@ class SSEStreamer:
         self._on_final = callback
     
     def emit(self, event_type: str, **kwargs) -> str:
+        """发射指定类型 SSE 事件；不可序列化字段会被逐个跳过。"""
         payload: Dict[str, Any] = {"type": event_type}
         payload.update(kwargs)
         try:
@@ -38,12 +49,15 @@ class SSEStreamer:
             return f"data: {json.dumps(payload_safe, ensure_ascii=False)}\n\n"
     
     def emit_step(self, text: str, status: str = "进行中") -> str:
+        """发射中间步骤提示事件。"""
         return self.emit("step", text=text, status=status)
     
     def emit_error(self, text: str) -> str:
+        """发射错误提示事件。"""
         return self.emit("error", text=text)
     
     def emit_final(self, text: str, timestamp: Optional[str] = None) -> str:
+        """发射最终回复事件；未给时间戳时兜底为本地当前时间，并触发 on_final 回调。"""
         if timestamp is None:
             # 统一本地时间：SSE 未传时间戳时兜底，避免前端收到 null 后
             # 回传空 timestamp 触发 SQLite DEFAULT CURRENT_TIMESTAMP（UTC）导致排序错乱
@@ -56,9 +70,11 @@ class SSEStreamer:
         return self.emit("final", text=text, timestamp=timestamp, complete=True)
     
     def emit_tool_call(self, tool_name: str, arguments: Dict[str, Any] = None) -> str:
+        """发射工具调用开始事件。"""
         return self.emit("tool_call", tool_name=tool_name)
     
     def emit_tool_result(self, tool_name: str, result: Any, args: Dict[str, Any] = None) -> str:
+        """发射工具执行结果事件；自动提炼成功/失败状态与错误摘要。"""
         if isinstance(result, dict):
             status = "success" if result.get("success") else "failed"
             err_msg = result.get("message") or result.get("error") or result.get("output") or ""
@@ -74,11 +90,13 @@ class SSEStreamer:
         return self.emit("tool_result", **payload)
     
     def emit_reasoning(self, text: str) -> str:
+        """发射推理过程事件。"""
         return self.emit("reasoning", text=text)
     
     def emit_confirm(self, confirmation_token: str, title: str = "操作需要确认", 
                       command: str = "", details: dict = None, tool_name: str = "",
                       challenge_phrase: str = "", expires_at: Optional[float] = None) -> str:
+        """发射操作确认请求事件；未指定过期时间时按引擎确认超时统一设置。"""
         # 确认请求过期时间与引擎 CONFIRMATION_TIMEOUT 统一（延迟导入避免循环依赖）
         if expires_at is None:
             from core.react_engine import ReActEngine
@@ -96,6 +114,7 @@ class SSEStreamer:
         )
     
     def broadcast(self, event_type: str, **kwargs):
+        """向注册了该事件类型的回调广播事件；回调异常被吞掉。"""
         if event_type in self._callbacks:
             try:
                 self._callbacks[event_type](**kwargs)
@@ -104,8 +123,11 @@ class SSEStreamer:
 
 
 class StreamingFormatter:
+    """LLM 输出与工具结果格式化工具集（静态方法）。"""
+
     @staticmethod
     def format_llm_chunk(chunk: Dict[str, Any]) -> Optional[str]:
+        """从流式 chunk 字典中提取可展示文本，无法识别时返回 None。"""
         if chunk.get("type") == "chunk":
             if chunk.get("content"):
                 return chunk["content"]
@@ -118,6 +140,7 @@ class StreamingFormatter:
     
     @staticmethod
     def format_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
+        """将工具结果字典格式化为单行文本（含状态图标与截断）。"""
         if result.get("success"):
             output = result.get("output", "")
             if result.get("is_gui_operation"):
@@ -216,6 +239,7 @@ def stream_response(event_iter: Iterator[str], heartbeat_interval: float = 15.0)
     event_queue: queue.Queue = queue.Queue(maxsize=100)
 
     def _producer():
+        """SSE 心跳生产者线程：从事件迭代器读取事件并推入队列，队列满时重试，结束放入 None 哨兵"""
         try:
             for event in event_iter:
                 while True:
@@ -255,6 +279,11 @@ streaming_formatter = StreamingFormatter()
 
 
 def strip_code_blocks(content: str) -> str:
+    """剥离 LLM 输出中的 reasoning/action/json 代码块与内联 JSON 动作对象。
+
+    对指定键名的内联 JSON 采用花括号计数法，正确处理值中含花括号与
+    多行对象的情况，返回仅剩用户可见正文的文本。
+    """
     content = re.sub(r'```reasoning\s*[\s\S]*?\s*```', '', content).strip()
     content = re.sub(r'```action\s*[\s\S]*?\s*```', '', content).strip()
     content = re.sub(r'```json\s*[\s\S]*?\s*```', '', content).strip()
@@ -294,6 +323,7 @@ def strip_code_blocks(content: str) -> str:
 
 
 def _truncate_result(content: str, max_length: int = 5000) -> str:
+    """超长工具结果居中截断，保留首尾并在中间标注原始长度。"""
     if len(content) <= max_length:
         return content
     half = max_length // 2
@@ -340,6 +370,7 @@ def _strip_reasoning_trace(raw: str) -> tuple[str, str | None]:
 
 
 def _safe_json_loads(data: str) -> Any:
+    """安全解析 JSON：依次尝试 json_repair、标准 json.loads 与花括号提取修复，全部失败返回原数据"""
     if not isinstance(data, str):
         return data
 
@@ -404,6 +435,11 @@ def _tool_worker(result_dict, func, args):
 
 
 def parse_reasoning_trace(content: str) -> Optional[Dict[str, Any]]:
+    """从 LLM 输出中解析 reasoning_trace 字典。
+
+    依次尝试：```reasoning 代码块内 JSON、纯文本兜底、内联 JSON 对象；
+    全部失败返回 None。优先使用 json_repair 增强容错。
+    """
     try:
         from json_repair import loads as repair_loads
         has_json_repair = True

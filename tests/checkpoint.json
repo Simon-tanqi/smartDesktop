@@ -1,0 +1,22 @@
+{
+  "status": "RUNNING",
+  "current_category": "系统配置更改",
+  "last_completed_test": null,
+  "next_test_to_run": "T-01",
+  "total_tests_passed": 0,
+  "total_tests_failed": 0,
+  "session_registry": {},
+  "category_order": [
+    "系统配置更改",
+    "电脑软件安装卸载",
+    "网页资料浏览",
+    "Word 文档生成",
+    "PPT 演示文稿生成",
+    "Excel 数据处理",
+    "代码编写",
+    "扩展场景"
+  ],
+  "manual_check_tests": ["T-07", "T-13", "T-23", "T-56", "T-62"],
+  "per_case_timeout_sec": 120,
+  "test_results": {}
+}

@@ -1,10 +1,16 @@
-# core/plan.py
+"""任务计划数据结构：定义计划步骤与整体计划的模型及序列化。
+
+PlanStep 描述单个执行步骤（工具、参数、依赖与执行状态），TaskPlan 将步骤
+组合为一份可持久化、可恢复的完整计划，支持与 JSON 互相转换。
+"""
 import datetime
 from typing import List, Dict, Any, Optional, Literal
 from dataclasses import dataclass, field
 
 @dataclass
 class PlanStep:
+    """单个计划步骤：记录待执行工具、参数、依赖关系与执行结果。"""
+
     step_id: int
     description: str                     # 人类可读描述
     tool_name: str                       # 必须存在于工具注册表
@@ -18,6 +24,8 @@ class PlanStep:
 
 @dataclass
 class TaskPlan:
+    """完整任务计划：由多个 PlanStep 组成，支持进度跟踪与 JSON 序列化。"""
+
     plan_id: str
     user_task: str
     steps: List[PlanStep]
@@ -27,6 +35,7 @@ class TaskPlan:
     is_complete: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
+        """将计划导出为可 JSON 序列化的字典。"""
         return {
             "plan_id": self.plan_id,
             "user_task": self.user_task,
@@ -42,6 +51,7 @@ class TaskPlan:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TaskPlan":
+        """从字典还原计划对象，缺失字段使用默认值兜底。"""
         steps = [PlanStep(**s) for s in data["steps"]]
         return cls(
             plan_id=data["plan_id"],

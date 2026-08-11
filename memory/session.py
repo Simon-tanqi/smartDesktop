@@ -106,6 +106,7 @@ def _get_tool_cache_from_registry(available_tools: list) -> list:
 
 
 def _make_title(content: str) -> str:
+    """从消息内容生成会话标题：去代码块、压缩空白、截断 25 字"""
     if not content:
         return "新会话"
     cleaned = re.sub(r"```[\s\S]*?```", "", content)
@@ -123,6 +124,7 @@ _FACT_EXTRACT_MIN_LEN = 3
 
 
 def _is_noise(text: str) -> bool:
+    """判断文本是否为无意义噪声短语"""
     normalized = re.sub(r'(.)\1+', r'\1', text.strip())
     return normalized in set(NOISE_PHRASES) or text.strip() in set(NOISE_PHRASES)
 
@@ -131,6 +133,7 @@ _session_lock = threading.RLock()
 
 
 def generate_session_id():
+    """生成会话 ID：小时前缀加序号自增"""
     now = datetime.datetime.now()
     base = now.strftime("%Y%m%d%H")
     db = load_sessions_db()
@@ -147,6 +150,7 @@ def generate_session_id():
 
 
 def _get_next_session_name():
+    """生成下一个未占用的新会话N名称"""
     db = load_sessions_db()
     used_numbers = set()
     for data in db.values():
@@ -161,6 +165,7 @@ def _get_next_session_name():
 
 
 def create_session(title=None):
+    """创建新会话并设为当前活动会话"""
     with _session_lock:
         if title is None:
             title = _get_next_session_name()
@@ -178,6 +183,7 @@ def create_session(title=None):
 
 
 def rename_session(session_id, new_title):
+    """重命名会话，标题为空或会话不存在时返回 False"""
     new_title = new_title.strip()
     if not new_title:
         return False
@@ -190,6 +196,7 @@ def rename_session(session_id, new_title):
 
 
 def ensure_session_titles():
+    """补齐所有空标题会话为未占用的新会话N"""
     db = load_sessions_db()
     used_numbers = set()
     for data in db.values():
@@ -212,6 +219,7 @@ def ensure_session_titles():
 
 
 def get_active_session_id():
+    """读取当前活动会话 ID，失效时自动创建新会话"""
     with _session_lock:
         if os.path.exists(ACTIVE_SESSION_FILE):
             with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
@@ -223,11 +231,13 @@ def get_active_session_id():
 
 
 def set_active_session(session_id):
+    """将指定会话 ID 写入活动会话文件"""
     with open(ACTIVE_SESSION_FILE, "w", encoding="utf-8") as f:
         f.write(session_id)
 
 
 def list_sessions():
+    """列出全部会话（排除测试/诊断前缀），按创建时间倒序"""
     db = load_sessions_db()
     sessions = []
     for sid, data in db.items():
@@ -243,6 +253,7 @@ def list_sessions():
 
 
 def get_session(session_id):
+    """按 ID 获取会话信息"""
     db = load_sessions_db()
     return db.get(session_id)
 
@@ -268,6 +279,7 @@ def _remove_active_session_file():
 
 
 def delete_session(session_id):
+    """删除会话及其聊天记录，若为活动会话同时清理活动文件"""
     from memory.stores.sqlite_store import delete_chat_session
     db = load_sessions_db()
     if session_id in db:
@@ -284,6 +296,7 @@ def delete_session(session_id):
 
 
 def update_last_turn(session_id, turn):
+    """更新会话的最后轮次号"""
     db = load_sessions_db()
     if session_id in db:
         db[session_id]["last_turn"] = turn
@@ -291,6 +304,7 @@ def update_last_turn(session_id, turn):
 
 
 def get_last_turn(session_id):
+    """读取会话的最后轮次号"""
     db = load_sessions_db()
     return db.get(session_id, {}).get("last_turn", -1)
 
@@ -320,10 +334,12 @@ def save_turn_count(session_id: str, n: int) -> bool:
 
 
 def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35):
+    """检测与历史用户消息高度重复的查询，返回需排除的助手回复索引"""
     if not current_user_msg or not messages:
         return []
 
     def _bigrams(text):
+        """提取文本的中文二元组与英文单词特征集合"""
         chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
         english = re.findall(r'[a-zA-Z]{2,}', text.lower())
         features = set()
@@ -333,6 +349,7 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
         return features
 
     def _is_tool_call(content):
+        """判断内容是否为工具调用 JSON"""
         content = content.strip()
         return ('"tool_name"' in content[:200] or
                 content.startswith('{"tool_call"') or
@@ -368,10 +385,12 @@ def _detect_repeated_query(messages, current_user_msg, similarity_threshold=0.35
 
 
 def _calculate_session_relevance(current_user_msg, messages, threshold=0.1):
+    """计算当前消息与历史会话的相关度，返回是否延续上下文与归一化分数"""
     if not current_user_msg or not messages:
         return True, 1.0
 
     def _bigrams(text):
+        """提取文本的中文二元组与英文单词特征集合"""
         chinese = re.sub(r'[^\u4e00-\u9fff]', '', text)
         english = re.findall(r'[a-zA-Z]{2,}', text.lower())
         features = set()
@@ -446,6 +465,7 @@ def tool_recall_memory(session_id: str, key: str = None) -> str:
 
 
 def _parse_tool_call(content):
+    """解析回复内容中的工具调用 JSON，返回工具名与参数字典"""
     tool_name = ""
     tool_arguments = {}
 
@@ -469,6 +489,7 @@ def _parse_tool_call(content):
 
 
 def _extract_tool_calls(content):
+    """解析回复内容中的工具调用 JSON，支持单个对象或列表，返回调用列表"""
     tool_calls = []
 
     try:
@@ -909,6 +930,7 @@ def _compute_elapsed_ms(child_turns):
 
 
 def _finalize_entry_v2(entry, tool_calls, last_tool_name, last_tool_args, last_tool_result, child_turns=None):
+    """完成轮次条目收尾：合并工具调用并推断任务状态"""
     if last_tool_name and last_tool_result:
         tool_calls.append({
             "tool_name": last_tool_name,
@@ -1787,6 +1809,7 @@ def append_session_message(session_id, role, content,
                            tool_call_id="",
                            tool_calls="",
                            thinking_summary=""):
+    """写入一条会话消息：自动建会话、噪声过滤、事实提取与超阈值压缩"""
     content = content.strip()
     if not content:
         return session_id
@@ -1899,15 +1922,18 @@ def append_think_step(session_id, content, trace_id="", user_id=""):
 
 
 def log_session_turn(role, content, trace_id="", user_id="", session_id=""):
+    """记录一轮对话操作日志"""
     log_operation(trace_id, user_id, session_id,
                   operation=f"chat.{role}", detail=content)
 
 
 def get_log_dir():
+    """返回会话日志目录"""
     return LOGS_DIR
 
 
 def save_ai_log(content: str, filename: str = None):
+    """追加 AI 输出到日志文件"""
     if not content.strip():
         return
     if filename is None:

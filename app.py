@@ -1,3 +1,4 @@
+"""Flask 服务入口模块：应用工厂、优雅停机、模型配置校验与字节码缓存清理。"""
 import os
 import sys
 import signal
@@ -10,6 +11,7 @@ import tkinter
 def _tk_safe_del(original_del):
     """包装 __del__，静默捕获跨线程 GC 错误。"""
     def wrapper(self):
+        """调用原始析构并吞掉线程相关的 RuntimeError。"""
         try:
             original_del(self)
         except RuntimeError:
@@ -45,6 +47,8 @@ _HOST = AGENT_HOST
 
 
 class Config:
+    """服务运行配置：端口、主机、CORS、限速与调试开关（支持环境变量覆盖）。"""
+
     PORT = _PORT
     HOST = _HOST
     CORS_ORIGINS = AGENT_CORS_ORIGINS
@@ -62,6 +66,7 @@ def _register_tools():
 def _setup_graceful_shutdown(app):
     """注册优雅停机信号处理"""
     def graceful_shutdown(signum, frame):
+        """停机信号处理：关闭应用上下文并退出进程。"""
         logger.info("收到停机信号，正在优雅关闭服务...")
         try:
             app.do_teardown_appcontext()
@@ -158,18 +163,22 @@ def create_app(config=None):
     
     @app.route('/')
     def index():
+        """首页：渲染前端入口页面。"""
         return render_template('index.html')
     
     @app.route('/api/health')
     def health():
+        """健康检查接口：返回服务状态与当前时间。"""
         return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
     
     @app.before_request
     def log_request_start():
+        """请求前置钩子：记录请求开始时间。"""
         request.start_time = time.time()
     
     @app.after_request
     def log_request_end(response):
+        """请求后置钩子：记录耗时日志并禁用前端页面缓存。"""
         if hasattr(request, 'start_time'):
             duration = (time.time() - request.start_time) * 1000
             logger.info(
@@ -184,6 +193,7 @@ def create_app(config=None):
     
     @app.errorhandler(Exception)
     def handle_exception(e):
+        """全局异常处理：记录堆栈并返回统一错误响应。"""
         logger.error(f"未捕获异常: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
     

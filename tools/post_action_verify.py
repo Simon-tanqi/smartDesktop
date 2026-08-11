@@ -50,6 +50,7 @@ _VERIFIERS: Dict[str, Callable[[VerifyContext], VerifyReport]] = {}
 def register_verifier(operation_type: str):
     """装饰器：注册操作后验证器"""
     def decorator(func: Callable[[VerifyContext], VerifyReport]):
+        """装饰器：将验证函数注册到验证器表"""
         _VERIFIERS[operation_type] = func
         return func
     return decorator
@@ -436,6 +437,7 @@ def with_verification(tool_func: Callable) -> Callable:
     """
     def wrapper(*args, **kwargs):
         # 执行原始工具
+        """包装后的执行体：执行工具、解析结果并触发验证"""
         result = tool_func(*args, **kwargs)
         
         # 尝试提取命令参数（假设第一个参数是 command）

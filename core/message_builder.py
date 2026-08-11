@@ -1,3 +1,9 @@
+"""消息构建模块：组装 System Prompt 文本与多轮 messages 数组。
+
+build_system_prompt 负责将角色模式、工具列表与安全规则拼装为完整提示词；
+StandardMessageBuilder 遵循「System 静态不变、Tools 独立传递」的约定，
+仅处理 messages 数组的注入与拼接。
+"""
 import json
 from typing import List, Dict, Any, Optional
 
@@ -64,6 +70,17 @@ class StandardMessageBuilder:
         memory_preamble: Optional[str] = None,    # 可选：长期记忆/会话摘要注入
         system_prompt: Optional[str] = None       # 可选：静态 System Prompt，嵌入 messages[0]
     ) -> List[Dict[str, Any]]:
+        """按顺序组装本轮 messages：System 提示词 → 记忆注入 → 历史 → 当前输入。
+
+        Args:
+            history: 完整的多轮对话历史。
+            current_user_input: 当前轮次的新用户输入，None 时省略。
+            memory_preamble: 长期记忆/会话摘要，以 system 消息注入，不污染交替序列。
+            system_prompt: 静态 System Prompt，嵌入 messages[0]。
+
+        Returns:
+            组装完成的 messages 列表。
+        """
         messages: List[Dict[str, Any]] = []
 
         # 0. System Prompt 注入（静态，放在最前，由 AI 做多段合并）
