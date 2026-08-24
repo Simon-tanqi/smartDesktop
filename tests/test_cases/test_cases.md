@@ -500,7 +500,7 @@
 **前置条件**：`take_screenshot` 工具可用  
 **用户输入**：截取当前屏幕截图，保存到桌面，文件名为 `screenshot_test.png`  
 
-**预期行为**：Agent 调用 `take_screenshot()` 或 `gui_screenshot(save_path="C:\\Users\\username\\Desktop\\screenshot_test.png")`，返回截图文件路径  
+**预期行为**：Agent 调用 `take_screenshot()` 或 `gui_screenshot(save_path="<USER_HOME>\\Desktop\\screenshot_test.png")`，返回截图文件路径  
 
 **验证方式**：  
 - 检查点 1：截图文件在桌面成功创建  
@@ -521,7 +521,7 @@
 
 **预期行为**：  
 1. Agent 调用 `search_images(query="cat", max_results=1)` 获取图片 URL  
-2. Agent 调用 `web_download(url="https://...", output_dir="C:\\Users\\username\\Desktop")` 下载  
+2. Agent 调用 `web_download(url="https://...", output_dir="<USER_HOME>\\Desktop")` 下载  
 3. 返回文件路径  
 
 **验证方式**：  
@@ -624,7 +624,7 @@
 **前置条件**：`python-docx` 已安装；桌面有写入权限  
 **用户输入**：在桌面创建一个 Word 文档，文件名为 `report.docx`，包含标题"项目进度报告"和两段正文  
 
-**预期行为**：Agent 调用 `create_word_document(file_path="C:\\Users\\username\\Desktop\\report.docx", content={"sections": [{"heading": "项目进度报告", "content": [{"type": "paragraph", "text": "第一段内容..."}, {"type": "paragraph", "text": "第二段内容..."}]}]})`  
+**预期行为**：Agent 调用 `create_word_document(file_path="<USER_HOME>\\Desktop\\report.docx", content={"sections": [{"heading": "项目进度报告", "content": [{"type": "paragraph", "text": "第一段内容..."}, {"type": "paragraph", "text": "第二段内容..."}]}]})`  
 
 **验证方式**：  
 - 检查点 1：文件 `report.docx` 在桌面成功创建  
@@ -666,7 +666,7 @@
 **前置条件**：需准备一张本地图片（如 `C:\test.jpg`）或网络图片 URL  
 **用户输入**：在桌面创建一个 Word 文档 `image_doc.docx`，包含一张图片（来自本地或网络），图片居中显示  
 
-**预期行为**：Agent 先确认图片路径可用，再调用 `add_word_content(file_path="C:\\Users\\username\\Desktop\\image_doc.docx", content_type="image", content_config={"image_path": "C:\\test.jpg", "alignment": "center"})`  
+**预期行为**：Agent 先确认图片路径可用，再调用 `add_word_content(file_path="<USER_HOME>\\Desktop\\image_doc.docx", content_type="image", content_config={"image_path": "C:\\test.jpg", "alignment": "center"})`  
 
 **验证方式**：  
 - 检查点 1：Word 文档创建成功  
@@ -704,7 +704,7 @@
 **前置条件**：T-29 已创建 `report.docx`  
 **用户输入**：读取桌面上的 `report.docx`，提取所有文本内容并展示给我  
 
-**预期行为**：Agent 调用 `extract_word_text(file_path="C:\\Users\\username\\Desktop\\report.docx")`，返回提取的纯文本内容  
+**预期行为**：Agent 调用 `extract_word_text(file_path="<USER_HOME>\\Desktop\\report.docx")`，返回提取的纯文本内容  
 
 **验证方式**：  
 - 检查点 1：返回文本包含"项目进度报告"标题  
@@ -723,7 +723,7 @@
 **前置条件**：T-29 已创建 `report.docx`  
 **用户输入**：将 `report.docx` 中的所有"项目"替换为"PROJECT"  
 
-**预期行为**：Agent 调用 `search_replace_word(file_path="C:\\Users\\username\\Desktop\\report.docx", search_text="项目", replace_text="PROJECT", case_sensitive=false)`  
+**预期行为**：Agent 调用 `search_replace_word(file_path="<USER_HOME>\\Desktop\\report.docx", search_text="项目", replace_text="PROJECT", case_sensitive=false)`  
 
 **验证方式**：  
 - 检查点 1：返回 success=true  
@@ -770,7 +770,7 @@
 **前置条件**：`python-pptx` 已安装；桌面有写入权限  
 **用户输入**：在桌面创建一个 PPT，文件名为 `intro.pptx`，包含：第1页标题"欢迎辞"，副标题"2026年度会议"；第2页标题"议程"，正文列出3个议程项  
 
-**预期行为**：Agent 调用 `generate_ppt(slides=[{"title": "欢迎辞", "subtitle": "2026年度会议", "layout": "title"}, {"title": "议程", "bullets": ["议程项1", "议程项2", "议程项3"]}], theme="tech_blue", output_path="C:\\Users\\username\\Desktop\\intro.pptx")`  
+**预期行为**：Agent 调用 `generate_ppt(slides=[{"title": "欢迎辞", "subtitle": "2026年度会议", "layout": "title"}, {"title": "议程", "bullets": ["议程项1", "议程项2", "议程项3"]}], theme="tech_blue", output_path="<USER_HOME>\\Desktop\\intro.pptx")`  
 
 **验证方式**：  
 - 检查点 1：文件 `intro.pptx` 在桌面成功创建  
@@ -789,7 +789,7 @@
 **前置条件**：T-36 已创建 `intro.pptx`  
 **用户输入**：向 `intro.pptx` 添加第3页，内容为：标题"总结"，正文2个要点  
 
-**预期行为**：Agent 调用 `add_slide_content(file_path="C:\\Users\\username\\Desktop\\intro.pptx", slide_config={"title": "总结", "bullets": ["要点1", "要点2"]})`  
+**预期行为**：Agent 调用 `add_slide_content(file_path="<USER_HOME>\\Desktop\\intro.pptx", slide_config={"title": "总结", "bullets": ["要点1", "要点2"]})`  
 
 **验证方式**：  
 - 检查点 1：PPT 现在包含 3 张幻灯片  
@@ -828,9 +828,9 @@
 **用户输入**：读取 `intro.pptx` 的所有文本内容，导出为 `intro_content.txt` 保存到桌面  
 
 **预期行为**：  
-1. Agent 调用 `extract_presentation_info(file_path="C:\\Users\\username\\Desktop\\intro.pptx")` 或 `export_presentation_text`  
+1. Agent 调用 `extract_presentation_info(file_path="<USER_HOME>\\Desktop\\intro.pptx")` 或 `export_presentation_text`  
 2. 整理文本内容  
-3. 调用 `write_file(file_path="C:\\Users\\username\\Desktop\\intro_content.txt", content="...")`  
+3. 调用 `write_file(file_path="<USER_HOME>\\Desktop\\intro_content.txt", content="...")`  
 
 **验证方式**：  
 - 检查点 1：文本文件创建成功  
@@ -868,7 +868,7 @@
 **前置条件**：T-36 已创建 `intro.pptx`  
 **用户输入**：查看 `intro.pptx` 的基本信息，包括幻灯片数量、每页标题  
 
-**预期行为**：Agent 调用 `extract_presentation_info(file_path="C:\\Users\\username\\Desktop\\intro.pptx")`  
+**预期行为**：Agent 调用 `extract_presentation_info(file_path="<USER_HOME>\\Desktop\\intro.pptx")`  
 
 **验证方式**：  
 - 检查点 1：返回幻灯片总数（3张）  
@@ -953,7 +953,7 @@
 **前置条件**：测试数据文件存在  
 **用户输入**：用 `sales_data.xlsx` 生成一个柱状图，展示各部门的销售额，保存到桌面 `chart.xlsx`  
 
-**预期行为**：Agent 调用 `excel_chart_advanced(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", chart_config={"chart_type": "bar", "title": "部门销售额", "categories_col": "部门", "values_col": "销售额", "output_path": "C:\\Users\\username\\Desktop\\chart.xlsx"})`  
+**预期行为**：Agent 调用 `excel_chart_advanced(file_path="D:\\PyCharm Project\\smartDesktop\\test_data\\sales_data.xlsx", chart_config={"chart_type": "bar", "title": "部门销售额", "categories_col": "部门", "values_col": "销售额", "output_path": "<USER_HOME>\\Desktop\\chart.xlsx"})`  
 
 **验证方式**：  
 - 检查点 1：图表文件创建成功（chart.xlsx）  
@@ -1014,7 +1014,7 @@
 **前置条件**：准备 2 个格式相同的 Excel 文件（如 `file1.xlsx` 和 `file2.xlsx`，可自行创建）  
 **用户输入**：将桌面上的 `file1.xlsx` 和 `file2.xlsx` 合并为一个文件 `merged.xlsx`（按行拼接）  
 
-**预期行为**：Agent 调用 `excel_merge(file_paths=["C:\\Users\\username\\Desktop\\file1.xlsx", "C:\\Users\\username\\Desktop\\file2.xlsx"], output_path="C:\\Users\\username\\Desktop\\merged.xlsx", strategy="concat")`  
+**预期行为**：Agent 调用 `excel_merge(file_paths=["<USER_HOME>\\Desktop\\file1.xlsx", "<USER_HOME>\\Desktop\\file2.xlsx"], output_path="<USER_HOME>\\Desktop\\merged.xlsx", strategy="concat")`  
 
 **验证方式**：  
 - 检查点 1：`merged.xlsx` 创建成功  

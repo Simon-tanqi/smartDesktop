@@ -39,27 +39,38 @@ safe_exec:
     - pattern: "(?i)DingTalk\\\\.+?\\\\db[\\\\.]"
       desc: "钉钉聊天记录数据库"
     # 安全凭据
-    - pattern: "(?i)\\\\\\\\.ssh\\\\"
+    - pattern: "(?i)\\\\.ssh\\\\"
       desc: "SSH 密钥目录"
-    - pattern: "(?i)\\\\\\\\.aws\\\\"
+    - pattern: "(?i)\\\\.aws\\\\"
       desc: "AWS 凭据目录"
-    - pattern: "(?i)\\\\\\\\.kube\\\\"
+    - pattern: "(?i)\\\\.kube\\\\"
       desc: "Kubernetes 配置目录"
-    - pattern: "(?i)\\\\\\\\.env$"
+    - pattern: "(?i)\\\\.env(?:$|[\\s\"'\\\\])"
       desc: "环境变量配置文件"
-    - pattern: "(?i)\\\\\\\\.git\\\\"
+    - pattern: "(?i)\\\\.git\\\\"
       desc: "Git 仓库数据"
 
   # 挑战短语
   danger_challenge_phrase: "我知晓此操作为危险操作，我确认授权给Agent执行此危险操作"
 
   # 危险模式定义（仅保留高风险操作；taskkill 等已由 execute_command 确认层处理）
+  # 注意：pattern 中禁止使用裸 .* 连接远端关键词（会对超长无匹配输入产生二次回溯，
+  # 实测 120KB 命令耗时 7s+，可致 Agent 卡死）；统一使用 (?=[^\r\n]{0,512}\b...) 限长前瞻。
   danger_patterns:
-    - pattern: \breg\s+add\b.*\bHKLM\b
+    - pattern: \breg\s+add\b(?=[^\r\n]{0,512}\bHKLM\b)
       desc: "写入系统级注册表 (HKLM)"
       level: challenge
-    - pattern: \breg\s+add\b.*\bHKEY_LOCAL_MACHINE\b
+    - pattern: \breg\s+add\b(?=[^\r\n]{0,512}\bHKEY_LOCAL_MACHINE\b)
       desc: "写入系统级注册表 (HKLM)"
+      level: challenge
+    - pattern: \breg\s+delete\b(?=[^\r\n]{0,512}\b(?:HKLM|HKEY_LOCAL_MACHINE)\b)
+      desc: "删除系统级注册表项 (HKLM)"
+      level: challenge
+    - pattern: \breg\s+import\b(?=[^\r\n]{0,512}\b(?:HKLM|HKEY_LOCAL_MACHINE)\b)
+      desc: "导入系统级注册表文件 (HKLM)"
+      level: challenge
+    - pattern: \b(?:Set-ItemProperty|New-ItemProperty|Remove-ItemProperty)\b(?=[^\r\n]{0,512}\b(?:HKLM|HKEY_LOCAL_MACHINE)\b)
+      desc: "修改系统级注册表项 (HKLM)"
       level: challenge
 
   # 危险路径模式 — L2 挑战层
@@ -206,7 +217,6 @@ file_tools:
       - hostname
       - systeminfo
       - tasklist
-      - net
       - ipconfig
       - ping
       - tracert
@@ -222,7 +232,6 @@ file_tools:
       - powercfg
     # 其他
     other:
-      - wmic
       # 常见开发工具命令（包管理 / 构建 / 编译）
       - pip
       - pip3

@@ -1715,7 +1715,7 @@ class SessionLogger:
             "reasoning": reasoning,
             "status": "in_progress",
             "error": "",
-            "start_time": self._now_iso(),  # ★ 修复 BUG 1：创建时即赋值
+            "start_time": self._now_iso(),  #创建时即赋值
             "end_time": "",
             "duration_ms": 0,
             # ── 近3轮结构化记忆快照 ──

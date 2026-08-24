@@ -1,8 +1,122 @@
 # smartDesktop
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](requirements.txt)
+[![CI](https://github.com/Simon-tanqi/smartDesktop/actions/workflows/ci.yml/badge.svg)](https://github.com/Simon-tanqi/smartDesktop/actions/workflows/ci.yml)
+
 个人 AI Agent 助手，基于 ReAct（Reasoning + Acting）模式的本地智能代理。支持多模型后端、工具动态注册、分层记忆系统与 BM25 上下文路由。
 
+## 核心亮点
+
+- **自研零依赖上下文路由**：基于 Okapi BM25 的纯统计任务切换检测（memory/context_router.py），无向量模型、无外部依赖、完全离线，中文 bigram + 单字分词
+- **四层记忆体系**：工作记忆 / 情节缓存 / 历史摘要 / 长期记忆分层组织，LLM 增量压缩控制 Token 预算，长对话不失忆
+- **任务检查点恢复**：SQLite 持久化检查点，任务意外中断后可精确断点续传
+- **动态技能域加载**：12 类内置工具按需注册，加载后下一轮对话即获得该域全部能力
+- **三层递进式熔断**：循环检测 + 同名失败计数 + 全局失败上限，防止工具调用死循环
+- **安全执行沙箱**：safe_exec 命令预检拦截 + 风险分级确认（P0-P3）
+
+## 演示
+
+点击 GIF 可跳转到对应功能的源码实现。
+
+| 基础对话 | 时间查询 | 文档产出 |
+| --- | --- | --- |
+| [![基础对话](assets/demo/demo-basic-chat.gif)](README.md) | [![时间查询](assets/demo/demo-time-query.gif)](core/intent_router.py) | [![报表生成](assets/demo/demo-excel-report.gif)](backend/chat.py) |
+
+| 安全确认 | 安全拦截 | 工具思考 | 记忆召回 |
+| --- | --- | --- | --- |
+| [![安全确认](assets/demo/demo-security-deny.gif)](core/safety_policy.py) | [![安全拦截](assets/demo/demo-security-guard.gif)](prompts/safety.md) | [![工具思考](assets/demo/demo-tool-thinking.gif)](core/react_engine.py) | [![记忆召回](assets/demo/demo-memory-recall.gif)](memory/long_term.py) |
+
+> 记忆召回演示图为测试数据（演示数据的长期记忆写入与召回）。
+
 ## 核心架构
+
+### 系统架构总览
+
+```mermaid
+flowchart TD
+    subgraph WEB["Web 层"]
+        W1["web/index.html<br/>聊天前端（消息/工具流式展示）"]
+        W2["web/static/log_viewer.html<br/>运行日志查看器"]
+    end
+
+    subgraph API["API 层"]
+        A1["backend/chat.py<br/>Flask 蓝图 / SSE 流式接口"]
+    end
+
+    subgraph ROUTE["路由层"]
+        R1["core/intent_router.py<br/>L1 直连（问候/闲聊）<br/>L2 LLM 意图识别（可降级）"]
+    end
+
+    subgraph ENGINE["引擎层"]
+        E1["core/react_engine.py<br/>ReAct 循环：推理 → 行动 → 最终回复"]
+        E2["core/agent_state.py<br/>上下文构建 + 归档话题召回"]
+    end
+
+    subgraph MEM["记忆层"]
+        M1["memory/context_router.py<br/>BM25 话题切换检测"]
+        M2["memory/session.py / long_term.py<br/>四层记忆（会话 / 长期 / 压缩 / 提取）"]
+        M3["memory/stores/sqlite_store.py<br/>SQLite 持久化 + topic_archive 话题归档表"]
+    end
+
+    subgraph TOOLS["工具层"]
+        T1["tools/（file / search / system / code）<br/>工具注册、参数校验、safe_exec 安全执行"]
+        T2["utils/dependency_manager.py<br/>运行依赖校验与补装"]
+    end
+
+    subgraph LLM["LLM 适配层"]
+        L1["llm_client.py<br/>Ollama 原生 + OpenAI 兼容（DeepSeek 等多厂商）"]
+    end
+
+    W1 --> A1
+    W2 --> A1
+    A1 --> R1
+    R1 --> E1
+    E1 --> E2
+    E2 --> M1
+    M2 --> M3
+    E1 --> T1
+    T1 --> T2
+    E1 --> L1
+    L1 --> M2
+    E2 --> M3
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as web/index.html
+    participant API as backend/chat.py (Flask)
+    participant IR as core/intent_router.py
+    participant AS as core/agent_state.py
+    participant RE as core/react_engine.py
+    participant LLM as llm_client.py
+    participant TOOL as tools/（注册 + 校验）
+    participant MEM as memory/（SQLite + 话题归档）
+
+    U->>W: 输入消息
+    W->>API: POST /api/chat（SSE 流式）
+    API->>IR: 意图路由
+    IR-->>API: L1 直连命中（问候/闲聊）
+    API-->>W: 直接回复
+    API->>IR: 复杂任务 → L2 LLM 意图识别
+    IR-->>API: 意图 + 任务类型
+    API->>AS: 构建上下文
+    AS->>MEM: 读取跨轮历史 + match_archived_topics 归档召回
+    MEM-->>AS: 上下文块
+    AS->>RE: 进入 ReAct 循环
+    RE->>LLM: reasoning / action 决策
+    LLM-->>RE: 工具调用指令（含参数）
+    RE->>TOOL: 执行工具（注册校验 / 依赖校验）
+    TOOL-->>RE: 观察结果（observation）
+    RE->>LLM: 继续推理直至 final_message
+    LLM-->>RE: final_message
+    RE->>MEM: 写入会话消息 + 话题切换时 archive_session_topic 归档
+    RE-->>API: 最终回复
+    API-->>W: SSE 流式返回
+    W-->>U: 展示回复与工具执行轨迹
+```
 
 ### 单用户消息 ReAct 模式
 
@@ -175,6 +289,8 @@ smartDesktop/
 │
 ├── web/                        # Web 前端
 │   ├── index.html
+│   ├── static/
+│   │   └── log_viewer.html     # 运行日志查看器（独立页面）
 │   └── api/
 │       └── requirements.txt
 │
@@ -278,7 +394,28 @@ python app.py
 
 # 配置 API Key
 # 首次启动后编辑 %APPDATA%\smartDesktop\models.json
+# 可先复制配置模板：copy models.example.json "%APPDATA%\smartDesktop\models.json"
 ```
+
+## 快速体验
+
+以下为一段真实交互链路示例（工具名与 `prompts/tools.yaml` 注册一致），展示 Agent 从意图识别到文件产出的完整思考与执行过程：
+
+**用户：** 帮我在下载文件夹里找 6 月的销售 Excel，统计各产品总销售额，把结果写成新表，再复制一份到我桌面的工作区。
+
+| # | 链路 | 示例内容 | 对应技术点 |
+|---|------|---------|-----------|
+| 1 | 意图路由 | 消息被判定为**多步数据处理任务**（非问候/闲聊），进入 L2 意图识别 | 意图路由：L1 直连未命中 → L2 LLM 识别 |
+| 2 | 文件检索 | 调用 `search_files`（文件名关键词 + 扩展名过滤）命中 `销售明细-2025-06.xlsx` | 工具注册与参数校验 |
+| 3 | 数据读取 | 调用 `excel_read` 读取工作表，得到各产品行数据 | ReAct 循环：思考 → 工具 → 观察 |
+| 4 | 数据计算 | 调用 `run_python` 按产品聚合销售额，生成结果表 | 安全执行与依赖校验 |
+| 5 | 文件产出 | 调用 `excel_write` 将结果写入新文件 `销售汇总-2025-06.xlsx` | 文件产出到工作区 |
+| 6 | 工作区复制 | 调用 `copy_file_to_workspace` 将结果复制到桌面工作区目录 | 文件产出到工作区 |
+| 7 | 记忆与归档 | 本轮消息写入会话存储；若话题切换，触发 `archive_session_topic` 归档 | 记忆写入与话题归档 |
+
+**Agent 最终回复：** 已找到 6 月销售明细，统计完成并生成 `销售汇总-2025-06.xlsx`，已复制到 `Desktop\workspace\`，共汇总 3 个产品、12 条订单。
+
+> 说明：完整 ReAct 循环中，每步工具调用都会在 `web/static/log_viewer.html` 中留下结构化 `reasoning_trace` 与 `tool_call` 日志，便于回溯与面试演示。
 
 ## 关键设计原则
 

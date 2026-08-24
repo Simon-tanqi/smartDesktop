@@ -1,12 +1,5 @@
 """
-经验内化模块：从对话历史中提取任务处理经验，生成可复用的 Skill。
-
-修复问题：
-- 3.1: 步骤提取逻辑脆弱 → 使用消息角色 + 智能边界检测
-- 3.2: LLM Prompt 质量 → 智能截断 + 添加格式示例
-- 3.3: 版本号污染 → 使用 YAML frontmatter
-- 3.4: 文件冲突策略 → 版本自增 + 备份机制
-- 3.5: 触发词误判 → 正则 + 词边界检测
+经验内化模块：从对话历史中提取任务处理经验，生成可复用的 Skill，暂时未完整实现
 """
 import os
 import json
@@ -119,7 +112,6 @@ def extract_task_steps_from_history(messages: list[dict]) -> dict:
                     tool_name = tc.get("function", {}).get("name", "")
                     tools_used.add(tool_name)
                     
-                    # 修复问题 3：处理 chunked tool_calls 的 arguments 可能是字符串
                     arguments = tc.get("function", {}).get("arguments", {})
                     if isinstance(arguments, str):
                         try:
@@ -276,7 +268,7 @@ def _extract_tool_call_from_content(content: str) -> tuple[str, dict]:
 
 
 def _extract_task_description(messages: list[dict]) -> str:
-    """提取任务描述（第一条用户消息）"""
+    """提取任务描述"""
     for msg in messages:
         if msg["role"] == "user":
             return msg["content"][:200]

@@ -120,7 +120,7 @@ def _extract_registry_value(command: str) -> tuple:
 @register_verifier("uninstall")
 def verify_uninstall(ctx: VerifyContext) -> VerifyReport:
     """
-    验证卸载操作：检查程序是否仍然存在（优化版 - 修复转义与匹配逻辑）
+    检查程序是否仍然存在
     """
     program = _extract_program_name(ctx.original_command)
     if not program:

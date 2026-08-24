@@ -1,0 +1,42 @@
+{
+  "_comment": "smartDesktop 模型配置示例模板。使用方法：将本文件复制为 %APPDATA%\\smartDesktop\\models.json（Windows）或 ~/smartDesktop/models.json（Linux/macOS），再按需修改。真实配置目录下的 models.json 已被 .gitignore 忽略，不会提交；本示例文件保留在仓库中供开源用户参考。字段说明：active_model_id=当前激活模型 id（必须与 models[].id 对应）；models[].id=模型唯一标识（必填）；name=前端显示名；provider=服务商（ollama/deepseek/hunyuan/qwen/zhipu/doubao/openai/custom，仅 ollama 走本地原生 API，其余走 OpenAI 兼容协议）；model=实际模型名；base_url=API 根地址（不含 /chat/completions 路径）；api_version=OpenAI 兼容版本路径，默认 v1；temperature=采样温度；api_key=API Key（建议留空，改用环境变量 SMARTDESKTOP_API_KEY 或 API_KEY 注入，更安全）；stream=是否支持流式。本文件中的 _comment 字段仅为说明，代码读取时会忽略。",
+  "active_model_id": "deepseek-chat",
+  "models": [
+    {
+      "_comment": "示例1：DeepSeek 云端模型（项目默认后端，model 与 base_url 缺省时即回退到此配置）",
+      "id": "deepseek-chat",
+      "name": "DeepSeek (deepseek-chat)",
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "base_url": "https://api.deepseek.com",
+      "api_version": "v1",
+      "temperature": 0.7,
+      "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "stream": true
+    },
+    {
+      "_comment": "示例2：本地 Ollama 模型（需先启动 ollama serve 并拉取 deepseek-r1:7b；provider=ollama 时原生走 http://localhost:11434/api/chat，base_url 仅用于兼容展示，可按需改为 http://localhost:11434/v1）",
+      "id": "ollama-r1",
+      "name": "本地 Ollama (deepseek-r1:7b)",
+      "provider": "ollama",
+      "model": "deepseek-r1:7b",
+      "base_url": "http://localhost:11434",
+      "api_version": "v1",
+      "temperature": 0.25,
+      "api_key": "",
+      "stream": true
+    },
+    {
+      "_comment": "示例3：通义千问（OpenAI 兼容协议；同法可配混元 https://api.hunyuan.cloud.tencent.com/v1、智谱 https://open.bigmodel.cn/api/paas/v4、豆包 https://ark.cn-beijing.volces.com/api/v3、OpenAI https://api.openai.com/v1）",
+      "id": "qwen-plus",
+      "name": "通义千问 (qwen-plus)",
+      "provider": "qwen",
+      "model": "qwen-plus",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_version": "v1",
+      "temperature": 0.7,
+      "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "stream": true
+    }
+  ]
+}

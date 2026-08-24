@@ -213,7 +213,9 @@ FEATURE_BOUNDARIES = {
             "blocked_modules": ["os.system", "subprocess", "sys.exit"],
             "allowed_modules": ["pandas", "numpy", "matplotlib", "openpyxl", "xlsxwriter"]
         },
-        "dependencies": ["pandas", "matplotlib", "openpyxl", "xlsxwriter"]
+        # 依赖 = 工具自身运行所需。run_python 是纯标准库 exec 沙箱（tools/code_tools.py:591），
+        # 自身不 import pandas/matplotlib 等第三方库；用户代码内部使用这些库由执行时自然报错，
+        "dependencies": []
     },
     
     "file_operations": {

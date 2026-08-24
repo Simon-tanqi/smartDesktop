@@ -252,7 +252,9 @@ _retry_strategy = Retry(
     connect=3,
     read=2,
     backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
+    # 429 为配额类错误，重试无益且会放大单次 timeout（如 8s×3 次重试≈28s 卡顿）。
+    # 移除 429：遇限流直接抛 HTTPError，由调用方快速降级（与 stream 路径一致）。
+    status_forcelist=[500, 502, 503, 504],
     allowed_methods=["POST"],
     raise_on_status=True
 )
@@ -301,8 +303,14 @@ def _map_response_format(response_format):
 
 
 def ai_concat(messages, model_name=None, provider=None, trace_id="",
-              tools=None, response_format=None, base_url_override=None, model_id=None, temperature=None):
-    """统一 AI 调用入口:Ollama 走专属逻辑,其余走通用 OpenAI 兼容协议"""
+              tools=None, response_format=None, base_url_override=None, model_id=None, temperature=None,
+              timeout=None):
+    """统一 AI 调用入口:Ollama 走专属逻辑,其余走通用 OpenAI 兼容协议
+
+    Args:
+        timeout: 非流式 OpenAI 兼容调用的超时秒数(默认 None 走 _openai_compatible_call 内置 60s)。
+                 调用方可传短超时实现快速降级(如复杂度判断 timeout=8)。
+    """
     try:
         get_logger().debug(f"[ai_concat] 开始调用", trace_id=trace_id, model_id=model_id,
                           provider=provider, messages_count=len(messages) if messages else 0)
@@ -371,7 +379,8 @@ def ai_concat(messages, model_name=None, provider=None, trace_id="",
                     messages, resolved_model, resolved_api_key, resolved_base_url,
                     provider=backend, trace_id=trace_id, tools=tools,
                     response_format=response_format, api_version=resolved_api_version,
-                    temperature=resolved_temperature
+                    temperature=resolved_temperature,
+                    timeout=timeout
                 )
                 _llm_req_log.info(f"[LLM_RESP] provider={backend} model={resolved_model} trace_id={trace_id} "
                                  f"content={_brief_result(result)}")
@@ -556,8 +565,11 @@ def _ollama_call(messages, model, trace_id="", tools=None, response_format=None,
         return {"message": {"content": "", "error": error_detail, "reasoning_content": ""}}
 
 
-def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE):
-    """调用本地 Ollama 流式接口，逐块产出 (type, data) 事件。"""
+def _ollama_call_stream(messages, model, trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE, stream=True):
+    """调用本地 Ollama 接口，逐块产出 (type, data) 事件。
+
+    stream=False 时发起非流式请求，一次性产出 result 事件（协议不变）。
+    """
     _assert_system_first(messages, caller="ollama_stream")
     url = f"{OLLAMA_HOST}/api/chat"
 
@@ -570,7 +582,7 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
     payload = {
         "model": model,
         "messages": messages,
-        "stream": True,
+        "stream": stream,
         "options": {"temperature": temperature},
     }
     if tools:
@@ -580,8 +592,43 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
         payload["format"] = fmt
     t0 = time.perf_counter()
     try:
-        response = _session.post(url, json=payload, stream=True, timeout=(30,120))
+        response = _session.post(url, json=payload, stream=stream, timeout=(30,120))
         response.raise_for_status()
+
+        if not stream:
+            data = response.json()
+            msg_chunk = data.get("message", {})
+            full_content = msg_chunk.get("content", "") or ""
+            full_reasoning = msg_chunk.get("reasoning_content", "") or ""
+            raw_tool_calls = msg_chunk.get("tool_calls") or []
+            native_tool_calls = []
+            if raw_tool_calls:
+                action_lines = []
+                for i, tc in enumerate(raw_tool_calls):
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", "")
+                    if isinstance(fn_args, dict):
+                        fn_args = json.dumps(fn_args, ensure_ascii=False)
+                    action_lines.append(json.dumps({"tool_name": fn_name, "arguments": fn_args}, ensure_ascii=False))
+                    native_tool_calls.append({
+                        "id": tc.get("id") or f"call_{i}_{int(time.time())}",
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": fn_args},
+                    })
+                if full_content and not full_content.endswith("\n"):
+                    full_content += "\n"
+                full_content += "\n".join(f"```action\n{a}\n```" for a in action_lines)
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            log_trace(
+                trace_id=trace_id, span_name="llm.ollama", node_type="llm",
+                duration_ms=elapsed_ms, provider="ollama", model_name=model,
+                model_params=f'{{"temperature":{temperature},"stream":false}}', status="success",
+                input_summary=str(messages)[:200],
+                output_summary=full_content[:200]
+            )
+            yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning, "tool_calls": native_tool_calls}
+            return
 
         full_content = ""
         full_reasoning = ""
@@ -690,7 +737,7 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
         log_trace(
             trace_id=trace_id, span_name="llm.ollama", node_type="llm",
             duration_ms=elapsed_ms, provider="ollama", model_name=model,
-            model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
+            model_params=f'{{"temperature":{temperature},"stream":{stream}}}', status="error",
             error=error_detail[:500]
         )
         # LLM 调用日志兜底记录(流式失败)
@@ -715,8 +762,14 @@ def _ollama_call_stream(messages, model, trace_id="", tools=None, response_forma
 
 def _openai_compatible_call(messages, model, api_key, base_url,
                             provider="openai_compatible", trace_id="",
-                            tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE):
-    """通用 OpenAI 兼容接口调用(DeepSeek / 豆包 / 通义等均适用)"""
+                            tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE,
+                            timeout=None):
+    """通用 OpenAI 兼容接口调用(DeepSeek / 豆包 / 通义等均适用)
+
+    Args:
+        timeout: 非流式请求超时秒数。默认 None 时保持原行为(60s);
+                 传短超时(如 8)时超时抛 requests.exceptions.Timeout,由调用方降级。
+    """
     if not api_key:
         logger.error(f"{provider} API Key 为空,无法发起调用(model={model}, base_url={base_url})")
         return {"message": {"content": "", "error": f"{provider} API Key 未配置,请在设置中添加 API Key", "reasoning_content": ""}}
@@ -739,8 +792,9 @@ def _openai_compatible_call(messages, model, api_key, base_url,
     normalized_url = _normalize_base_url(base_url)
     t0 = time.perf_counter()
     try:
+        _timeout = timeout if timeout is not None else 60
         response = _session.post(f"{normalized_url}/{api_version}/chat/completions",
-                                headers=headers, json=payload, timeout=60)
+                                headers=headers, json=payload, timeout=_timeout)
         response.raise_for_status()
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         data = response.json()
@@ -824,8 +878,11 @@ def _openai_compatible_call(messages, model, api_key, base_url,
 
 def _openai_compatible_call_stream(messages, model, api_key, base_url,
                                    provider="openai_compatible", trace_id="",
-                                   tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE):
-    """通用 OpenAI 兼容流式调用"""
+                                   tools=None, response_format=None, api_version="v1", temperature=DEFAULT_TEMPERATURE, stream=True):
+    """通用 OpenAI 兼容调用（流式/非流式）。
+
+    stream=False 时发起非流式请求，一次性产出 result 事件（协议不变）。
+    """
     _assert_system_first(messages, caller=provider or "openai_compatible_stream")
     if not api_key:
         logger.error(f"{provider} API Key 为空,无法发起流式调用(model={model}, base_url={base_url})")
@@ -840,7 +897,7 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 4096,
-        "stream": True,
+        "stream": stream,
     }
     if tools:
         payload["tools"] = tools
@@ -851,8 +908,58 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
     t0 = time.perf_counter()
     try:
         response = _session.post(f"{normalized_url}/{api_version}/chat/completions",
-                                headers=headers, json=payload, stream=True, timeout=(30, 120))
+                                headers=headers, json=payload, stream=stream, timeout=(30, 120))
         response.raise_for_status()
+
+        if not stream:
+            data = response.json()
+            choices = data.get("choices") or []
+            msg = (choices[0].get("message", {}) if choices else {})
+            full_content = msg.get("content", "") or ""
+            full_reasoning = msg.get("reasoning_content", "") or ""
+            raw_tool_calls = msg.get("tool_calls") or []
+            native_tool_calls = []
+            if raw_tool_calls:
+                action_lines = []
+                for i, tc in enumerate(raw_tool_calls):
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", "")
+                    if isinstance(fn_args, dict):
+                        fn_args = json.dumps(fn_args, ensure_ascii=False)
+                    action_lines.append(json.dumps({"tool_name": fn_name, "arguments": fn_args}, ensure_ascii=False))
+                    native_tool_calls.append({
+                        "id": tc.get("id") or f"call_{i}_{int(time.time())}",
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": fn_args},
+                    })
+                if full_content and not full_content.endswith("\n"):
+                    full_content += "\n"
+                full_content += "\n".join(f"```action\n{a}\n```" for a in action_lines)
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            log_trace(
+                trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
+                duration_ms=elapsed_ms, provider=provider, model_name=model,
+                model_params=f'{{"temperature":{temperature},"stream":false}}', status="success",
+                input_summary=str(messages)[:200],
+                output_summary=full_content[:200]
+            )
+            try:
+                get_logger().log_llm_call(
+                    trace_id=trace_id, session_id="", turn=0, child_turn=0,
+                    user_task="[llm_client直接调用]",
+                    response=full_content,
+                    model_name=model, provider=provider,
+                    elapsed_ms=elapsed_ms,
+                    token_estimate=0,
+                    reasoning=full_reasoning,
+                    messages=messages,
+                )
+            except Exception:
+                pass
+            yield {"type": "result", "content": full_content, "reasoning_content": full_reasoning, "tool_calls": native_tool_calls}
+            return
+
         full_content = ""
         full_reasoning = ""
         accumulated_tool_calls = {}
@@ -963,7 +1070,7 @@ def _openai_compatible_call_stream(messages, model, api_key, base_url,
         log_trace(
             trace_id=trace_id, span_name=f"llm.{provider}", node_type="llm",
             duration_ms=elapsed_ms, provider=provider, model_name=model,
-            model_params=f'{{"temperature":{temperature},"stream":true}}', status="error",
+            model_params=f'{{"temperature":{temperature},"stream":{stream}}}', status="error",
             error=error_detail[:500]
         )
         # LLM 调用日志兜底记录(流式失败)
@@ -1319,12 +1426,13 @@ def _deepseek_call(messages, model, api_key, base_url,
 
 
 def _deepseek_call_stream(messages, model, api_key, base_url,
-                          provider="deepseek", trace_id="", tools=None, response_format=None,temperature=DEFAULT_TEMPERATURE):
+                          provider="deepseek", trace_id="", tools=None, response_format=None, temperature=DEFAULT_TEMPERATURE, stream=True):
     """调用 DeepSeek 流式接口（转发到通用 OpenAI 兼容协议实现）。"""
     _assert_system_first(messages, caller="deepseek_stream")
     return _openai_compatible_call_stream(messages, model, api_key, base_url,
                                           provider=provider, trace_id=trace_id,
-                                          tools=tools, response_format=response_format,temperature=temperature)
+                                          tools=tools, response_format=response_format,
+                                          temperature=temperature, stream=stream)
 
 
 def ai_concat_stream(messages, model_name=None, provider=None, trace_id="",
@@ -1432,11 +1540,14 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
                         user_input: str = "",
                         call_seq: list = None, _tools_param=None, base_url: str = "",
                         default_provider: str = "", default_model: str = "",
-                        model_id: str = "", temperature=None, cancel_event=None,
+                        model_id: str = "", temperature=None, stream: bool = True,
+                        cancel_event=None,
                         layered_cache=None,
                         *, trace_id: str = "", session_id: str = "",
                         session_name: str = "", turn_state=None) -> Generator[Any, None, None]:
-    """流式 LLM 响应入口：带重试、推理块解析与 SSE 事件归一化的生成器。"""
+    """流式 LLM 响应入口：带重试、推理块解析与 SSE 事件归一化的生成器。
+
+    stream=False 时对 LLM 发起非流式请求，仍以统一的 chunk/result 事件协议产出。"""
     idx = call_seq[0]
     call_seq[0] += 1
     t0 = time.perf_counter()
@@ -1462,7 +1573,8 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
                 trace_id=trace_id, session_id=session_id
             )
             if default_provider == "ollama":
-                stream_gen = _ollama_call_stream(messages, default_model, trace_id=trace_id, tools=tools_param)
+                stream_gen = _ollama_call_stream(messages, default_model, trace_id=trace_id, tools=tools_param,
+                                                 temperature=temperature, stream=stream)
             elif not api_key:
                 get_logger().error(f"API Key 为空,无法调用{default_provider}模型", trace_id=trace_id)
                 yield {"type": "error", "message": f"{default_provider} API Key 未配置,请在设置中添加 API Key"}
@@ -1470,7 +1582,7 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
             else:
                 stream_gen = _deepseek_call_stream(messages, default_model,
                     api_key, base_url,
-                    trace_id=trace_id, tools=tools_param,temperature=temperature)
+                    trace_id=trace_id, tools=tools_param, temperature=temperature, stream=stream)
 
             last_heartbeat = time.time()
             try:
@@ -1579,6 +1691,12 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
 
                     if chunk.get("type") == "error":
                         err_msg = chunk.get("message") or chunk.get("error") or "未知错误"
+                        # 429 限流为配额类错误,重试无益且叠加 5s/15s 延迟形成 30s 卡顿,
+                        _is_rate_limited = ("429" in str(err_msg)) or ("Too Many Requests" in str(err_msg))
+                        if _is_rate_limited:
+                            get_logger().warning(f"LLM 429 限流,快速失败不重试: {err_msg}", trace_id=trace_id)
+                            yield {"type": "error", "message": translate_error(err_msg)}
+                            return
                         if attempt < max_retries:
                             full_content = ""
                             full_reasoning = ""
@@ -1666,7 +1784,7 @@ def stream_llm_response(messages: List[Dict[str, Any]], system_prompt: str = "",
 def call_llm_and_parse(engine, rs, state, user_message: str, step: int,
                        cancel_event, call_seq, tools_param,
                        base_url: str, default_provider: str, default_model: str,
-                       model_id, temperature, remaining_steps
+                       model_id, temperature, stream=True, remaining_steps=[]
                        ) -> Generator[str, None, tuple]:
     """调用 LLM 并解析响应。可变状态通过 rs(RunState) 承载。
 
@@ -1807,7 +1925,7 @@ def call_llm_and_parse(engine, rs, state, user_message: str, step: int,
             call_seq=call_seq, _tools_param=tools_param,
             base_url=base_url, default_provider=default_provider,
             default_model=default_model, model_id=model_id,
-            temperature=temperature, cancel_event=cancel_event,
+            temperature=temperature, stream=stream, cancel_event=cancel_event,
             layered_cache=layered_cache,
             trace_id=engine.trace_id, session_id=engine.session_id,
             session_name=engine.session_name, turn_state=engine._turn_state,

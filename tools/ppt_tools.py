@@ -237,7 +237,7 @@ class SlideConfig(TypedDict, total=False):
 
 @schema_override("add_slide_content")
 @register_tool(timeout=30)
-@path_params("file_path")   # 只保留实际存在的函数参数（Bug4 修复）
+@path_params("file_path")   # 只保留实际存在的函数参数
 def add_slide_content(file_path: str, slide_config: SlideConfig) -> str:
     """
     向PPT添加幻灯片（支持文字、项目符号、图片、标题页）
@@ -324,7 +324,6 @@ def add_slide_content(file_path: str, slide_config: SlideConfig) -> str:
                     break
             
             if content_placeholder:
-                # 关键修复：清空默认文本（解决“单击添加文本”叠加问题）
                 text_frame = content_placeholder.text_frame
                 text_frame.clear()  # 清除所有段落
                 
@@ -393,6 +392,15 @@ def add_slide_content(file_path: str, slide_config: SlideConfig) -> str:
 @register_tool
 def extract_presentation_info(file_path: str):
     """提取PPT演示文稿信息。file_path: PPT文件路径"""
+    # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）
+    from core.safety_policy import match_sensitive_read_root
+    _sensitive_hit = match_sensitive_read_root(str(file_path))
+    if _sensitive_hit:
+        return json.dumps({
+            "success": False,
+            "message": f"安全策略：禁止读取系统目录文件（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
+        }, ensure_ascii=False)
+
     if not PPT_AVAILABLE:
         return json.dumps({"success": False, "message": "需要安装python-pptx库: pip install python-pptx"})
     

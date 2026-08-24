@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -29,5 +29,12 @@ temp/
 htmlcov/
 .idea/
 .vscode/
+
+# 测试运行时产物（run_tests.py 执行期间生成/更新，不入库）
+tests/reports/
+tests/artifacts/
+tests/snapshots/
+tests/checkpoint.json
+tests/test_data/*_copy_*
 
 docs/github_pre_push_review.md

@@ -1,16 +1,4 @@
-"""代码操作工具：工作空间读写、内容搜索、文件替换、项目结构分析
-
-修复清单：
-- 路径穿越漏洞：所有函数添加工作区边界校验
-- 工作目录命名：work_space → workspace（与项目结构一致）
-- 相对路径解析：基于工作区根目录解析相对路径
-- 编码处理一致：search_content/replace_in_file 支持多编码
-- 大文件保护：文件大小前置校验，防止 OOM
-- 单行超长截断：read_file 修复单行超长不截断问题
-- 目录遍历限制：深度限制 + 文件数量限制
-- 原子写入：replace_in_file 使用临时文件替换
-- 公共函数提取：工作目录计算统一到 get_workspace_root()
-"""
+"""代码操作工具：工作空间读写、内容搜索、文件替换、项目结构分析"""
 import os
 import json
 import fnmatch
@@ -259,6 +247,15 @@ def read_file(file_path: str, start_line: int = None, end_line: int = None):
             "message": f"非法路径！只能在 workspace 内操作: {file_path}"
         }, ensure_ascii=False)
 
+    # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）：C:\Windows 等系统目录直接拒绝
+    from core.safety_policy import match_sensitive_read_root
+    _sensitive_hit = match_sensitive_read_root(target_abs)
+    if _sensitive_hit:
+        return json.dumps({
+            "success": False,
+            "message": f"安全策略：禁止读取系统目录文件（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
+        }, ensure_ascii=False)
+
     if not os.path.isfile(target_abs):
         return json.dumps({
             "success": False,
@@ -294,7 +291,7 @@ def read_file(file_path: str, start_line: int = None, end_line: int = None):
     content = "".join(selected)
     is_full_read = (start_line is None and end_line is None)
 
-    # 修复单行超长截断漏洞：无论行数多少，都限制字符数
+    # 单行超长截断漏洞：无论行数多少，都限制字符数
     truncate_reason = []
     if is_full_read:
         if total > MAX_READ_LINES:
@@ -339,6 +336,14 @@ def search_content(keyword: str, directory: str = None, file_pattern: str = "*",
             return json.dumps({
                 "success": False,
                 "message": f"非法路径！只能在 workspace 内操作: {directory}"
+            }, ensure_ascii=False)
+        # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）：C:\Windows 等系统目录直接拒绝
+        from core.safety_policy import match_sensitive_read_root
+        _sensitive_hit = match_sensitive_read_root(dir_abs)
+        if _sensitive_hit:
+            return json.dumps({
+                "success": False,
+                "message": f"安全策略：禁止读取系统目录（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
             }, ensure_ascii=False)
     else:
         dir_abs = _ensure_workspace()

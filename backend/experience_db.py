@@ -48,7 +48,7 @@ class ExperienceDB:
     """基于 JSON 文件的任务→工具经验存储"""
 
     def __init__(self, db_path: str = None):
-        """初始化经验数据库；未指定路径时默认位于 %APPDATA%\smartDesktop\experience\experience_db.json"""
+        """初始化经验数据库；未指定路径时默认位于 %APPDATA%\\smartDesktop\\experience\\experience_db.json"""
         if db_path is None:
             try:
                 from config.settings import DATA_DIR

@@ -192,6 +192,13 @@ _ensure_dir(CUSTOM_SKILLS_DIR)
 SHORT_TERM_DIR = os.path.join(DATA_DIR, 'memory', 'short_term')
 _ensure_dir(SHORT_TERM_DIR)
 
+# ═══════════════════════════════════════════════
+# 经验库 / 情节库（全局库，与 per-session 消息库隔离）
+# ═══════════════════════════════════════════════
+
+EXPERIENCE_DB = os.path.join(DATA_DIR, 'memory', 'experience.db')
+_ensure_dir(os.path.dirname(EXPERIENCE_DB))
+
 def get_session_dir(session_id):
     """获取会话专属目录，不存在则创建。"""
     d = os.path.join(SHORT_TERM_DIR, session_id)

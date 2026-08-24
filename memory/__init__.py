@@ -46,6 +46,9 @@ from memory.stores.sqlite_store import (
     get_latest_summary,
     get_summaries,
     get_full_session_messages_rich,
+    archive_session_topic,
+    list_archived_topics,
+    get_archived_topic_messages,
 )
 
 # ── 长期记忆（Markdown）─

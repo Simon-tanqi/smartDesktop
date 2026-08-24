@@ -226,22 +226,33 @@ def wait_for_confirmation(confirmation_token: str, timeout: float = 300,
 
 
 # ── 模型选择 ──
-try:
-    available_models = get_available_models()
-except Exception as e:
-    get_logger().error("加载模型列表失败，使用默认配置", error=str(e))
-    available_models = []
-default_model = available_models[0] if available_models else {"provider": "ollama", "model": "deepseek-r1:7b", "display": "本地 Ollama"}
+def _load_available_models():
+    """实时读取可用模型列表（绕过模块级启动快照，保存新模型后无需重启即生效）。"""
+    try:
+        return get_available_models()
+    except Exception as e:
+        get_logger().error("加载模型列表失败，使用默认配置", error=str(e))
+        return []
+
+
+def _get_default_model():
+    """实时返回默认模型配置（列表首项，为空时使用内置兜底）。"""
+    models = _load_available_models()
+    return models[0] if models else {"provider": "ollama", "model": "deepseek-r1:7b", "display": "本地 Ollama"}
 
 
 def get_model_choice(display_name=None, model_id=None):
-    """按显示名或 id 选择模型配置，未命中时回退到默认模型。"""
-    for m in available_models:
+    """按显示名或 id 选择模型配置，未命中时回退到默认模型。
+
+    每次调用实时读取模型列表（get_available_models 走 mtime 缓存），
+    设置面板保存新模型后，兜底路径无需重启即可命中。
+    """
+    for m in _load_available_models():
         if model_id and m.get("id") == model_id:
             return m
         if m["display"] == display_name:
             return m
-    return default_model
+    return _get_default_model()
 
 
 # ── SSE 快捷响应辅助 ──
@@ -258,6 +269,30 @@ def _sse_quick_reply(text: str, session_id: str, trace_id: str, user_id: str):
                            trace_id=trace_id, user_id=user_id,
                            skip_compress=True, msg_type="final_answer")
     return generate()
+
+
+def _format_direct_tool_reply(result) -> str:
+    """把 L1 直连工具的执行结果格式化为用户可读回复文本。
+
+    工具返回可能是 JSON 字符串、dict 或普通字符串；失败结果转为友好的失败说明。
+    """
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                if parsed.get("success") is False:
+                    return f"执行失败：{parsed.get('message') or parsed.get('error') or '未知错误'}"
+                msg = parsed.get("message") or parsed.get("summary") or ""
+                if msg:
+                    return str(msg)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return result[:2000]
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return f"执行失败：{result.get('message') or result.get('error') or '未知错误'}"
+        return json.dumps(result, ensure_ascii=False)[:2000]
+    return str(result)[:2000]
 
 
 # ── 截图静态服务 ──
@@ -336,6 +371,51 @@ def api_chat():
                             mimetype='text/event-stream',
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
+        # ── 第1.2层：意图分类直答（core.intent_router，零 LLM） ──
+        # L0 问候/身份、L1 时间/日期/星期 → 预设回复直出；
+        # L1 工具执行型 → 直连注册工具；任何异常降级回原有流程。
+        intent_result = None
+        try:
+            from core.intent_router import classify_intent
+            intent_result = classify_intent(cleaned_msg)
+        except Exception as _ie:
+            get_logger().warning(f"[ROUTE intent] 意图分类异常，降级原流程: {_ie}",
+                                 trace_id=trace_id, session_id=session_id)
+
+        # 长度护栏：直答仅对短句生效；复合长句（如"几点了，顺便写份报告"）
+        # 若命中时间等 search 型规则会丢失后半段任务，故长句一律走原流程
+        if (intent_result is not None and not intent_result.degraded
+                and len(cleaned_msg) <= 30):
+            # L0/L1 预设回复：本地直出，零 LLM 调用
+            if intent_result.reply:
+                get_logger().info(f"[ROUTE intent] {intent_result.route_level} 直答命中: {intent_result.detail}",
+                                  trace_id=trace_id, session_id=session_id)
+                gen = _sse_quick_reply(intent_result.reply, session_id, trace_id, user_id)
+                return Response(stream_with_context(gen),
+                                mimetype='text/event-stream',
+                                headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+            # L1 工具执行型：校验工具存在后直连执行，结果格式化直出
+            if intent_result.exec_action:
+                try:
+                    from tools import TOOL_REGISTRY
+                    _tool_info = TOOL_REGISTRY.get(intent_result.exec_action)
+                    if _tool_info is None:
+                        get_logger().info(f"[ROUTE intent] L1 工具 {intent_result.exec_action} 未注册，降级原流程",
+                                          trace_id=trace_id, session_id=session_id)
+                    else:
+                        get_logger().info(f"[ROUTE intent] L1 工具直连: {intent_result.exec_action}",
+                                          trace_id=trace_id, session_id=session_id)
+                        _tool_result = _tool_info["function"](**(intent_result.exec_params or {}))
+                        gen = _sse_quick_reply(_format_direct_tool_reply(_tool_result),
+                                               session_id, trace_id, user_id)
+                        return Response(stream_with_context(gen),
+                                        mimetype='text/event-stream',
+                                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+                except Exception as _te:
+                    get_logger().warning(f"[ROUTE intent] L1 工具直连异常，降级原流程: {_te}",
+                                         trace_id=trace_id, session_id=session_id)
+            # L3 命中不在此处拦截，由下方复杂度判定处强制进入规划模式
+
         # ── 第1.5层：任务恢复检测 ──
         # 仅当消息本身就是恢复短语时才触发，避免「继续删除文件」等误判
         # 支持带标点的输入如「继续。」「接着来！」
@@ -364,24 +444,9 @@ def api_chat():
 
         def _run_agent_with_cleanup():
             """SSE 生成器：注册会话、启动 worker 线程执行任务并转发事件流，退出时统一清理。"""
-            # 首先发送初始 heartbeat，让前端立即知道连接已建立
+            # 首先发送初始 heartbeat + 处理中占位，让前端立即感知已受理（不再表现为无响应）
             yield f"data: {json.dumps({'type': 'heartbeat', 'status': 'running'})}\n\n"
-
-            # ── 第3层：复杂度判断（移入 SSE 流中，避免阻塞前端渲染） ──
-            try:
-                _complexity = check_complexity(user_input, model_choice)
-                get_logger().info(f"[ROUTE L3] 复杂度判定: {_complexity}", session_id=session_id)
-            except Exception as e:
-                get_logger().error(f"复杂度判断异常，使用默认值: {e}", trace_id=trace_id, session_id=session_id)
-                _complexity = "简单"
-            _planning_extra = ""
-            if _complexity == "复杂":
-                _planning_extra = (
-                    "\n\n[系统指令 - 步骤规划] 这是一个复杂任务。"
-                    "请在首轮以 JSON 格式输出结构化步骤规划：\n"
-                    '{"plan": [{"step": 1, "description": "第一步做什么", "expected_tool": "建议工具"}, ...]}\n'
-                    "输出规划后，按步骤顺序逐一执行。每完成一步，用 progress 报告完成进度（如 '已完成步骤1: xxx'）。"
-                )
+            yield f"data: {json.dumps({'type': 'step', 'text': '正在处理...', 'status': '进行中'}, ensure_ascii=False)}\n\n"
 
             # 会话注册移入生成器内部，确保与注销成对执行，异常时不泄漏
             cancel_event, request_id = _register_session(session_id, trace_id=trace_id, session_name=session_name)
@@ -414,11 +479,31 @@ def api_chat():
                 event_queue: queue.Queue = queue.Queue(maxsize=100)
 
                 def _worker():
-                    """后台工作线程：调用 run_agent 执行任务，把结果事件放入队列，异常时落库并转发错误。"""
+                    """后台工作线程：先做复杂度判断（异步化，不阻塞 SSE 首包），再调用 run_agent 执行任务，把结果事件放入队列，异常时落库并转发错误。"""
                     with _active_sessions_lock:
                         info = _active_sessions.get(session_id)
                         if info:
                             info["thread_id"] = threading.current_thread().ident
+                    # ── 第3层：复杂度判断（移入 worker 线程，SSE 主线程已推占位消息，不再同步阻塞） ──
+                    try:
+                        _complexity = check_complexity(user_input, model_choice)
+                        get_logger().info(f"[ROUTE L3] 复杂度判定: {_complexity}", session_id=session_id)
+                    except Exception as e:
+                        get_logger().error(f"复杂度判断异常，使用默认值: {e}", trace_id=trace_id, session_id=session_id)
+                        _complexity = "简单"
+                    # intent_router L3 强信号命中：无论复杂度评分结果，强制进入步骤规划模式
+                    if (intent_result is not None and intent_result.route_level == "L3"
+                            and _complexity != "复杂"):
+                        _complexity = "复杂"
+                        get_logger().info("[ROUTE intent] L3 强信号命中 → 强制规划模式", session_id=session_id)
+                    _planning_extra = ""
+                    if _complexity == "复杂":
+                        _planning_extra = (
+                            "\n\n[系统指令 - 步骤规划] 这是一个复杂任务。"
+                            "请在首轮以 JSON 格式输出结构化步骤规划：\n"
+                            '{"plan": [{"step": 1, "description": "第一步做什么", "expected_tool": "建议工具"}, ...]}\n'
+                            "输出规划后，按步骤顺序逐一执行。每完成一步，用 progress 报告完成进度（如 '已完成步骤1: xxx'）。"
+                        )
                     try:
                         get_logger().info(f"[/chat] Worker线程启动，开始执行run_agent", trace_id=trace_id)
                         for chunk in run_agent(
@@ -430,7 +515,7 @@ def api_chat():
                             streaming=True,
                             session_name=session_name,
                             tool_executor=_TOOL_EXECUTOR,
-                            default_model=default_model,
+                            default_model=_get_default_model(),
                             confirmation_handler=_confirmation_handler,
                             planning_extra=_planning_extra,
                             on_success=lambda msg, tn="", p=None, **kw: record_success(
@@ -659,12 +744,17 @@ def api_get_models_config():
 
 @chat_bp.route('/api/config/models', methods=['POST'])
 def api_save_models_config():
-    """保存模型配置列表。"""
+    """保存模型配置列表。
+
+    设置面板唯一保存入口：整体保存 {models, active_model_id}，
+    激活模型以本接口的 active_model_id 字段为准（/api/config/models/active 已废弃）。"""
     try:
         data = request.json
         if not data or "models" not in data:
             return jsonify({"success": False, "message": "缺少 models 字段"}), 400
         _save_models_config(data)
+        # 保存成功后主动失效模型列表缓存，确保下次 GET /api/models 立即读到新配置
+        invalidate_models_cache()
         return jsonify({"success": True, "message": "配置已保存"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -672,7 +762,12 @@ def api_save_models_config():
 
 @chat_bp.route('/api/config/models/active', methods=['POST'])
 def api_set_active_model():
-    """设置当前激活模型 id。"""
+    """[DEPRECATED] 设置当前激活模型 id。
+
+    已废弃：前端设置面板不再调用本接口，激活模型统一由
+    POST /api/config/models 的 active_model_id 字段整体保存。
+    本接口仅保留兼容旧客户端，不影响其他功能；新代码请勿使用。
+    """
     try:
         data = request.json
         model_id = data.get("model_id", "")

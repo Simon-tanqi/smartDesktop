@@ -31,6 +31,177 @@ def _get_confirmation_manager():
     return _confirmation_manager
 
 # ============================================================
+# 敏感系统路径读取拦截（工具层 Path B：P0/BLOCK，直接拒绝，不弹确认框）
+# ============================================================
+# 命中 C:\Windows、C:\Program Files、C:\Program Files (x86)、C:\ProgramData
+# 及子目录的「读取命令」一律直接拒绝；写入命令（Remove-Item 等）走既有通道。
+
+# 读取语义命令识别：命令中包含这些只读命令即视为"读取"。
+_READ_COMMAND_RE = re.compile(
+    r"\b(get-content|get-childitem|get-item|get-itemproperty|type|cat|dir|findstr|select-string|fc|comp|more)\b",
+    re.IGNORECASE,
+)
+_CMD_PATH_RE = re.compile(
+    r""""([A-Za-z]:[\\/][^"]+)"|'([A-Za-z]:[\\/][^']+)'|([A-Za-z]:[\\/][^\s"'`;|&]+)"""
+)
+
+# 注册表写操作（HKCU）正则：命中即 P2 确认（不得直接放行）。
+# 覆盖 reg add/delete/import 与 Set-ItemProperty/New-ItemProperty/Remove-ItemProperty
+# 的目标为 HKCU/HKEY_CURRENT_USER 的变体；HKLM 变体由 danger_patterns 直接拒绝。
+# 注意：禁止使用 .* 连接远端关键词（超长无匹配输入会二次回溯卡死，实测 120KB 耗时 7s+），
+# 统一使用 (?=[^\r\n]{0,512}\b...) 限长前瞻，语义等价且线性。
+_REGISTRY_WRITE_HKCU_RE = re.compile(
+    r"\breg\s+(?:add|delete|import)\b(?=[^\r\n]{0,512}\b(?:HKCU|HKEY_CURRENT_USER)\b)"
+    r"|\b(?:Set-ItemProperty|New-ItemProperty|Remove-ItemProperty)\b(?=[^\r\n]{0,512}\b(?:HKCU|HKEY_CURRENT_USER)\b)",
+    re.IGNORECASE,
+)
+
+# P2-9：其他注册表根键（HKCR/HKU/HKCC 等）写 → P2 确认，与 HKCU 同级；HKLM 由 danger_patterns 直接拒绝
+_REGISTRY_WRITE_OTHER_RE = re.compile(
+    r"\breg\s+(?:add|delete|import)\b(?=[^\r\n]{0,512}\b(?:HKCR|HKU|HKCC|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|HKEY_DYN_DATA)\b)"
+    r"|\b(?:Set-ItemProperty|New-ItemProperty|Remove-ItemProperty)\b(?=[^\r\n]{0,512}\b(?:HKCR|HKU|HKCC|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|HKEY_DYN_DATA)\b)",
+    re.IGNORECASE,
+)
+
+# reg import 单独出现即拒绝：导入的 .reg 文件内容无法静态解析（可能含 HKLM 系统键），
+# 且 registry_tools.forbidden_operations 已禁止 import，不允许 Agent 直接执行。
+_REG_IMPORT_RE = re.compile(r"\breg\s+import\b", re.IGNORECASE)
+
+# readonly 白名单绕过防护：首 token 命中 readonly_patterns 时，若命令携带管道/分号/逻辑与或
+# 组合段，不得整体标记为只读放行（如 "echo xxx | Remove-Item ..." 会被 echo 白名单放行）。
+# 带组合段的命令必须继续走完整分类流程（danger/delete/safe_exec 规则）。
+_HAS_COMBINED_SEGMENTS_RE = re.compile(r"[|;&]|\b(?:&&|\|\|)\b")
+
+# ── P2-10：low_risk_registry + HKCU 放行收紧 ──
+# 仅放行"纯 HKCU 单条注册表写"：命令必须以 reg/注册表 cmdlet 开头、目标根键仅 HKCU/
+# HKEY_CURRENT_USER、不含其他注册表根键、不含分号/管道/&&/|| 等组合分隔符。
+_OTHER_REGISTRY_ROOTS_RE = re.compile(
+    r"\b(?:HKLM|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG)\b",
+    re.IGNORECASE,
+)
+_REG_CMD_TOKENS = {"reg", "set-itemproperty", "new-itemproperty", "remove-itemproperty", "set-item", "new-item", "remove-item"}
+
+
+def _is_hkcu_only_low_risk_command(command, first_token):
+    """P2-10：判断是否为纯 HKCU 低风险注册表写（夹带其他命令/根键一律不放行）。"""
+    lower = command.lower()
+    if "hkcu" not in lower and "HKEY_CURRENT_USER" not in command:
+        return False
+    if _HAS_COMBINED_SEGMENTS_RE.search(command):
+        return False
+    if _OTHER_REGISTRY_ROOTS_RE.search(command):
+        return False
+    # 目标根键必须明确为 HKCU（拒绝"未指明根键但含关键词"的模糊命令）
+    if not re.search(r"\b(?:HKCU|HKEY_CURRENT_USER)\b", command, re.IGNORECASE):
+        return False
+    # 首 token 必须是注册表操作入口
+    if first_token.lower() not in _REG_CMD_TOKENS:
+        return False
+    return True
+
+# ── P1-5：net / wmic 从 readonly 白名单移除后，仅放行明确只读子命令 ──
+# net 只读查询（负面断言排除修改参数：/add /delete /active /expires /passwordchg 等）
+_NET_READONLY_RE = re.compile(
+    r"\bnet\s+(?:view|accounts|statistics|session|config)\b"
+    r"|\bnet\s+user\b(?![^\r\n]*(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))"
+    r"|\bnet\s+share\b(?![^\r\n]*(?:=|/delete|/grant|/remark|/add|/users|/cache))",
+    re.IGNORECASE,
+)
+# wmic 只读查询（list/get 形式，负面断言排除 terminate/call/delete/set/create 修改语义）
+_WMIC_READONLY_RE = re.compile(
+    r"\bwmic\b(?![^\r\n]*\b(?:terminate|call|delete|set|create|stop|start)\b)",
+    re.IGNORECASE,
+)
+
+# ── P1-6：系统级操作分级确认（挑战级 P1）──
+# 服务停止/删除、启动配置修改、ACL 修改等一律 P1 挑战确认，不得静默放行。
+_SYSTEM_LEVEL_P1_PATTERNS = [
+    (r"\bsc\s+(?:config|create|delete|stop|start|pause|continue|failure)\b", "服务配置/状态修改 (sc)"),
+    (r"\bnet\s+(?:stop|start|pause|continue|use|add|delete|print|localgroup|group|computer|send|time|file|name)\b", "网络/账户/服务操作 (net)"),
+    (r"\bnet\s+user\b(?=[^\r\n]*(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))", "账户修改 (net user)"),
+    (r"\bnet\s+share\b(?=[^\r\n]*(?:=|/delete|/grant|/remark|/add|/users|/cache))", "共享目录修改 (net share)"),
+    (r"\btaskkill\b[^\r\n]*\s/F\b", "强制结束进程 (taskkill /F)"),
+    (r"\b(?:Set-Service|New-Service|Remove-Service|Restart-Service|Stop-Service|Start-Service|Suspend-Service|Resume-Service)\b", "服务操作 (PowerShell)"),
+    (r"\bbcdedit\b(?![^\r\n]*/enum\b)", "启动配置修改 (bcdedit)"),
+    (r"\bnetsh\b[^\r\n]*\b(?:set|add|delete|reset|exec|commit)\b", "网络配置修改 (netsh)"),
+    (r"\bschtasks\s+/(?:create|delete|change|run|end|register)\b", "计划任务操作 (schtasks)"),
+    (r"\b(?:icacls|takeown)\b", "ACL 权限修改 (icacls/takeown)"),
+    (r"\bwmic\b[^\r\n]*\b(?:terminate|call|delete|set|create)\b", "WMI 修改操作 (wmic)"),
+    # P2-8：diskpart 整体挑战级（clean 由 always_blocked 先拦 P0/REJECT，其余子命令走 P1）
+    (r"\bdiskpart\b", "磁盘分区工具 (diskpart)"),
+]
+_SYSTEM_LEVEL_P1_RE = re.compile(
+    "|".join(f"(?:{p})" for p, _ in _SYSTEM_LEVEL_P1_PATTERNS),
+    re.IGNORECASE,
+)
+
+# ── P1-7：解释器入口带内联代码载荷（无法静态解析确认无危险）→ P1 挑战确认 ──
+# -c / -e / /c / /k / -Command 为内联代码参数；python -m 属模块运行（pip 等）不拦截。
+_INLINE_INTERPRETER_RE = re.compile(
+    r"\b(?:python|python3|pythonw|py|node|nodejs|powershell|pwsh|cmd|bash|sh|zsh|perl|ruby)\b"
+    r"[^\r\n]*\s(?:-c|-e|/c|/k|-Command)\b",
+    re.IGNORECASE,
+)
+
+
+def _cmd_path_matches(command: str):
+    """提取命令中的 Windows 绝对路径（支持引号包裹的含空格路径）。"""
+    for m in _CMD_PATH_RE.finditer(command):
+        yield next((g for g in m.groups() if g), "")
+
+
+def _match_p1_desc(command: str) -> str:
+    """返回命令命中的第一条 P1 系统级操作描述（用于确认弹窗说明）。"""
+    for pattern, desc in _SYSTEM_LEVEL_P1_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return desc
+    return "系统级操作"
+
+
+def _check_sensitive_read_command(command: str):
+    """命令同时满足「读取语义 + 命中敏感读取路径」时返回展示描述，否则 None。
+
+    - 读取语义：包含 Get-Content / type / cat / Get-ChildItem / dir 等只读命令；
+    - 敏感读取路径：仅 C:\\Windows（读取语义已放宽，Program Files / ProgramData 允许读取）；
+    - 仅命中敏感路径但为写操作（如 Remove-Item）不在此拦截；
+    - 命中敏感路径但路径在用户目录（如 C:\\Users\\...）不在拦截范围。
+    """
+    if not command or not _READ_COMMAND_RE.search(command):
+        return None
+    from core.safety_policy import match_sensitive_read_root
+    for p in _cmd_path_matches(command):
+        hit = match_sensitive_read_root(p)
+        if hit:
+            return hit
+    return None
+
+
+# 复制语义命令识别：命令中包含这些复制命令即视为"复制"。
+_COPY_COMMAND_RE = re.compile(
+    r"\b(copy-item|copy|cp|xcopy|robocopy|shutil\.copy2?|shutil\.copyfile)\b",
+    re.IGNORECASE,
+)
+
+
+def _check_sensitive_copy_command(command: str):
+    """命令同时满足「复制语义 + 命中复制保护路径」时返回展示描述，否则 None。
+
+    复制语义：Copy-Item / copy / xcopy / robocopy / cp / shutil.copy 等；
+    源或目标任一命中 C:\\Windows / C:\\Program Files / C:\\Program Files (x86) /
+    C:\\ProgramData 四目录即拒绝——系统核心路径不允许复制（含"复制副本再读"
+    绕过路径），也不允许作为复制目标被写入。复制语义保持四目录保护。
+    """
+    if not command or not _COPY_COMMAND_RE.search(command):
+        return None
+    from core.safety_policy import match_sensitive_copy_root
+    for p in _cmd_path_matches(command):
+        hit = match_sensitive_copy_root(p)
+        if hit:
+            return hit
+    return None
+
+
+# ============================================================
 # 卸载路径缓存 — 防止 LLM 捏造路径
 # ============================================================
 _uninstall_path_cache: dict = {}   # {program_name: set of valid_paths}
@@ -229,7 +400,10 @@ def _is_temp_dir_delete(command: str) -> bool:
 
 
 def _is_c_drive_delete(command: str) -> bool:
-    """判断删除命令的目标是否位于 C 盘（C 盘禁止 Agent 删除文件）。
+    """判断删除命令的目标是否位于 C 盘。
+
+    仅作"目标在 C 盘"的初步判定，最终是否拒绝取决于调用处
+    （C 盘仅当前用户目录 C:\\Users\\<当前用户> 允许删除，其余一律拒绝）。
 
     注意：卸载命令（uninstaller exe 等）不在本函数判定范围内，卸载走
     execute_command 步骤 4 的卸载专用分支（C 盘内 P1、非 C 盘 P2）。
@@ -248,20 +422,21 @@ def _is_c_drive_delete(command: str) -> bool:
     return False
 
 
-def _is_appdata_roaming_delete(command: str) -> bool:
-    """判断删除命令的目标是否全部位于用户 AppData\\Roaming 目录内。
+def _is_current_user_dir_delete(command: str) -> bool:
+    """判断删除命令的目标是否全部位于当前用户目录（C:\\Users\\<当前用户>）内。
 
-    该目录属于用户文件区，允许 Agent 删除（单文件 P2、批量 P1），
-    不适用「C 盘禁止删除」规则。其余 C 盘位置一律拒绝。
+    该目录属于用户文件区，允许 Agent 删除（单文件 P2、批量 P1 分级确认），
+    不适用「C 盘禁止删除」规则。其余 C 盘位置（含 C:\\Users 下其他用户目录、
+    C:\\Windows、C:\\Program Files 等）一律拒绝。
     """
     targets = _extract_delete_targets(command)
     if not targets:
         return False
-    roaming = os.environ.get("APPDATA", "")
-    if not roaming:
+    user_profile = os.environ.get("USERPROFILE", "")
+    if not user_profile:
         return False
     try:
-        roaming_norm = os.path.normcase(os.path.normpath(os.path.abspath(roaming)))
+        user_profile_norm = os.path.normcase(os.path.normpath(os.path.abspath(user_profile)))
     except Exception:
         return False
     for t in targets:
@@ -269,7 +444,7 @@ def _is_appdata_roaming_delete(command: str) -> bool:
             norm = os.path.normcase(os.path.normpath(os.path.abspath(t)))
         except Exception:
             return False
-        if not (norm == roaming_norm or norm.startswith(roaming_norm + os.sep)):
+        if not (norm == user_profile_norm or norm.startswith(user_profile_norm + os.sep)):
             return False
     return True
 
@@ -454,7 +629,6 @@ def _validate_uninstall_path(command: str, prevalidated_paths: list = None) -> d
         tokens = shlex.split(command.strip(), posix=False)
         if not tokens:
             return {"valid": False, "message": "无法解析命令"}
-        # Bug 修复：跳过调用链前缀（如 & / cmd / Start-Process），与 _is_uninstall_command 保持一致，
         # 否则 tokens[0]="&" 导致 os.path.exists("&") 始终 False 且注册表匹配永远失败
         _idx = 0
         _leading = tokens[0].strip().lower().strip('"').strip("'")
@@ -615,8 +789,7 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
 
     _confirmed_note = ""
     _is_verified = False
-    _command_is_readonly = False  # Bug 1 修复：标记为非破坏性命令（可走线程路径）
-
+    _command_is_readonly = False  
     # ── 1. 提前验证可能传入的确认令牌（如果有效则直接标记为已验证）──
     if challenge_response and challenge_token:
         pending = _get_confirmation_manager().pop(challenge_token)
@@ -656,6 +829,34 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
     # ── 2. 强制黑名单检查（始终执行，无论是否已验证）──
     if any(re.search(pattern, command, re.IGNORECASE) for pattern in _get_cfg().always_blocked):
         return json.dumps({"success": False, "message": f"命令被阻止：包含危险模式"})
+
+    # ── 2.5 敏感系统路径读取拦截（P0/BLOCK：读取 C:\Windows 等系统目录直接拒绝，不弹确认框）──
+    # 读取语义命令（Get-Content/type/cat/Get-ChildItem/dir 等）命中 C 盘稳定系统文件夹即拒绝；
+    # 写入命令（Remove-Item 等）不在此拦截，继续走既有删除/危险模式通道。
+    _sensitive_read_hit = _check_sensitive_read_command(command)
+    if _sensitive_read_hit:
+        return json.dumps({
+            "success": False,
+            "message": "内容不允许操作，如需操作请用户自行手动操作",
+            "details": {
+                "命令": command[:200],
+                "说明": "C 盘稳定系统文件夹（Windows / Program Files / ProgramData）下的文件不允许读取，命中即系统级拒绝"
+            }
+        }, ensure_ascii=False)
+
+    # ── 2.6 敏感系统路径复制拦截（P0/BLOCK：复制命令命中系统目录直接拒绝，不弹确认框）──
+    # 复制语义命令（Copy-Item/copy/xcopy/robocopy/cp/shutil.copy 等）源或目标命中
+    # C 盘稳定系统文件夹即拒绝，杜绝"复制系统文件到工作区再读取"的绕过路径。
+    _sensitive_copy_hit = _check_sensitive_copy_command(command)
+    if _sensitive_copy_hit:
+        return json.dumps({
+            "success": False,
+            "message": "内容不允许操作，如需操作请用户自行手动操作",
+            "details": {
+                "命令": command[:200],
+                "说明": "C 盘稳定系统文件夹（Windows / Program Files / ProgramData）下的文件不允许复制，命中即系统级拒绝"
+            }
+        }, ensure_ascii=False)
 
     # ── 3. 音频命令重定向到 system_audio（零风险命令，免确认）──
     audio_result = _try_redirect_audio_command(stripped)
@@ -724,15 +925,25 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
         prog_no_ext = os.path.splitext(prog)[0]
 
         if prog and prog in _get_cfg().readonly_patterns:
-            _is_verified = True
-            _command_is_readonly = True
+            if not _HAS_COMBINED_SEGMENTS_RE.search(command):
+                _is_verified = True
+                _command_is_readonly = True
         elif prog_no_ext and prog_no_ext in _get_cfg().readonly_patterns:
-            _is_verified = True
-            _command_is_readonly = True
+            if not _HAS_COMBINED_SEGMENTS_RE.search(command):
+                _is_verified = True
+                _command_is_readonly = True
         elif first_token.lower() in _get_cfg().readonly_patterns:
+            if not _HAS_COMBINED_SEGMENTS_RE.search(command):
+                _is_verified = True
+                _command_is_readonly = True
+        elif (any(kw in command for kw in _get_cfg().low_risk_registry_patterns)
+                and _is_hkcu_only_low_risk_command(command, first_token)):
+            # P2-10：仅放行纯 HKCU 低风险注册表写（无分号/管道/其他根键夹带）
             _is_verified = True
             _command_is_readonly = True
-        elif any(kw in command for kw in _get_cfg().low_risk_registry_patterns) and "hkcu" in command.lower():
+        elif _NET_READONLY_RE.search(command) or _WMIC_READONLY_RE.search(command):
+            # P1-5：net/wmic 已从 readonly 白名单移除，仅放行明确只读子命令（net view/user
+            # 查询、wmic list/get 等）；带修改参数的 net/wmic 由下方 _SYSTEM_LEVEL_P1_RE 拦截。
             _is_verified = True
             _command_is_readonly = True
 
@@ -740,6 +951,65 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             if confirmed or domain_confirmed:
                 _is_verified = True
                 _confirmed_note = "[已确认]" if confirmed else "[域已确认]"
+            elif _SYSTEM_LEVEL_P1_RE.search(command):
+                # P1-6：系统级操作（服务/账户/进程/启动配置/网络/计划任务/ACL/WMI 修改）→ P1 挑战确认
+                _p1_desc = _match_p1_desc(command)
+                challenge_phrase = _get_cfg().danger_challenge_phrase
+                token = _get_confirmation_manager().create_challenge(
+                    command=command,
+                    desc=_p1_desc,
+                    source="system_tools",
+                    level="challenge"
+                )
+                _log_confirmation(command, "CHALLENGE", f"系统级操作: {_p1_desc}")
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "challenge_phrase": challenge_phrase,
+                    "challenge_token": token,
+                    "message": f"检测到系统级操作: {_p1_desc}，属于 P1 风险操作。请回复以下完整短语以确认执行：\n```\n{challenge_phrase}\n```",
+                    "details": {
+                        "命令": command[:200],
+                        "风险等级": "P1",
+                        "说明": _p1_desc
+                    }
+                }, ensure_ascii=False)
+            elif _INLINE_INTERPRETER_RE.search(command):
+                # P1-7：解释器入口带内联代码载荷（python -c / node -e / powershell -Command /
+                # cmd /c / bash -c 等），载荷无法静态解析确认无危险 → P1 挑战确认。
+                # 例外：解释器包装的 C 盘删除不因包装而放宽（保持既有 C 盘删除 REJECT 优先）。
+                if (any(re.search(pattern, command, re.IGNORECASE)
+                        for pattern in _get_cfg().delete_command_patterns)
+                        and _is_c_drive_delete(command)
+                        and not _is_current_user_dir_delete(command)):
+                    return json.dumps({
+                        "success": False,
+                        "message": "操作被拒绝：C 盘除当前用户文件夹外禁止 Agent 删除文件",
+                        "details": {
+                            "命令": command[:200],
+                            "说明": "C 盘中仅当前用户文件夹（C:\\Users\\<当前用户>）允许删除，其余位置（含其他用户目录、Windows、Program Files 等）不允许 Agent 执行，请用户手动操作"
+                        }
+                    }, ensure_ascii=False)
+                challenge_phrase = _get_cfg().danger_challenge_phrase
+                token = _get_confirmation_manager().create_challenge(
+                    command=command,
+                    desc="解释器内联代码执行",
+                    source="system_tools",
+                    level="challenge"
+                )
+                _log_confirmation(command, "CHALLENGE", "解释器内联代码执行")
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "challenge_phrase": challenge_phrase,
+                    "challenge_token": token,
+                    "message": f"检测到解释器内联代码执行（无法静态解析载荷），属于 P1 风险操作。请回复以下完整短语以确认执行：\n```\n{challenge_phrase}\n```",
+                    "details": {
+                        "命令": command[:200],
+                        "风险等级": "P1",
+                        "说明": "python -c / node -e / powershell -Command / cmd /c / bash -c 等内联载荷无法静态确认无危险"
+                    }
+                }, ensure_ascii=False)
             elif any(re.search(p[0], command, re.IGNORECASE) for p in _get_cfg().danger_patterns):
                 # 危险模式：无预先授权时直接拒绝，不返回 chat 级确认
                 return json.dumps({
@@ -752,19 +1022,20 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                     _is_verified = True
                     _confirmed_note = "[临时文件夹豁免]"
                     _log_confirmation(command, "TEMP_EXEMPT", "删除临时文件夹内文件，豁免确认")
-                elif _is_c_drive_delete(command) and not _is_appdata_roaming_delete(command):
-                    # C 盘禁止 Agent 删除文件（AppData\Roaming 用户文件区除外，
-                    # 该目录内文件走下方单文件 P2 / 批量 P1 分级；卸载走步骤 4 专用分支）
+                elif _is_c_drive_delete(command) and not _is_current_user_dir_delete(command):
+                    # C 盘除当前用户目录（C:\Users\<当前用户>，含子目录）外禁止 Agent 删除：
+                    # 含 C:\Users 下其他用户目录、C:\Windows、C:\Program Files 等一律拒绝。
+                    # 当前用户目录内删除走下方单文件 P2 / 批量 P1 分级；卸载走步骤 4 专用分支。
                     return json.dumps({
                         "success": False,
-                        "message": "操作被拒绝：C 盘禁止 Agent 删除文件",
+                        "message": "操作被拒绝：C 盘除当前用户文件夹外禁止 Agent 删除文件",
                         "details": {
                             "命令": command[:200],
-                            "说明": "C 盘中的文件删除操作不允许 Agent 执行（AppData\\Roaming 用户目录除外），请用户手动操作"
+                            "说明": "C 盘中仅当前用户文件夹（C:\\Users\\<当前用户>）允许删除，其余位置（含其他用户目录、Windows、Program Files 等）不允许 Agent 执行，请用户手动操作"
                         }
                     }, ensure_ascii=False)
                 elif not _is_batch_delete(command):
-                    # 单文件删除（非 C 盘，或 C 盘 AppData\Roaming 用户目录内）：P2 普通确认（确认/取消按钮）
+                    # 单文件删除（非 C 盘，或 C 盘当前用户目录内）：P2 普通确认（确认/取消按钮）
                     token = _get_confirmation_manager().create_confirmation(command=command)
                     return json.dumps({
                         "success": False,
@@ -774,15 +1045,15 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "details": {
                             "命令": command[:200],
                             "风险等级": "P2",
-                            "说明": "删除单个文件（非 C 盘或 AppData\\Roaming 用户目录内）"
+                            "说明": "删除单个文件（非 C 盘或 C 盘当前用户目录内）"
                         }
                     }, ensure_ascii=False)
                 else:
-                    # 批量删除（非 C 盘，或 C 盘 AppData\Roaming 用户目录内）：P1 挑战短语确认
+                    # 批量删除（非 C 盘，或 C 盘当前用户目录内）：P1 挑战短语确认
                     challenge_phrase = _get_cfg().danger_challenge_phrase
                     token = _get_confirmation_manager().create_challenge(
                         command=command,
-                        desc="批量删除（非 C 盘或 AppData\\Roaming）",
+                        desc="批量删除（非 C 盘或当前用户目录内）",
                         source="system_tools",
                         level="high"
                     )
@@ -795,15 +1066,114 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "details": {
                             "命令": command[:200],
                             "风险等级": "P1",
-                            "说明": "批量删除文件/目录（非 C 盘或 AppData\\Roaming 用户目录内）"
+                            "说明": "批量删除文件/目录（非 C 盘或当前用户目录内）"
                         }
                     }, ensure_ascii=False)
-            # 未匹配任何分类的命令：直接执行（UI 确认已在 react_engine 层完成）
-            _is_verified = True
+            elif _REG_IMPORT_RE.search(command):
+                # reg import：.reg 文件内容不可静态解析，一律拒绝（registry_tools 已禁止 import）
+                return json.dumps({
+                    "success": False,
+                    "message": "操作被拒绝：reg import 导入的注册表文件内容无法静态解析，禁止 Agent 直接执行",
+                    "details": {
+                        "命令": command[:200],
+                        "说明": "请由用户手动运行 reg import，或明确拆分导入键后再授权"
+                    }
+                }, ensure_ascii=False)
+            elif _REGISTRY_WRITE_HKCU_RE.search(command):
+                # HKCU 注册表写操作（非 low_risk 白名单项）：P2 普通确认，不得直接放行
+                token = _get_confirmation_manager().create_confirmation(command=command)
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "confirmation_token": token,
+                    "message": "修改 HKCU 注册表属于 P2 风险操作，需要确认",
+                    "details": {
+                        "命令": command[:200],
+                        "风险等级": "P2",
+                        "说明": "修改用户级注册表（HKCU），需用户确认后执行"
+                    }
+                }, ensure_ascii=False)
+            elif _REGISTRY_WRITE_OTHER_RE.search(command):
+                # P2-9：其他注册表根键（HKCR/HKU/HKCC 等）写 → P2 普通确认
+                token = _get_confirmation_manager().create_confirmation(command=command)
+                return json.dumps({
+                    "success": False,
+                    "confirmation_required": True,
+                    "confirmation_token": token,
+                    "message": "修改注册表（非 HKCU 根键）属于 P2 风险操作，需要确认",
+                    "details": {
+                        "命令": command[:200],
+                        "风险等级": "P2",
+                        "说明": "修改 HKCR/HKU/HKCC 等注册表根键，需用户确认后执行"
+                    }
+                }, ensure_ascii=False)
+            else:
+                # 1) protected_path_patterns（L0 硬拦截）：敏感凭据目录（.ssh/.aws/.kube/.env/.git/
+                #    微信/QQ/钉钉）与系统目录（C:\Windows、C:\ProgramData）的修改语义命令 → 直接拒绝；
+                #    danger_path_patterns（L2 挑战）：Program Files(x86) 修改 → P1 挑战确认
+                #    （保留挑战而非硬拒，避免破坏 winget/pip 等正常安装流程）。
+                # 2) _check_danger：rm/del/iex/Start-Process/管道组合等危险规则 → P1 挑战确认。
+                _block_hit, _challenge_hit = safe_exec._check_protected_paths(command, cwd=working_dir)
+                if _block_hit:
+                    _log_confirmation(command, "BLOCK", f"路径保护拦截: {_block_hit}")
+                    return json.dumps({
+                        "success": False,
+                        "message": f"安全策略：禁止修改 {_block_hit}。此路径受硬保护。",
+                        "stop": True,
+                        "details": {
+                            "命令": command[:200],
+                            "说明": "目标路径受 protected_path_patterns 硬保护（敏感凭据目录/系统目录），请用户手动完成该操作"
+                        }
+                    }, ensure_ascii=False)
+                if _challenge_hit:
+                    challenge_phrase = _get_cfg().danger_challenge_phrase
+                    token = _get_confirmation_manager().create_challenge(
+                        command=command,
+                        desc=_challenge_hit,
+                        source="system_tools",
+                        level="challenge"
+                    )
+                    _log_confirmation(command, "CHALLENGE", f"挑战路径: {_challenge_hit}")
+                    return json.dumps({
+                        "success": False,
+                        "confirmation_required": True,
+                        "challenge_phrase": challenge_phrase,
+                        "challenge_token": token,
+                        "message": f"检测到目标路径涉及 {_challenge_hit}，属于 P1 风险操作。请回复以下完整短语以确认执行：\n```\n{challenge_phrase}\n```",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P1",
+                            "说明": _challenge_hit
+                        }
+                    }, ensure_ascii=False)
+
+                _is_danger, _danger_desc, _danger_level = safe_exec._check_danger(command)
+                if _is_danger:
+                    challenge_phrase = _get_cfg().danger_challenge_phrase
+                    token = _get_confirmation_manager().create_challenge(
+                        command=command,
+                        desc=_danger_desc,
+                        source="system_tools",
+                        level="challenge"
+                    )
+                    _log_confirmation(command, "CHALLENGE", f"危险操作: {_danger_desc}")
+                    return json.dumps({
+                        "success": False,
+                        "confirmation_required": True,
+                        "challenge_phrase": challenge_phrase,
+                        "challenge_token": token,
+                        "message": f"检测到危险操作: {_danger_desc}，属于 P1 风险操作。请回复以下完整短语以确认执行：\n```\n{challenge_phrase}\n```",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P1",
+                            "说明": _danger_desc
+                        }
+                    }, ensure_ascii=False)
+                # 未匹配任何分类的命令：直接执行（UI 确认已在 react_engine 层完成）
+                _is_verified = True
 
 
     # ── 5. 命令执行 ──
-    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
     # 统一兜底为 None（继承当前进程工作目录），同时保证 os.makedirs 逻辑不受影响
     working_dir = working_dir or None
     if working_dir:
@@ -835,7 +1205,6 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             import subprocess
             try:
                 tokens = _win_split_command(actual_command.strip())
-                # Bug 修复：跳过 "& '...' /S" 拼接前缀，避免把 "&" 当可执行文件启动
                 if tokens and tokens[0].strip().lower() in ("&", "cmd", "cmd.exe", "start", "call"):
                     tokens = tokens[1:]
                 exe_path = tokens[0].strip('"').strip("'") if tokens else ""
@@ -887,7 +1256,6 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             except Exception as e:
                 result = {"success": False, "message": f"启动卸载程序失败: {str(e)}", "output": f"启动卸载程序失败: {str(e)}"}
         elif _command_is_readonly and not is_uninstall:
-            # Bug 1 修复：非破坏性命令走线程路径，共享主进程 TOOL_REGISTRY 等 Python 状态
             result = _run_command_threaded(actual_command, working_dir=working_dir, timeout=120,
                                           domain_confirmed=(confirmed or bool(_confirmed_note)),
                                           **safe_exec_kwargs)
@@ -974,7 +1342,6 @@ def _is_uninstall_command(command: str) -> bool:
         if not tokens:
             return False
         first_token = tokens[0]
-        # Bug 修复：跳过调用链前缀（如 "& '...\unins000.exe' /S"、"Start-Process -FilePath ..."），
         # 找到实际卸载器 token 作为识别与执行目标，避免 tokens[0]="&" 导致识别失败走错分支
         _leading = first_token.strip().strip('"').strip("'").lower()
         if _leading in ("&", "start-process", "start-process.exe", "cmd", "cmd.exe", "start", "call"):

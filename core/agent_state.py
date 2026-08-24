@@ -29,7 +29,9 @@ from tools import (build_dynamic_system_prompt, build_tools_param, match_domains
                    match_persona, add_domain_to_session, get_session_domains,
                    clear_session_domains)
 from memory import (log_session_turn, log_trace, build_context_messages,
-                    get_layered_memory, clear_session_messages, update_last_turn)
+                    get_layered_memory, clear_session_messages, update_last_turn,
+                    archive_session_topic)
+from memory.context_router import match_archived_topics
 from utils.error_mapper import translate_error
 from config.settings import CONTEXT_ROUTER_ENABLED, DEEPSEEK_BASE_URL, OLLAMA_HOST
 from core.progress_controller import ProgressEvaluator
@@ -62,7 +64,7 @@ class TaskCheckpoint:
     trace_id: str = ""
     user_task: str = ""
     turn: int = 0
-    current_step: int = 0  # 2026-07-12 修复：补充子步骤字段，react_engine.py:382 调用处传了 current_step 但类中未定义
+    current_step: int = 0
     messages: List[Dict[str, Any]] = field(default_factory=list)
     completed_steps: List[Dict[str, Any]] = field(default_factory=list)
     remaining_steps: List[str] = field(default_factory=list)
@@ -124,7 +126,7 @@ class TaskCheckpoint:
             trace_id=data.get("trace_id", ""),
             user_task=data.get("user_task", ""),
             turn=data.get("turn", 0),
-            current_step=data.get("current_step", 0),  # 2026-07-12 修复：旧数据无此字段时默认 0
+            current_step=data.get("current_step", 0),
             messages=json.loads(data.get("messages", "[]")),
             completed_steps=json.loads(data.get("completed_steps", "[]")),
             remaining_steps=json.loads(data.get("remaining_steps", "[]")),
@@ -541,7 +543,11 @@ def inject_memory_if_needed(messages, layered_cache):
 
     memory_parts = []
     if layered_cache.get("long_term"):
-        memory_parts.append(f"[长期记忆]\n{layered_cache['long_term']}")
+        memory_parts.append(
+            "[长期记忆]\n"
+            "以下为长期记忆，回答优先以本段为准：\n"
+            f"{layered_cache['long_term']}"
+        )
 
     # 近期交互：将 episodic_history 轻量化后注入（缩减 60%+ 无效 Token）
     recent_structured = layered_cache.get("recent_structured")
@@ -563,7 +569,7 @@ def inject_memory_if_needed(messages, layered_cache):
             lightweight_json = json.dumps({"error": "memory serialization failed"})
         memory_parts.append(f"[近期交互]\n{lightweight_json}")
 
-    # 历史摘要：超三轮摘要（结构化 JSON 或旧自然语言），修复未注入缺陷
+    # 历史摘要：超三轮摘要（结构化 JSON 或旧自然语言）
     older_summary = layered_cache.get("older_summary")
     if older_summary:
         switch_ref = layered_cache.get("switch_ref")
@@ -579,6 +585,16 @@ def inject_memory_if_needed(messages, layered_cache):
                 "涉及文件或系统操作必须重新确认。"
             )
         memory_parts.append(f"[历史摘要]\n{older_summary}")
+
+    # GAP②③：归档话题相关性召回（A-B-A 选择性恢复）
+    # 未发生切换但当前消息与某归档话题强相关时，把历史话题作为只读参考注入，
+    # 边界标记与 switch_ref 同模式，防止 LLM 误把历史指令当本轮新指令执行。
+    archived_ref = layered_cache.get("archived_ref")
+    if archived_ref:
+        for _ref in archived_ref[:2]:
+            _content = _ref.get("content") or ""
+            if _content:
+                memory_parts.append(_content)
 
     if memory_parts:
         result.insert(1, {
@@ -759,7 +775,7 @@ def load_cross_turn_history(engine, user_message: str, max_entries: int = 30,
     """加载跨 Turn 历史对话（完整轮次注入），修复多轮对话模型失忆。
 
     数据源：SQLite chat_history（get_full_session_messages_rich，已过滤 is_temporary）。
-    注入过滤规则（与用户设计目标一致：工具结果全量以 role="tool" 拼入上下文）：
+    注入过滤规则
     - role=user 且 msg_type ∈ {chat, text, ""/None} → 注入（原文）
     - role=assistant 且 msg_type == "tool_call" → 注入（content 原文 + tool_calls JSON 解析）
     - role=tool   且 msg_type == "tool_result" → 注入（content 全量，不摘要；
@@ -816,7 +832,6 @@ def load_cross_turn_history(engine, user_message: str, max_entries: int = 30,
     # ── 第四步：序列合法性校验 + 组装 API 消息 ──
     injected: List[Dict[str, Any]] = []
     for turn in turns:
-        # 4.0 【修复 S5/M3】跳过未完成轮次：无 final_answer 的轮次表示任务中断
         # （ai_reply 为空），注入这种轮次会污染上下文、浪费 token。
         has_final = any(
             m.get("role") == "assistant" and (m.get("msg_type") or "") == "final_answer"
@@ -849,7 +864,6 @@ def load_cross_turn_history(engine, user_message: str, max_entries: int = 30,
         while cleaned and cleaned[-1].get("role") == "assistant" and cleaned[-1].get("_tc_parsed"):
             cleaned.pop()
 
-        # 4.2.1 【修复 DeepSeek 400】中间孤悬的 assistant(tool_call)：
         # 如果后面紧跟的不是 tool 响应（如中间被 user_response 或其他角色隔开），
         # 必须把 _tc_parsed 标记摘掉，转为普通 assistant 消息，
         # 否则 DeepSeek 会报 "An assistant message with 'tool_calls' must be followed by tool messages..."
@@ -862,7 +876,6 @@ def load_cross_turn_history(engine, user_message: str, max_entries: int = 30,
                     # 孤立 tool_call → 转为普通 assistant（保留 content，删除 _tc_parsed）
                     cleaned[i].pop("_tc_parsed", None)
 
-        # 4.2.2 【修复 H2】合并连续同 content 的 assistant(tool_call)：
         # _persist_tool_pair 按每个 tool_call 单独落库（每条都带相同的 full_content），
         # 跨轮恢复时须还原为单条 assistant + 合并的 tool_calls，避免 content 重复 N 份。
         merged: List[Dict[str, Any]] = []
@@ -983,6 +996,7 @@ class PrepareResult:
     tank_logger: Any  # TankLogger (_tl)
     session_logger: Any  # SessionLogger (_sl)
     remaining_steps: list
+    stream: bool = True
 
 
 @dataclass
@@ -1232,6 +1246,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
         provider = model_choice["provider"]
         model_name = model_choice["model"]
         temperature = model_choice.get("temperature", 0.75)
+        stream = model_choice.get("stream", True)
         base_url = model_choice.get("base_url", DEEPSEEK_BASE_URL)
 
         known_models = [m["model"] for m in get_available_models()]
@@ -1382,6 +1397,22 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
 
                 layered_cache = get_layered_memory(engine.session_id, user_message)
 
+                # GAP②③：未切换时按 BM25 相关性召回归档话题（A-B-A 选择性恢复）。
+                # 切换分支由下方归档块处理，刚归档的旧话题不重复召回；
+                # 召回结果以 switch_ref 同款边界标记注入（见 inject_memory_if_needed）。
+                if CONTEXT_ROUTER_ENABLED and not _switch_result["is_switch"]:
+                    try:
+                        _archived_ref = match_archived_topics(user_message, engine.session_id)
+                        if _archived_ref:
+                            layered_cache["archived_ref"] = _archived_ref
+                            get_logger().debug(
+                                f"[上下文路由] 归档话题召回 {len(_archived_ref)} 个",
+                                trace_id=engine.trace_id, session_id=engine.session_id,
+                            )
+                    except Exception as e:
+                        get_logger().debug(f"[上下文路由] 归档话题召回失败: {e}",
+                                           trace_id=engine.trace_id, session_id=engine.session_id)
+
                 full_system = build_dynamic_system_prompt(
                     domains=domains, persona_mode=persona_mode
                 )
@@ -1426,7 +1457,6 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
                              trace_id=engine.trace_id, session_id=engine.session_id)
         else:
             # 每轮独立计数：start_step 固定 0，MAX_TURNS=15 是本轮推理预算，
-            # 不随会话累计 turn 递增而递减（修复第 N 问可用步数=15-N 的枯竭问题）
             start_step = 0
 
         # save_ai_reply 已移除 —— AI 消息持久化收敛为前端 saveSessionToBackend 单一入口
@@ -1513,8 +1543,22 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
             )
             engine._full_system = full_system
 
-            # 5. 清空会话历史消息（可选：保留最近 1 条系统消息）
-            clear_session_messages(engine.session_id, keep_system=True)
+            # 5. 归档旧话题（替代物理删除；GAP①）
+            # 消息打 archived=1 标记并记录话题描述到 topic_archive，
+            # 数据可持久化保留、可被 match_archived_topics 相关性召回。
+            # load_cross_turn_history / get_full_session_messages_rich 默认排除
+            # archived=1 消息，新话题加载路径自动只看到未归档消息。
+            _old_topic_desc = getattr(engine.context_detector, "_last_task", "") or user_message
+            _archived = archive_session_topic(engine.session_id, topic_desc=_old_topic_desc)
+            if _archived:
+                get_logger().info(
+                    f"[话题切换] 已归档旧话题 {_archived['count']} 条消息 "
+                    f"(archive_id={_archived['archive_id']}, desc={(_archived['topic_desc'] or '')[:50]})",
+                    trace_id=engine.trace_id, session_id=engine.session_id,
+                )
+            else:
+                get_logger().debug("[话题切换] 无可归档消息（空会话）",
+                                   trace_id=engine.trace_id, session_id=engine.session_id)
 
             start_step = 0
 
@@ -1542,7 +1586,6 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
         )
 
         # 初始化 Multi-Turn 消息数组（优先从检查点恢复完整对话历史）
-        # P0 修复：显式调用 build_system_prompt 组装 system prompt（角色/模式 + 工具列表 + 安全规则），
         # 以 build_dynamic_system_prompt 动态结果（core.md/safety.md/output.md/技能注入）作为安全规则基础，
         # 保证任何路径下 conversation_messages[0] 都是 system。
         _loaded_domains = get_session_domains(engine.session_id) if engine.session_id else []
@@ -1617,6 +1660,7 @@ def prepare_run_state(engine, rs: RunState, user_message: str,
             default_model=default_model,
             default_provider=default_provider,
             temperature=temperature,
+            stream=stream,
             call_seq=call_seq,
             tools_param=_tools_param,
             tank_logger=_tl,

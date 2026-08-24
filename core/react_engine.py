@@ -107,10 +107,13 @@ class ReActEngine:
         # 绕过工具内部 challenge_phrase 的问题（问题三）。
         "modify_registry": "P0",
         "delete_file": "P0",
-        # P1：可导致数据修改或系统状态变更，需确认
-        "write_file": "P1",
-        "edit_file": "P1",
-        "replace_in_file": "P1",
+        # 单文件内容修改类（write_file/edit_file/replace_in_file）：动态定级，静态值仅兜底。
+        # 实际由 check_tool_risk_level 动态判定：
+        #   - 目标在 C 盘且不在 C:\Users\<当前用户> 目录下 → P0 直接拒绝
+        #   - 其余（C:\Users\<当前用户> 内或非 C 盘）→ P2 简单确认（单文件修改不升 P1）
+        "write_file": "P2",
+        "edit_file": "P2",
+        "replace_in_file": "P2",
         "move_file": "P1",
         "gui_click": "P1",
         "gui_type_text": "P1",
@@ -135,7 +138,8 @@ class ReActEngine:
         self.streamer = SSEStreamer()
         self.formatter = StreamingFormatter()
         self.execution_state = AgentExecutionState()
-        self.context_detector = ContextSwitchDetector(window_size=5, strict_threshold=0.25)
+        self.context_detector = ContextSwitchDetector(window_size=5, strict_threshold=0.25,
+                                                      session_id=session_id)
         self._turn_state: Optional[AgentTurnState] = None  # 当前轮次状态引用，供 _on_final 回调使用
         self._manager = Manager()
         self._search_breaker = SearchCircuitBreaker(failure_threshold=3, cooldown_seconds=60)
@@ -175,6 +179,7 @@ class ReActEngine:
         default_model = result.default_model
         default_provider = result.default_provider
         temperature = result.temperature
+        stream = result.stream
         call_seq = result.call_seq
         _tools_param = result.tools_param
         _tl = result.tank_logger
@@ -188,6 +193,10 @@ class ReActEngine:
         consecutive_empty_turns = rs.consecutive_empty_turns
         final_reply_saved = rs.final_reply_saved
         start_step = rs.start_step
+
+        # 修复1：拒绝/中止路径标志——execute_one_step 返回 "return" 时不再直接 return，
+        # 置位后跳出两层循环，统一走循环后的 do_final_cleanup 收尾（释放日志/会话资源）。
+        _abort_run = False
 
         for step in range(start_step, self.MAX_TURNS):
             # 取消信号检查：在每轮开始前检查，避免取消后继续发起 LLM 调用
@@ -212,7 +221,7 @@ class ReActEngine:
                     self, rs, state, user_message, step, cancel_event,
                     call_seq, _tools_param,
                     base_url, default_provider, default_model,
-                    model_id, temperature, remaining_steps
+                    model_id, temperature, stream, remaining_steps
                 )
                 # 同步状态回局部变量
                 conversation_messages = rs.conversation_messages
@@ -425,8 +434,13 @@ class ReActEngine:
                     layered_cache = rs.layered_cache
                     final_reply_saved = rs.final_reply_saved
                     if _flow == "return":
-                        return
+                        # 修复1：拒绝/中止路径不再直接 return（会跳过 do_final_cleanup 收尾，
+                        # 导致日志/会话资源未释放），置标志跳出两层循环，统一走循环后收尾。
+                        _abort_run = True
+                        break
                     # _flow == "continue" or "proceed": 继续下一个 tc
+                if _abort_run:
+                    break
             except Exception as e:
 
                 try:
@@ -438,5 +452,6 @@ class ReActEngine:
         
         yield from do_final_cleanup(self, state, user_message, remaining_steps,
                                           cancel_event, default_model, default_provider,
-                                          model_id, temperature)
+                                          model_id, temperature,
+                                          final_reply_saved=final_reply_saved)
         return

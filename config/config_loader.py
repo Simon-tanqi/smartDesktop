@@ -67,6 +67,12 @@ class SafetyConfig:
     # web_download
     risky_extensions: set = field(default_factory=set)
 
+    # ── 预留接口（只读占位，不接入任何确认逻辑） ──
+    # confirm_override：未来"原始路径 → 复制到工作区 → 修改副本 → 用户确认 →
+    # 覆写原始路径"方案的确认开关。用户设置打开后可跳过人工确认。
+    # 当前仅占位可读：恒为 False/关闭，不改变任何现有行为。
+    confirm_override: bool = False
+
 
 # ═══════════════════════════════════════════════
 #  解析逻辑
@@ -132,6 +138,11 @@ def _parse_yaml() -> SafetyConfig:
     # ── web_download ──
     wd = data.get("web_download", {})
     cfg.risky_extensions = set(wd.get("risky_extensions", []))
+
+    # ── 预留接口（只读占位）：confirm_override 确认开关 ──
+    # 未来"复制到工作区→修改→确认→覆写原路径"方案的确认开关；当前仅占位可读，
+    # 无论 YAML 是否配置均不接入任何确认逻辑（默认 False/关闭）。
+    cfg.confirm_override = bool(ft.get("confirm_override", False))
 
     return cfg
 

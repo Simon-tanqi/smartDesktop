@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>运行日志查看</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #222; }
+  .header { padding: 14px 20px; background: #1e293b; color: #fff; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 18px; margin: 0; flex: 1; }
+  .filters { display: flex; flex-wrap: wrap; gap: 10px; padding: 14px 20px; background: #fff; border-bottom: 1px solid #e2e8f0; align-items: center; }
+  .filters label { font-size: 13px; color: #475569; }
+  .filters input, .filters select { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+  .filters button { padding: 6px 16px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; font-size: 13px; }
+  .filters button:hover { background: #1d4ed8; }
+  .summary { padding: 8px 20px; font-size: 13px; color: #64748b; }
+  table { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eef2f7; vertical-align: top; }
+  th { background: #f8fafc; color: #334155; position: sticky; top: 0; }
+  tr:hover { background: #f1f5f9; }
+  td.msg { max-width: 560px; word-break: break-all; }
+  .lvl { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .lvl-INFO { background: #dcfce7; color: #166534; }
+  .lvl-WARNING { background: #fef9c3; color: #854d0e; }
+  .lvl-ERROR { background: #fee2e2; color: #991b1b; }
+  .lvl-DEBUG { background: #e0e7ff; color: #3730a3; }
+  .detail { display: none; background: #f8fafc; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .empty { padding: 40px; text-align: center; color: #94a3b8; }
+  .err { padding: 10px 20px; background: #fee2e2; color: #991b1b; }
+</style>
+</head>
+<body>
+<div class="header"><h1>运行日志查看</h1></div>
+<div class="filters">
+  <label>日期
+    <select id="dateSel"><option value="">全部</option></select>
+  </label>
+  <label>级别
+    <select id="levelSel">
+      <option value="">全部</option>
+      <option value="INFO">INFO</option>
+      <option value="WARNING">WARNING</option>
+      <option value="ERROR">ERROR</option>
+      <option value="DEBUG">DEBUG</option>
+    </select>
+  </label>
+  <label>关键词 <input id="kwInput" placeholder="消息包含..." style="width:140px"></label>
+  <label>会话名 <input id="sessionInput" placeholder="会话标题包含..." style="width:140px"></label>
+  <button onclick="doQuery()">查询</button>
+</div>
+<div class="summary" id="summary">加载中...</div>
+<div style="overflow:auto;max-height:calc(100vh - 170px)">
+<table>
+<thead><tr><th style="width:170px">时间</th><th style="width:90px">级别</th><th>消息</th><th style="width:160px">会话</th></tr></thead>
+<tbody id="tbody"></tbody>
+</table>
+<div class="empty" id="emptyBox" style="display:none">暂无日志</div>
+</div>
+<div class="err" id="errBox" style="display:none"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let _logs = [];
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return String(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function showLlmCall(sessionId, btn) {
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = "加载中...";
+  try {
+    const data = await fetchJSON("/api/logs/llm_call?session_id=" + encodeURIComponent(sessionId) + "&turn=latest");
+    const wrap = btn.parentElement;
+    const pre = document.createElement("pre");
+    pre.style.cssText = "margin:4px 0 0;white-space:pre-wrap;word-break:break-all;";
+    pre.textContent = JSON.stringify(data, null, 2);
+    wrap.appendChild(pre);
+    btn.textContent = "刷新 LLM 调用详情";
+  } catch (e) {
+    btn.textContent = "无 LLM 调用记录或加载失败";
+    setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 2000);
+  }
+}
+
+async function loadDates() {
+  try {
+    const data = await fetchJSON("/api/logs/dates");
+    const sel = $("dateSel");
+    (data.dates || []).forEach((d) => {
+      const opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = d;
+      sel.appendChild(opt);
+    });
+    if (data.dates && data.dates.length) sel.value = data.dates[0];
+  } catch (e) {
+    $("errBox").style.display = "block";
+    $("errBox").textContent = "日期加载失败: " + e.message;
+  }
+}
+
+async function doQuery() {
+  const q = new URLSearchParams();
+  const d = $("dateSel").value;
+  if (d) { q.set("date_from", d); q.set("date_to", d); }
+  const lv = $("levelSel").value;
+  if (lv) q.set("level", lv);
+  const kw = $("kwInput").value.trim();
+  if (kw) q.set("keyword", kw);
+  const sn = $("sessionInput").value.trim();
+  if (sn) q.set("session_name", sn);
+  q.set("limit", "300");
+  $("summary").textContent = "查询中...";
+  try {
+    const data = await fetchJSON("/api/logs/query?" + q.toString());
+    renderLogs(data.logs || []);
+    $("summary").textContent = "共 " + (data.logs || []).length + " 条日志";
+  } catch (e) {
+    $("errBox").style.display = "block";
+    $("errBox").textContent = "查询失败: " + e.message;
+    $("summary").textContent = "";
+  }
+}
+
+function renderLogs(logs) {
+  _logs = logs;
+  const tb = $("tbody");
+  tb.innerHTML = "";
+  $("emptyBox").style.display = logs.length ? "none" : "block";
+  logs.forEach((log, i) => {
+    const tr = document.createElement("tr");
+    const lvl = log.level || "";
+    const extra = log.extra || {};
+    tr.innerHTML =
+      "<td>" + escapeHtml(fmtTime(log.timestamp || log.time)) + "</td>" +
+      "<td><span class=\"lvl lvl-" + escapeHtml(lvl) + "\">" + escapeHtml(lvl) + "</span></td>" +
+      "<td class=\"msg\">" + escapeHtml(log.message) + "</td>" +
+      "<td>" + escapeHtml(log.session_name || extra.session_id || "") + "</td>";
+    const det = document.createElement("tr");
+    det.style.display = "none";
+    det.className = "detail-row";
+    const sid = (extra && extra.session_id) ? escapeHtml(extra.session_id) : "";
+    const btnHtml = sid
+      ? '<button onclick="showLlmCall(\'' + sid + '\', this)" style="margin:6px 0;padding:4px 10px;border:1px solid #93c5fd;border-radius:6px;background:#eff6ff;color:#1d4ed8;cursor:pointer;font-size:12px">查看 LLM 调用详情</button>'
+      : "";
+    det.innerHTML = "<td colspan=\"4\"><div class=\"detail\" style=\"display:block\">" +
+      btnHtml +
+      escapeHtml(JSON.stringify(log, null, 2)) + "</div></td>";
+    tr.addEventListener("click", () => { det.style.display = det.style.display === "none" ? "" : "none"; });
+    tb.appendChild(tr);
+    tb.appendChild(det);
+  });
+}
+
+loadDates().then(doQuery);
+</script>
+</body>
+</html>

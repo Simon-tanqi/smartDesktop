@@ -171,7 +171,7 @@ def _add_text_box(slide, region: dict):
     # 所以 pt = px * 72 / 96 = px * 0.75，但实际渲染时可能需要微调
     p.font.size = Pt(region['font_size'] * 0.72)
     
-    # 设置中文字体（关键修复：确保中文正常显示）
+    # 设置中文字体
     try:
         p.font.name = 'Microsoft YaHei'
         if hasattr(p.font, 'east_asian_font'):
@@ -191,7 +191,7 @@ def _add_text_box(slide, region: dict):
     elif region['text_align'] == 'right':
         p.alignment = PP_ALIGN.RIGHT
 
-    # 完全透明：无线条、无填充（关键修复：消除重影）
+    # 完全透明：无线条、无填充
     txBox.fill.background()
     txBox.line.fill.background()
     # 额外确保线条宽度为0

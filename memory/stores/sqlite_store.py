@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import datetime
 import time
+import json
 from contextlib import contextmanager
 from memory.config import (
     TRACE_DB, OPERATION_LOG_DB,
@@ -421,6 +422,7 @@ def _init_chat_tables(conn):
         ("tool_calls", "TEXT DEFAULT ''"),
         ("thinking_summary", "TEXT DEFAULT ''"),
         ("tool_call_id", "TEXT DEFAULT ''"),
+        ("archived", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE chat_history ADD COLUMN {col} {col_type}")
@@ -429,6 +431,20 @@ def _init_chat_tables(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_trace ON chat_history(trace_id)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msg_id ON chat_history(session_id, msg_id) WHERE msg_id != ''")
+    # 话题归档表：记录每次话题切换时被归档的旧话题段（描述 + 消息 id 范围）。
+    # 与 chat_history.archived 标记配套，实现"切换后旧话题不注入、相关话题可召回"。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS topic_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            topic_desc TEXT NOT NULL DEFAULT '',
+            min_msg_id INTEGER DEFAULT 0,
+            max_msg_id INTEGER DEFAULT 0,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_topic_archive_session ON topic_archive(session_id, archived_at)")
 
 
 def add_chat_message(session_id, role, content, msg_type="chat",
@@ -550,20 +566,31 @@ def get_full_session_messages(session_id, limit=500):
         return []
 
 
-def get_full_session_messages_rich(session_id, limit=500):
-    """获取完整会话消息（含 tool_calls / thinking_summary / tool_call_id）。"""
+def get_full_session_messages_rich(session_id, limit=500, exclude_archived=True):
+    """获取完整会话消息（含 tool_calls / thinking_summary / tool_call_id）。
+
+    Args:
+        session_id: 会话 ID
+        limit: 消息条数上限
+        exclude_archived: 默认 True，排除已归档（archived=1）的旧话题消息；
+            归档消息仅通过 get_archived_topic_messages 按话题段显式读取。
+    """
     db_path = get_session_messages_db(session_id)
     if not os.path.exists(db_path):
         return []
     try:
         with _get_conn_simple(db_path, row_factory=True) as conn:
             _init_chat_tables(conn)
+            where = "session_id = ? AND is_temporary = 0"
+            params: list = [session_id]
+            if exclude_archived:
+                where += " AND (archived IS NULL OR archived = 0)"
             rows = conn.execute(
                 "SELECT id, role, content, msg_type, msg_id, tool_calls, thinking_summary, tool_call_id, created_at "
                 "FROM chat_history "
-                "WHERE session_id = ? AND is_temporary = 0 "
+                f"WHERE {where} "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
-                (session_id, limit),
+                (*params, limit),
             ).fetchall()
         return [
             {
@@ -720,6 +747,191 @@ def clear_session_messages(session_id: str, keep_system: bool = True):
             conn.commit()
     except sqlite3.DatabaseError as e:
         print(f"[WARN] clear_session_messages 失败: {e}, session={session_id}")
+
+
+def archive_session_topic(session_id: str, topic_desc: str = "") -> dict:
+    """归档当前话题：将未归档的非 system 消息打 archived=1 标记，并记录话题描述到 topic_archive。
+
+    话题切换时调用（替代 clear_session_messages 物理删除）：
+    - 旧话题消息不再删除，仅打归档标记，保证数据可持久化保留、可相关性召回；
+    - topic_archive 记录该话题段的消息 id 范围（min_msg_id ~ max_msg_id），供召回读取。
+
+    Returns:
+        归档记录 dict（archive_id / min_msg_id / max_msg_id / count / topic_desc）；
+        无可归档消息时返回 None。
+    """
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return None
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_chat_tables(conn)
+            row = conn.execute(
+                "SELECT MIN(id), MAX(id), COUNT(*) FROM chat_history "
+                "WHERE session_id = ? AND role != 'system' AND (archived IS NULL OR archived = 0)",
+                (session_id,),
+            ).fetchone()
+            if not row or not row[2]:
+                return None
+            min_id, max_id, count = int(row[0]), int(row[1]), int(row[2])
+            conn.execute(
+                "UPDATE chat_history SET archived = 1 "
+                "WHERE session_id = ? AND role != 'system' AND (archived IS NULL OR archived = 0)",
+                (session_id,),
+            )
+            desc = (topic_desc or "").strip()[:500]
+            cur = conn.execute(
+                "INSERT INTO topic_archive (session_id, topic_desc, min_msg_id, max_msg_id) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, desc, min_id, max_id),
+            )
+            conn.commit()
+            return {
+                "archive_id": cur.lastrowid,
+                "session_id": session_id,
+                "min_msg_id": min_id,
+                "max_msg_id": max_id,
+                "count": count,
+                "topic_desc": desc,
+            }
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] archive_session_topic 失败: {e}, session={session_id}")
+        return None
+
+
+def list_archived_topics(session_id: str) -> list:
+    """列出会话全部归档话题（按归档时间正序），供 BM25 相关性召回打分。"""
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT id, session_id, topic_desc, min_msg_id, max_msg_id, archived_at, created_at "
+                "FROM topic_archive WHERE session_id = ? ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] list_archived_topics 失败: {e}, session={session_id}")
+        return []
+
+
+def get_archived_topic_messages(session_id: str, min_msg_id: int, max_msg_id: int,
+                                limit: int = 80) -> list:
+    """读取指定归档话题段内的消息（archived=1 且 id 位于 [min_msg_id, max_msg_id]）。
+
+    供注入侧相关性召回：把匹配话题的消息拼回上下文前，先按话题段读取。
+    """
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_chat_tables(conn)
+            rows = conn.execute(
+                "SELECT id, role, content, msg_type, tool_calls, tool_call_id, thinking_summary "
+                "FROM chat_history "
+                "WHERE session_id = ? AND archived = 1 AND role != 'system' "
+                "AND id >= ? AND id <= ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, min_msg_id, max_msg_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "role": r[1],
+                "content": r[2],
+                "msg_type": r[3] or "chat",
+                "tool_calls": r[4],
+                "tool_call_id": r[5],
+                "thinking_summary": r[6],
+            }
+            for r in rows
+        ]
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] get_archived_topic_messages 失败: {e}, session={session_id}")
+        return []
+
+
+# ═══════════════════════════════════════════════
+# 话题切换检测器状态（per-session messages.db）
+# GAP⑤：检测器窗口持久化，重启不丢
+# ═══════════════════════════════════════════════
+
+def _init_detector_tables(conn):
+    """初始化检测器状态表（会话级 messages.db 内）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS detector_state (
+            session_id TEXT PRIMARY KEY,
+            history_json TEXT NOT NULL DEFAULT '[]',
+            strict_threshold REAL DEFAULT 0.25,
+            window_size INTEGER DEFAULT 5,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+def save_detector_state(session_id: str, history: list, strict_threshold: float = 0.25,
+                        window_size: int = 5) -> bool:
+    """持久化检测器窗口状态（history + 参数），供重启后恢复。
+
+    存储在 per-session messages.db，随 delete_chat_session 目录删除一并清理，
+    不破坏"删除会话"物理清理语义。
+    """
+    if not session_id:
+        return False
+    db_path = get_session_messages_db(session_id)
+    try:
+        with _get_conn_simple(db_path) as conn:
+            _init_detector_tables(conn)
+            conn.execute(
+                "INSERT INTO detector_state (session_id, history_json, strict_threshold, window_size) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "history_json=excluded.history_json, "
+                "strict_threshold=excluded.strict_threshold, "
+                "window_size=excluded.window_size, "
+                "updated_at=CURRENT_TIMESTAMP",
+                (session_id, json.dumps(history[-window_size:], ensure_ascii=False),
+                 float(strict_threshold), int(window_size)),
+            )
+        return True
+    except Exception as e:
+        print(f"[WARN] save_detector_state 失败: {e}, session={session_id}")
+        return False
+
+
+def load_detector_state(session_id: str) -> dict:
+    """恢复检测器窗口状态；无记录或损坏时返回空字典。"""
+    if not session_id:
+        return {}
+    db_path = get_session_messages_db(session_id)
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        with _get_conn_simple(db_path, row_factory=True) as conn:
+            _init_detector_tables(conn)
+            row = conn.execute(
+                "SELECT history_json, strict_threshold, window_size FROM detector_state "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        try:
+            history = json.loads(row["history_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            history = []
+        return {
+            "history": [str(h) for h in history if isinstance(h, str)],
+            "strict_threshold": float(row["strict_threshold"] or 0.25),
+            "window_size": int(row["window_size"] or 5),
+        }
+    except sqlite3.DatabaseError as e:
+        print(f"[WARN] load_detector_state 失败: {e}, session={session_id}")
+        return {}
 
 
 # ═══════════════════════════════════════════════

@@ -737,8 +737,6 @@
                 <div class="settings-tabs">
                     <button class="settings-tab active" data-tab="models">模型配置</button>
                     <button class="settings-tab" data-tab="profile">个人信息</button>
-                    <button class="settings-tab disabled" data-tab="workspace" title="开发中">工作区域</button>
-                    <button class="settings-tab disabled" data-tab="tools" title="开发中">自定义工具</button>
                 </div>
 
                 <!-- 模型配置 -->
@@ -840,13 +838,7 @@
                 </div>
 
                 <!-- 工作区域 (占位) -->
-                <div id="tab-workspace" class="settings-section">
-                    <div class="placeholder-text">工作区域配置 - 开发中</div>
-                </div>
-                <!-- 自定义工具 (占位) -->
-                <div id="tab-tools" class="settings-section">
-                    <div class="placeholder-text">自定义工具配置 - 开发中</div>
-                </div>
+                <!-- 工作区域 / 自定义工具 Tab 已移除（开发中占位，不再展示入口） -->
             </div>
         </div>
     </div>
@@ -1634,7 +1626,7 @@
 				if (modelValue) {
 					try {
 						const parsed = JSON.parse(modelValue);
-						modelChoice = { display: parsed.display, provider: parsed.provider, model: parsed.model, id: parsed.id, base_url: parsed.base_url };
+						modelChoice = { display: parsed.display, provider: parsed.provider, model: parsed.model, id: parsed.id, base_url: parsed.base_url, temperature: parsed.temperature, stream: parsed.stream };
 						modelId = parsed.id || null;
 						// 防御：如果选项中缺 provider/model（Stale page），记警告并由后端补全
 						if (!modelChoice.provider || !modelChoice.model) {
@@ -2087,7 +2079,7 @@
 				modelSelect.innerHTML = '';
 				models.forEach(item => {
 					const option = document.createElement('option');
-					option.value = JSON.stringify({ display: item.display, id: item.id || '', provider: item.provider, model: item.model, base_url: item.base_url });
+					option.value = JSON.stringify({ display: item.display, id: item.id || '', provider: item.provider, model: item.model, base_url: item.base_url, temperature: item.temperature, stream: item.stream });
 					option.textContent = item.display || `${item.provider} - ${item.model}`;
 					modelSelect.appendChild(option);
 				});
@@ -2362,7 +2354,7 @@
 					modelSelect.innerHTML = '';
 					models.forEach(m => {
 						const opt = document.createElement('option');
-						opt.value = JSON.stringify({ display: m.display, id: m.id || '', provider: m.provider, model: m.model, base_url: m.base_url });
+						opt.value = JSON.stringify({ display: m.display, id: m.id || '', provider: m.provider, model: m.model, base_url: m.base_url, temperature: m.temperature, stream: m.stream });
 						opt.textContent = m.display;
 						modelSelect.appendChild(opt);
 					});

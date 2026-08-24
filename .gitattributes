@@ -1,0 +1,29 @@
+# 文本文件统一 LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.toml text eol=lf
+*.txt  text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.svg  text eol=lf
+
+# Windows 脚本保留 CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 图片 / 二进制文件
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pyc  binary
+*.xlsx binary
+*.docx binary
+*.pptx binary
+*.pdf  binary
+*.db   binary

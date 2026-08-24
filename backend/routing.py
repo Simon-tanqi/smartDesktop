@@ -104,6 +104,18 @@ _CHAT_MATCHES: dict[str, str] = {
     "辛苦了": "不辛苦，分内之事。",
     "你是谁": "我是 smartDesktop，您的本地智能助手。",
     "你叫什么": "我是 smartDesktop，您的本地智能助手。",
+    # 时间查询：命中后本地格式化当前时间直接回复，不走 LLM
+    "几点了": "TIME_QUERY",
+    "现在几点了": "TIME_QUERY",
+    "现在几点": "TIME_QUERY",
+    "几点钟": "TIME_QUERY",
+    "当前时间": "TIME_QUERY",
+    "现在时间": "TIME_QUERY",
+    "现在什么时候": "TIME_QUERY",
+    "现在是什么时间": "TIME_QUERY",
+    "what time": "TIME_QUERY",
+    "time now": "TIME_QUERY",
+    "current time": "TIME_QUERY",
 }
 
 
@@ -131,6 +143,8 @@ def check_chat_layer(user_message: str, context: dict = None) -> str | None:
         
         if reply == "TIME_GREETING":
             reply = _get_time_enhanced_greeting()
+        if reply == "TIME_QUERY":
+            reply = _get_current_time_reply()
         
         if msg_lower in ['你好', 'hello', 'hi', 'hey'] and context:
             return _enhance_greeting_with_context(reply, context)
@@ -142,6 +156,8 @@ def check_chat_layer(user_message: str, context: dict = None) -> str | None:
             if len(keyword) >= 2 and keyword.lower() in msg_lower:
                 if reply == "TIME_GREETING":
                     reply = _get_time_enhanced_greeting()
+                if reply == "TIME_QUERY":
+                    reply = _get_current_time_reply()
                 return reply
 
     return None
@@ -198,6 +214,12 @@ def _get_time_enhanced_greeting() -> str:
         return "下午好！有什么需要处理的吗？"
     else:
         return "晚上好！有什么需要处理的吗？"
+
+
+def _get_current_time_reply() -> str:
+    """返回本地格式化的当前时间（不调用 LLM，供 TIME_QUERY 预设使用）。"""
+    t = time.localtime()
+    return f"现在是 {t.tm_year} 年 {t.tm_mon:02d} 月 {t.tm_mday:02d} 日 {t.tm_hour:02d}:{t.tm_min:02d}。"
 
 
 # ── 第2层：高频固化层 ──
@@ -738,11 +760,6 @@ def _record_workflow_success(user_message: str, tool_call_chain: list):
     if not workflow_steps:
         return
 
-    # 2026-07-12 修复：拒绝"全为不安全工具"或"无参数变量化"的低质量工作流被固化
-    # 背景：用户问"把喇叭声音改成45"，LLM 选了 6 步全 execute_command 链（SendKeys/查pycaw/重复调用），
-    # 原逻辑只设 require_confirm=True 就写盘，导致 success_count 累积到 2 后被命中为可重用模板，
-    # 下次再问会弹出 6 个连续确认弹窗，重复执行错误的流程。
-    # 调整：要求"全为不安全 + 步骤≥3"才拒绝（保护 2 步的合法卸载/安装任务）
     unsafe_count = sum(1 for s in workflow_steps if s.get("require_confirm", False))
     if unsafe_count == len(workflow_steps) and len(workflow_steps) >= 3:
         logger.info(
@@ -1015,12 +1032,15 @@ def _llm_complexity_judgment(user_message: str, model_choice: dict, base_score: 
 
     messages = [{"role": "user", "content": judge_prompt}]
     try:
+        # 复杂度判断属低价值前置调用:传 8s 短超时,LLM 慢/限流时快速回退规则结果,
+        # 避免同步阻塞 SSE 主流程 30s+
         result = ai_concat(
             messages=messages,
             model_name=model_choice.get("model"),
             provider=provider,
             trace_id=model_choice.get("model", "complexity"),
             model_id=model_choice.get("id"),
+            timeout=3,
         )
 
         content = ""

@@ -1,0 +1,21 @@
+[project]
+name = "smartDesktop"
+version = "0.1.0"
+description = "个人 AI Agent 助手：基于 ReAct 模式的本地智能代理，支持多模型后端、工具动态注册、分层记忆系统与 BM25 上下文路由"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Simon-tanqi", email = "273597272+Simon-tanqi@users.noreply.github.com" },
+]
+keywords = ["ai-agent", "react", "llm", "memory", "bm25", "assistant"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

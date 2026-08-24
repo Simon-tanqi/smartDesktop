@@ -34,7 +34,7 @@ from memory.compressor import (
     estimate_tokens,
     increment_merge_summary,
 )
-from memory.long_term import get_relevant_memory
+from memory.long_term import get_relevant_memory, remember_to_long_term, forget_memory
 
 
 # 在 session.py 顶部定义常量
@@ -1004,7 +1004,6 @@ def _trigger_increment_compression(session_id, history_entries):
     1. 轮次触发：每完成1个用户轮次，且结构化轮次 > 3时，取出最老1轮数据合并进摘要
     2. 存储统一：写入 summaries.db，与 compress_conversation_async 共用存储
     3. 去重保护：以 summaries 最新 cover_turn_end 为游标，只压缩未覆盖轮次；
-       已覆盖轮次不再重复合并（修复恒取 history_entries[0] 导致后续轮次永不进摘要的问题）
     
     Args:
         session_id: 会话ID
@@ -1837,6 +1836,31 @@ def append_session_message(session_id, role, content,
 
     if role == "user":
         stripped = content.strip()
+        # 记忆指令落库：忘记/更改类指令优先（互斥），命中则删除/更新长期记忆，
+        # 不再走"记住"落库；未命中再走 remember_to_long_term（记住/记得...）。
+        if stripped and not _is_noise(stripped):
+            forget_result = None
+            try:
+                forget_result = forget_memory(stripped)
+            except Exception as _mem_err:
+                log_operation(trace_id, user_id, session_id,
+                              "memory.forget.error", str(_mem_err)[:200])
+            if forget_result and forget_result.get("ok"):
+                log_operation(
+                    trace_id, user_id, session_id,
+                    "memory.forget.executed",
+                    f"trigger={forget_result.get('trigger')} "
+                    f"kind={forget_result.get('kind')} "
+                    f"deleted={len(forget_result.get('deleted', []))} "
+                    f"written={forget_result.get('written') or '-'}",
+                )
+            else:
+                # 未命中忘记/更改指令，走记住落库
+                try:
+                    remember_to_long_term(stripped)
+                except Exception as _mem_err:
+                    log_operation(trace_id, user_id, session_id,
+                                  "memory.remember.error", str(_mem_err)[:200])
         if len(stripped) >= _FACT_EXTRACT_MIN_LEN and not _is_noise(stripped):
             extract_facts_async(content, trace_id=trace_id, user_id=user_id,
                                 session_id=session_id)

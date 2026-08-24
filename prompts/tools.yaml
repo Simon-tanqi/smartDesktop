@@ -50,10 +50,10 @@ tools:
     tags: [filesystem, general]
 
   search_files:
-    desc: 按文件名关键词递归搜索文件（深度3层，跳过系统目录）
+    desc: 按文件名关键词递归搜索文件（默认优先项目根与工作区，深度放宽到10层；兜底用户目录及D/E/F盘仅3层）
     params:
       keyword: {type: str, desc: 文件名关键词}
-      search_path: {type: str, optional: true, desc: 搜索起始路径，默认用户目录及D/E/F盘}
+      search_path: {type: str, optional: true, desc: 搜索起始路径，默认项目根+工作区+用户目录及D/E/F盘}
       file_extensions: {type: list, optional: true, desc: '扩展名过滤如[".pdf"]'}
     note: max_results=5
     tier: 1
@@ -624,7 +624,6 @@ domains:
       - 音量
       - 亮度
       - 分辨率
-      # 2026-07-12 修复：扩同义词，让"声音/喇叭/扬声器/静音/sound/speaker/mute"等表达也能命中此域
       - 声音
       - 喇叭
       - 扬声器

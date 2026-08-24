@@ -722,12 +722,36 @@ class ToolExecutionPipeline:
         - P0/P1：返回 (确认消息, 挑战短语, 风险等级) — 调用方应弹出确认窗口
         - P2/P3：返回 (None, None, None) — 直接执行
 
+        单文件内容修改类工具（_SINGLE_FILE_EDIT_TOOLS：replace_in_file /
+        replace_in_text / edit_file / write_file）走动态定级，不读静态表：
+        - 目标在 C 盘非当前用户目录 → 返回 P0 直接拒绝（调用方不弹确认框，
+          直接返回拒绝结果，任务继续）
+        - 其余（C:\\Users\\<当前用户> 内或非 C 盘）→ 返回 P2 简单确认
+          （按钮确认，无挑战短语，单文件修改不升 P1）
+
         Returns:
             (msg, challenge_phrase, risk_level):
             - msg: 描述性确认消息
-            - challenge_phrase: 挑战短语（P1 带固定短语供前端渲染输入框；P0 为 None 渲染按钮）
-            - risk_level: "P0" / "P1" / None
+            - challenge_phrase: 挑战短语（P1 带固定短语供前端渲染输入框；P0/P2 为 None 渲染按钮）
+            - risk_level: "P0" / "P1" / "P2" / None
         """
+        # ── 单文件内容修改类工具：动态定级（覆盖静态表） ──
+        if tool_name in _SINGLE_FILE_EDIT_TOOLS:
+            args_preview = json.dumps(arguments, ensure_ascii=False)[:300]
+            _c_path = _check_single_file_edit_p0(tool_name, arguments)
+            if _c_path:
+                msg = (
+                    f"[安全拦截] 工具 '{tool_name}' 目标文件位于 C 盘非用户数据目录"
+                    f"（{_c_path}），风险等级 P0（最高风险）："
+                    f"C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止操作。"
+                )
+                return msg, None, "P0"
+            msg = (
+                f"[安全确认] 工具 '{tool_name}' 将修改文件，风险等级 P2（中风险，简单确认），"
+                f"参数：{args_preview}。"
+            )
+            return msg, None, "P2"
+
         risk = self._risk_levels.get(tool_name, "P3")
         if risk in ("P0", "P1"):
             args_preview = json.dumps(arguments, ensure_ascii=False)[:300]
@@ -1072,6 +1096,153 @@ def _build_tool_call_kwargs(func, arguments, confirmed_approved=False):
         return kwargs
 
 
+# ═══════════════════════════════════════════════════════════════
+#  敏感系统路径读取拦截（引擎层 Path A：P0/BLOCK，直接拒绝，不弹确认框）
+# ═══════════════════════════════════════════════════════════════
+
+# 读取类工具集合：所有文件内容读取 / 目录内容检索入口统一在引擎层拦截。
+# 命中 C:\Windows、C:\Program Files、C:\Program Files (x86)、C:\ProgramData
+# 及子目录的读取参数 → 直接返回拒绝结果，不弹确认框。
+_READ_TOOLS = {
+    "read_file", "search_content", "search_files",
+    "excel_read", "extract_word_text", "extract_presentation_info",
+    "get_project_summary",
+}
+
+# 复制类工具集合：将外部文件复制到工作区/其他位置的入口。
+# 命中 C:\Windows 等敏感系统路径即系统级拒绝（禁止通过"复制副本再读"绕过保护）。
+_COPY_TOOLS = {
+    "copy_file_to_workspace", "copy_file",
+}
+
+# 单文件内容修改类工具集合：风险等级动态化（不读静态表）。
+# - 目标在 C 盘且不在 C:\Users\<当前用户> 目录下 → P0 直接拒绝（不弹确认框）
+# - 目标在 C:\Users\<当前用户> 或非 C 盘 → P2 简单确认（单文件修改不升 P1）
+_SINGLE_FILE_EDIT_TOOLS = {
+    "replace_in_file", "replace_in_text", "edit_file", "write_file",
+}
+
+# 系统级拒绝固定文案：命中敏感系统路径后直接作为最终回复输出，不允许换工具重试。
+SENSITIVE_BLOCK_FINAL_REPLY = "内容不允许操作，如需操作请用户自行手动操作"
+
+# Windows 绝对路径识别（C:\... / C:/...）
+_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _extract_abs_paths(arguments: dict) -> List[str]:
+    """递归提取参数中所有形如 Windows 绝对路径（C:\\...）的字符串值。"""
+    paths: List[str] = []
+
+    def _scan(v):
+        if isinstance(v, str):
+            s = v.strip().strip("\"'`")
+            if _ABS_PATH_RE.match(s):
+                paths.append(s)
+        elif isinstance(v, dict):
+            for _v in v.values():
+                _scan(_v)
+        elif isinstance(v, (list, tuple)):
+            for _v in v:
+                _scan(_v)
+
+    for _v in (arguments or {}).values():
+        _scan(_v)
+    return paths
+
+
+def _check_sensitive_path_read(tool_name: str, arguments: dict) -> Optional[str]:
+    """读取类工具命中敏感读取根目录（仅 C:\Windows）时返回展示描述，否则 None。
+
+    兼容大小写、正反斜杠、尾随分隔符等变体；不误伤 C:\\Users 等用户目录。
+    读取语义已放宽：仅 C:\Windows 受保护，Program Files / ProgramData 允许读取。
+    """
+    if tool_name not in _READ_TOOLS:
+        return None
+    from .safety_policy import match_sensitive_read_root
+    for p in _extract_abs_paths(arguments):
+        hit = match_sensitive_read_root(p)
+        if hit:
+            return hit
+    return None
+
+
+def _check_sensitive_path_copy(tool_name: str, arguments: dict) -> Optional[str]:
+    """复制类工具命中复制保护根目录（四目录）时返回展示描述，否则 None。
+
+    仅检查源路径参数（source_path / source / path / file_path / src 等），
+    命中即系统级拒绝，杜绝"复制系统文件到工作区再读取"的绕过路径。
+    复制/修改/删除语义仍限制 C:\Windows、C:\Program Files、
+    C:\Program Files (x86)、C:\ProgramData 四目录。
+    """
+    if tool_name not in _COPY_TOOLS:
+        return None
+    from .safety_policy import match_sensitive_copy_root
+    _src_keys = {"source_path", "source", "src", "src_path", "path", "file_path"}
+    for k, v in (arguments or {}).items():
+        if str(k).lower() not in _src_keys:
+            continue
+        if not isinstance(v, str):
+            continue
+        hit = match_sensitive_copy_root(v)
+        if hit:
+            return hit
+    # 兜底：递归扫描所有绝对路径参数（覆盖嵌套结构/别名键）
+    for p in _extract_abs_paths(arguments):
+        hit = match_sensitive_copy_root(p)
+        if hit:
+            return hit
+    return None
+
+
+def _c_drive_non_user_abs_path(path: str) -> Optional[str]:
+    """返回 C 盘非当前用户目录的规范化绝对路径，否则 None。
+
+    动态定级规则（单文件内容修改类工具）：
+    - 目标在 C 盘且不在 C:\\Users\\<当前用户> 目录下 → 返回该绝对路径（P0 直接拒绝）；
+    - 目标在 C:\\Users\\<当前用户> 内或非 C 盘 → 返回 None（放行，走 P2 简单确认）。
+    """
+    if not path or not isinstance(path, str):
+        return None
+    s = path.strip().strip("\"'`")
+    if not _ABS_PATH_RE.match(s):
+        return None
+    try:
+        drive, _tail = os.path.splitdrive(s)
+        if drive.upper() != "C:":
+            return None
+        norm = os.path.normpath(s)
+        profile = os.path.normpath(os.environ.get("USERPROFILE", r"C:\Users\UnknownUser"))
+        # 当前用户目录本身及其子目录放行（用户数据文件夹）
+        if norm == profile or norm.startswith(profile + os.sep):
+            return None
+        return norm
+    except Exception:
+        return None
+
+
+def _check_single_file_edit_p0(tool_name: str, arguments: dict) -> Optional[str]:
+    """单文件内容修改类工具命中 C 盘非当前用户目录时返回路径描述，否则 None。
+
+    仅对 _SINGLE_FILE_EDIT_TOOLS 生效；兼容大小写、正反斜杠、尾随分隔符等变体；
+    不误伤 C:\\Users\\<当前用户> 用户数据文件夹与非 C 盘路径。
+    """
+    if tool_name not in _SINGLE_FILE_EDIT_TOOLS:
+        return None
+    _target_keys = {"file_path", "path", "target", "target_path", "src", "source_path"}
+    for k, v in (arguments or {}).items():
+        if str(k).lower() not in _target_keys:
+            continue
+        hit = _c_drive_non_user_abs_path(v)
+        if hit:
+            return hit
+    # 兜底：递归扫描所有绝对路径参数（覆盖嵌套结构/别名键）
+    for p in _extract_abs_paths(arguments):
+        hit = _c_drive_non_user_abs_path(p)
+        if hit:
+            return hit
+    return None
+
+
 def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                       full_content: str, full_reasoning: str,
                       _tl, _sl, cancel_event, confirmation_handler,
@@ -1215,10 +1386,93 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 yield from safe_final(engine,state, "任务已取消", outcome="cancelled")
                 return "return"
 
+            # ── 敏感系统路径拦截（P0/BLOCK：直接拒绝，不弹确认框，且任务整体中止） ──
+            # C:\Windows、C:\Program Files、C:\Program Files (x86)、C:\ProgramData
+            # 及子目录下的读取/复制一律拒绝；命中后任务直接中止并输出系统级最终回复，
+            # 禁止 Agent 换工具（execute_command / 复制副本等）重试绕过。
+            # 写入路径拦截走既有通道（此处不动）。
+            _sensitive_hit = _check_sensitive_path_read(tool_name, arguments)
+            if _sensitive_hit is None:
+                _sensitive_hit = _check_sensitive_path_copy(tool_name, arguments)
+            if _sensitive_hit:
+                _op_label = "读取" if tool_name in _READ_TOOLS else "复制"
+                yield engine.streamer.emit_step(
+                    f"安全策略：禁止{_op_label}系统目录文件（{_sensitive_hit}），该路径受硬保护。", "warning")
+                _block_result = {
+                    "success": False,
+                    "message": SENSITIVE_BLOCK_FINAL_REPLY,
+                    "details": {
+                        "路径": _sensitive_hit,
+                        "操作": _op_label,
+                        "说明": "C 盘稳定系统文件夹（Windows / Program Files / ProgramData）下的文件不允许任何操作",
+                    },
+                }
+                args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
+                if len(json.dumps(arguments, ensure_ascii=False)) > 500:
+                    args_preview += "..."
+                _tool_call_history.append({
+                    "name": tool_name, "args": args_preview,
+                    "status": "blocked", "result": f"敏感系统路径{_op_label}被拒绝（{_sensitive_hit}）"
+                })
+                step_msg = engine.tool_pipeline.build_step_summary(tool_name, arguments, "", "failed",
+                    f"敏感系统路径{_op_label}被拒绝（{_sensitive_hit}）", step)
+                _persist_tool_pair(engine, full_content, tool_call_id, tc, full_reasoning,
+                                   json.dumps(_block_result, ensure_ascii=False))
+                conversation_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "content": json.dumps(_block_result, ensure_ascii=False)
+                })
+                # ── 系统级 BLOCK → 任务直接中止（禁止换工具重试） ──
+                # 与"用户拒绝确认"区分：此为安全策略硬拦截，文案使用固定系统级拒绝语。
+                save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                tool_name, arguments, progress="安全策略拦截：敏感系统路径操作被拒绝",
+                                messages_param=conversation_messages)
+                yield from safe_final(engine, state, SENSITIVE_BLOCK_FINAL_REPLY,
+                                      outcome="blocked")
+                final_reply_saved = True
+                return "return"
+
             # ── 安全分级检查（P0/P1 需确认） ──
             risk_msg, challenge_phrase, risk_level = engine.tool_pipeline.check_tool_risk_level(tool_name, arguments)
             _confirm_approved = False
             if risk_msg:
+                # ── 单文件修改命中 C 盘非用户目录：P0 直接拒绝（不弹确认框，任务继续） ──
+                # 与敏感系统路径 BLOCK（中止任务）区分：此处仅拒绝本次单文件修改调用，
+                # 返回拒绝结果供 Agent 调整思路，不中止整个任务。
+                if risk_level == "P0" and tool_name in _SINGLE_FILE_EDIT_TOOLS:
+                    yield engine.streamer.emit_step(
+                        f"安全策略：{risk_msg}", "warning")
+                    _block_result = {
+                        "success": False,
+                        "message": "内容不允许操作，如需操作请用户自行手动操作",
+                        "details": {
+                            "路径": _check_single_file_edit_p0(tool_name, arguments),
+                            "操作": "修改",
+                            "说明": "C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止修改文件",
+                            "风险等级": "P0",
+                        },
+                    }
+                    args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
+                    if len(json.dumps(arguments, ensure_ascii=False)) > 500:
+                        args_preview += "..."
+                    _tool_call_history.append({
+                        "name": tool_name, "args": args_preview,
+                        "status": "blocked", "result": "C 盘非用户目录文件修改被拒绝（P0）"
+                    })
+                    step_msg = engine.tool_pipeline.build_step_summary(tool_name, arguments, "", "failed",
+                        "C 盘非用户目录文件修改被拒绝（P0）", step)
+                    _persist_tool_pair(engine, full_content, tool_call_id, tc, full_reasoning,
+                                       json.dumps(_block_result, ensure_ascii=False))
+                    conversation_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": json.dumps(_block_result, ensure_ascii=False)
+                    })
+                    return "continue"
+
                 yield engine.streamer.emit_reasoning(risk_msg)
                 # ── 确认缓存：同一工具+完整参数（120s 内）已确认过 → 直接放行，不再弹确认框 ──
                 # 注：key 绑定全部参数而非仅 file_path/path/command，避免不同 operation/key 的
@@ -1249,25 +1503,46 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                     else:
                         ok = bool(confirm_result.get("confirmed"))
                     if not ok:
-                        yield engine.streamer.emit_step(f"用户拒绝/挑战校验失败 '{tool_name}'，已跳过", "warning")
+                        # ── 修复3：区分"确认超时"与"用户拒绝"，中止文案与审计日志分开 ──
+                        # wait_for_confirmation 超时返回 {"confirmed": False, "timeout": True, ...}，
+                        # 用户拒绝返回 {"confirmed": False}（无 timeout 字段）。两者都中止任务，
+                        # 但超时属"用户短暂离开"，拒绝属"用户主动否决"，排查时需可区分。
+                        _abort_is_timeout = bool(confirm_result.get("timeout"))
+                        if _abort_is_timeout:
+                            _abort_label = "确认超时，任务已取消"
+                            _abort_progress = "确认超时，任务已取消"
+                        else:
+                            _abort_label = "用户拒绝确认，任务中止"
+                            _abort_progress = "用户拒绝导致任务中断"
+                        yield engine.streamer.emit_step(f"{_abort_label} '{tool_name}'", "warning")
                         args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
                         if len(json.dumps(arguments, ensure_ascii=False)) > 500:
                             args_preview += "..."
                         _tool_call_history.append({
                             "name": tool_name, "args": args_preview,
-                            "status": "rejected", "result": "用户拒绝/挑战校验失败"
+                            "status": "rejected", "result": _abort_label
                         })
                         step_msg = engine.tool_pipeline.build_step_summary(tool_name, arguments, "", "failed",
-                            f"用户拒绝/挑战校验失败 '{tool_name}'", step)
+                            f"{_abort_label} '{tool_name}'", step)
                         _persist_tool_pair(engine, full_content, tool_call_id, tc, full_reasoning,
-                                           json.dumps({"success": False, "message": "用户拒绝/挑战校验失败"}, ensure_ascii=False))
+                                           json.dumps({"success": False, "message": _abort_label}, ensure_ascii=False))
                         conversation_messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "name": tool_name,
-                            "content": json.dumps({"success": False, "message": "用户拒绝/挑战校验失败"}, ensure_ascii=False)
+                            "content": json.dumps({"success": False, "message": _abort_label}, ensure_ascii=False)
                         })
-                        return "continue"
+                        # ── 确认未通过 → 任务整体立即中止（禁止 Agent 换工具重试） ──
+                        # 返回 "return" 使 ReAct 主循环立即结束，不再发起任何后续工具调用；
+                        # 生成中止总结作为该任务的最终结果（文案随超时/拒绝区分）。
+                        save_checkpoint(engine, user_message, state, remaining_steps, step,
+                                        tool_name, arguments, progress=_abort_progress,
+                                        messages_param=conversation_messages)
+                        yield from safe_final(engine, state,
+                            f"{_abort_label}：已中止当前任务，不会继续执行任何后续操作。",
+                            outcome="cancelled")
+                        final_reply_saved = True
+                        return "return"
 
                     # ✅ 确认通过：按是否带挑战短语注入对应确认参数
                     # 注：已删除向 tools.system_tools._pending_confirmations 的预注册——
@@ -2202,7 +2477,8 @@ def handle_tool_success(engine, rs: RunState, state, tool_name: str, arguments: 
 
 def do_final_cleanup(engine, state, user_message: str, remaining_steps: list,
                       cancel_event, default_model: str, default_provider: str,
-                      model_id: str, temperature) -> Generator[str, None, None]:
+                      model_id: str, temperature,
+                      final_reply_saved: bool = False) -> Generator[str, None, None]:
     """循环结束后的收尾：生成进度摘要、保存checkpoint、yield最终结果。
 
     从 run() 主循环后提取，通过 yield from 委托。
@@ -2218,6 +2494,15 @@ def do_final_cleanup(engine, state, user_message: str, remaining_steps: list,
         get_logger().info("检测到取消信号，跳过最终进度摘要生成",
                           trace_id=engine.trace_id, session_id=engine.session_id)
         yield from safe_final(engine,state, "任务已取消", outcome="cancelled")
+        return
+
+    if final_reply_saved:
+        # 修复1：主循环内已产出最终回复（用户拒绝中止/确认超时/纯文本结束等路径），
+        # 此处仅需保持统一的收尾出口（do_final_cleanup 被调用），不再生成进度摘要、
+        # 不再重复保存 checkpoint 或产出最终结果——避免在用户拒绝后仍发起 LLM 摘要
+        # 调用（违背"已中止，不再执行后续操作"语义）或覆盖既有的中止 checkpoint。
+        get_logger().info("final_reply 已产出，跳过最终进度摘要生成",
+                          trace_id=engine.trace_id, session_id=engine.session_id)
         return
         
     if engine.completed_steps:

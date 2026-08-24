@@ -1,6 +1,5 @@
 """
-安全命令执行模块（全面修复版）
-
+安全命令执行模块
 防护层：
   L0: 路径硬拦截 — 修改类命令触碰受保护路径时拒绝（支持环境变量、通配符、相对路径）
   L1: 挑战短语验证 — 必须完整输入授权文本
@@ -325,12 +324,12 @@ def _check_protected_paths(command: str, cwd: str = None, args_list: list = None
                     
                     if start > 0:
                         prev_char = text[start - 1]
-                        if prev_char in [' ', '\t', '"', "'", '=', ':', '\\', '/', '|', ';', '>']:
+                        if prev_char in [' ', '\t', '"', "'", '=', ':', '\\', '/', '|', ';', '>'] or prev_char.isalnum():
                             is_path_context = True
                     
                     if end < len(text):
                         next_char = text[end]
-                        if next_char in [' ', '\t', '"', "'", '\\', '/', '|', ';', '>', ',', ')', ']']:
+                        if next_char in [' ', '\t', '"', "'", '\\', '/', '|', ';', '>', ',', ')', ']'] or next_char.isalnum():
                             is_path_context = True
                     
                     if start == 0:
@@ -352,12 +351,12 @@ def _check_protected_paths(command: str, cwd: str = None, args_list: list = None
                     
                     if start > 0:
                         prev_char = text[start - 1]
-                        if prev_char in [' ', '\t', '"', "'", '=', ':', '\\', '/', '|', ';', '>']:
+                        if prev_char in [' ', '\t', '"', "'", '=', ':', '\\', '/', '|', ';', '>'] or prev_char.isalnum():
                             is_path_context = True
                     
                     if end < len(text):
                         next_char = text[end]
-                        if next_char in [' ', '\t', '"', "'", '\\', '/', '|', ';', '>', ',', ')', ']']:
+                        if next_char in [' ', '\t', '"', "'", '\\', '/', '|', ';', '>', ',', ')', ']'] or next_char.isalnum():
                             is_path_context = True
                     
                     if start == 0:
@@ -502,7 +501,6 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
     内部确认标志（challenge_response/challenge_token/domain_confirmed/_skip_validation）
     由上层经 kwargs 透传，不出现在 LLM 可见的 JSON Schema 中。
     """
-    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
     # 入口统一兜底为 None（继承当前进程工作目录），使下方所有 cwd=working_dir 安全
     working_dir = working_dir or None
     # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）
@@ -760,7 +758,6 @@ def run_cmd(command_list, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="g
     内部确认标志（challenge_response/challenge_token）由上层经 kwargs 透传，
     不出现在 LLM 可见的 JSON Schema 中。
     """
-    # Bug 修复：LLM 偶发传 working_dir=""，subprocess cwd="" 在 Windows 抛 WinError 123，
     # 入口统一兜底为 None（继承当前进程工作目录），使下方所有 cwd=working_dir 安全
     working_dir = working_dir or None
     # 内部标志：由 execute_command 透传（kwargs 吸收，schema 不暴露）

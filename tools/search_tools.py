@@ -441,17 +441,35 @@ def _multi_source_search(query: str, max_results: int, market: str = "zh-CN") ->
 # ═══════════════════════════════════════════════════════
 @register_tool
 def search_files(keyword: str, search_path: str = None, file_extensions: list = None) -> str:
-    """按文件名关键词递归搜索文件（深度3层，跳过系统目录，max_results=5）。keyword: 文件名关键词, search_path: 搜索起始路径（可选，默认用户目录及D/E/F盘）, file_extensions: 扩展名过滤如[".pdf"]（可选）"""
+    """按文件名关键词递归搜索文件（默认优先项目根与工作区，兜底用户目录及D/E/F盘，深度限制，跳过系统目录，max_results=5）。keyword: 文件名关键词, search_path: 搜索起始路径（可选，默认项目根+工作区+用户目录及D/E/F盘）, file_extensions: 扩展名过滤如[".pdf"]（可选）"""
     import fnmatch
 
-    # 默认搜索路径
+    # 默认搜索路径：项目根/工作区优先（可信根，放宽深度），用户目录与 D/E/F 盘兜底（保持浅层限制）
+    MAX_DEPTH = 3            # 盘根/用户目录等大范围搜索的深度上限
+    TRUSTED_MAX_DEPTH = 10   # 项目根/工作区等可信根放宽到 10 层
+    MAX_RESULTS = 5
+
+    trusted_roots = []
     if not search_path:
         candidates = []
-        # 用户目录
+        # 1) 项目根（本文件 tools/ 的上级，即代码仓库根）
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if os.path.isdir(project_root):
+            candidates.append(project_root)
+            trusted_roots.append(os.path.normpath(project_root))
+        # 2) 工作区（DATA_DIR/workspace）
+        try:
+            from .code_tools import WORKSPACE_ROOT as _ws_root
+        except Exception:
+            _ws_root = None
+        if _ws_root and os.path.isdir(_ws_root):
+            candidates.append(_ws_root)
+            trusted_roots.append(os.path.normpath(_ws_root))
+        # 3) 用户目录
         user_dir = os.path.expanduser("~")
         if os.path.isdir(user_dir):
             candidates.append(user_dir)
-        # D/E/F盘
+        # 4) D/E/F盘
         for drive in ["D:", "E:", "F:"]:
             dp = f"{drive}\\"
             if os.path.isdir(dp):
@@ -463,29 +481,38 @@ def search_files(keyword: str, search_path: str = None, file_extensions: list = 
                 "success": False,
                 "message": f"搜索路径不存在: {search_path}"
             }, ensure_ascii=False)
+        # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）：禁止显式搜索系统目录
+        from core.safety_policy import match_sensitive_read_root
+        _sensitive_hit = match_sensitive_read_root(search_path)
+        if _sensitive_hit:
+            return json.dumps({
+                "success": False,
+                "message": f"安全策略：禁止搜索系统目录（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
+            }, ensure_ascii=False)
         search_paths = [search_path]
 
     # 系统目录黑名单
     SKIP_DIRS = {
         "Windows", "System32", "SystemRoot", "Program Files", "Program Files (x86)",
-        "AppData", "$Recycle.Bin", "Recovery", "Config.Msi", "Boot",
+        "AppData", "$Recycle.Bin", "$RECYCLE.BIN", "Recovery", "Config.Msi", "Boot",
         "ProgramData", "Common Files", "Microsoft.NET", "assembly", "WinSxS",
         "node_modules", ".git", ".svn", "__pycache__", "venv", ".venv"
     }
 
     results = []
-    MAX_DEPTH = 3
-    MAX_RESULTS = 5
+    search_paths = [os.path.normpath(p) for p in search_paths]
 
     for base in search_paths:
         if len(results) >= MAX_RESULTS:
             break
         base = os.path.normpath(base)
+        is_trusted = base in trusted_roots or any(base.startswith(r + os.sep) for r in trusted_roots)
+        effective_max_depth = TRUSTED_MAX_DEPTH if is_trusted else MAX_DEPTH
         try:
             for root, dirs, files in os.walk(base):
                 # 深度限制
                 depth = root[len(base):].count(os.sep) if root != base else 0
-                if depth >= MAX_DEPTH:
+                if depth >= effective_max_depth:
                     dirs[:] = []
                     continue
 

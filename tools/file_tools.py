@@ -105,6 +105,23 @@ def resolve_folder(parent_dir: str, target_name: str):
 def copy_file_to_workspace(source_path: str, dest_filename: str = None):
     """将外部文件复制到工作区（workspace）。source_path: 源文件绝对路径, dest_filename: 目标文件名（可选，默认使用源文件名）"""
     from .code_tools import _ensure_workspace
+    from core.safety_policy import match_sensitive_copy_root
+    
+    # 敏感系统路径硬拦截（工具层 Path B）：C:\Windows、C:\Program Files、
+    # C:\Program Files (x86)、C:\ProgramData 不允许复制（复制语义四目录保护），
+    # 命中直接拒绝（系统级文案），禁止通过"复制副本再读"绕过读取保护。
+    # 注：读取语义已放宽（仅 C:\Windows），但复制仍保持四目录限制。
+    _sensitive_hit = match_sensitive_copy_root(source_path)
+    if _sensitive_hit:
+        return json.dumps({
+            "success": False,
+            "message": "内容不允许操作，如需操作请用户自行手动操作",
+            "details": {
+                "路径": _sensitive_hit,
+                "操作": "复制",
+                "说明": "C 盘稳定系统文件夹（Windows / Program Files / ProgramData）下的文件不允许任何操作",
+            },
+        }, ensure_ascii=False)
     
     try:
         if not os.path.exists(source_path):
@@ -142,6 +159,23 @@ def copy_file_to_workspace(source_path: str, dest_filename: str = None):
         
     except Exception as e:
         return json.dumps({"success": False, "message": f"复制失败: {str(e)}"}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  预留接口：工作区副本修改后覆写原始路径（未来方案，未实现）
+# ═══════════════════════════════════════════════════════════════
+def apply_workspace_edit(source_path: str, dest_filename: str = None) -> str:
+    """【预留接口 · 未实现】承载未来"原始路径 → 复制到工作区 → 修改副本 → 用户确认 → 覆写原始路径"流程。
+
+    TODO（未来实现）：
+      1. 校验副本与原始路径归属：原始路径须在允许操作范围内，副本须位于 workspace 内；
+      2. 依据确认开关 confirm_override（config.confirm_override）决定跳过人工确认或弹出确认；
+      3. 用户确认后，将工作区副本内容原子覆写回原始路径。
+
+    当前仅占位：不注册为工具（无 @register_tool）、不接入任何工具调用链，
+    调用直接抛出 NotImplementedError，禁止在现有流程中引用。
+    """
+    raise NotImplementedError("apply_workspace_edit 为预留接口，尚未实现，禁止接入工具调用链。")
 
 
 # ==================== Excel 高级处理工具 ====================
@@ -450,10 +484,23 @@ def excel_batch_process(directory: str, operations: list = None):
 @register_tool(timeout=60)
 def excel_read(file_path: str, sheet_name: str = None, max_rows: int = 100, start_row: int = 0):
     """读取Excel数据，返回JSON格式。file_path: Excel文件路径, sheet_name: 工作表名(默认第一个), max_rows: 最大读取行数, start_row: 起始行"""
+    # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）
+    from core.safety_policy import match_sensitive_read_root
+    _sensitive_hit = match_sensitive_read_root(str(file_path))
+    if _sensitive_hit:
+        return json.dumps({
+            "success": False,
+            "message": f"安全策略：禁止读取系统目录文件（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
+        }, ensure_ascii=False)
+
     import pandas as pd
 
     try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=start_row, nrows=max_rows)
+        # pandas read_excel 不支持 .csv，需按扩展名分派 read_csv
+        if str(file_path).lower().endswith(".csv"):
+            df = pd.read_csv(file_path, skiprows=start_row, nrows=max_rows)
+        else:
+            df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=start_row, nrows=max_rows)
         
         if isinstance(df, dict):
             first_sheet = list(df.keys())[0]

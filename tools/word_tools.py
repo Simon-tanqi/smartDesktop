@@ -517,6 +517,15 @@ def add_word_content(file_path: str, content_type: str, content_config: dict):
 @register_tool(timeout=60)
 def extract_word_text(file_path: str):
     """提取Word文档文本内容。file_path: 文档路径"""
+    # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）
+    from core.safety_policy import match_sensitive_read_root
+    _sensitive_hit = match_sensitive_read_root(str(file_path))
+    if _sensitive_hit:
+        return json.dumps({
+            "success": False,
+            "message": f"安全策略：禁止读取系统目录文件（{_sensitive_hit}）。该路径受硬保护，不允许读取。"
+        }, ensure_ascii=False)
+
     if not WORD_AVAILABLE:
         return json.dumps({
             "success": False, "code": "DEPENDENCY_MISSING",

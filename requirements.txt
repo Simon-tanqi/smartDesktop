@@ -29,6 +29,7 @@ json_repair==0.61.7
 keyring==25.7.0
 limits==5.8.0
 lxml==6.1.1
+matplotlib==3.11.1
 MarkupSafe==3.0.3
 more-itertools==11.1.0
 MouseInfo==0.1.3

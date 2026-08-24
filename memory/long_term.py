@@ -8,6 +8,8 @@ v4：
 import os
 import re
 import json
+import shutil
+import tempfile
 import datetime
 import threading
 
@@ -212,6 +214,255 @@ def append_custom_skill(skill_key, text):
     _invalidate_cache(filepath)
 
 
+# 记忆指令触发词：用户明确要求记住/记下某信息时，同步写入长期记忆
+# 原有触发词：需分隔符（：:，,、空格）后跟正文，行为保持不变
+_MEMORY_TRIGGER_RE = re.compile(
+    r"(记住|记得|请记下|记一下|帮我记)[：:，,、\s]+(.+)"
+)
+# 新增触发词：命中即触发，不要求分隔符（分隔符或非分隔符均取其后内容）
+_MEMORY_TRIGGER_RE_NO_SEP = re.compile(
+    r"(牢记|记着|别忘了|请记一下|麻烦记一下)(.*)"
+)
+
+
+def _strip_leading_punct(text):
+    """去掉字符串首部空白与常见标点，保留正文。"""
+    if not text:
+        return text
+    return re.sub(
+        r'^[\s：:，,、。；;！？!?\'"《》（）【】\[\]()]+', '', text
+    ).strip()
+
+
+def extract_memory_command(user_message):
+    """从用户消息中提取"记住"类记忆指令内容。
+
+    命中格式：
+    - 原有词：记住：xxx / 记得：xxx / 请记下 xxx / 记一下 xxx / 帮我记 xxx（需分隔符）
+    - 新增词：牢记/记着/别忘了/请记一下/麻烦记一下 后不检测分隔符，直接取其后内容，
+      并清理首部空白/标点（如"别忘了，xxx"→"xxx"）
+    返回要写入长期记忆的正文；非记忆指令或"记住这次/牢记这次"（技能内化触发词，
+    与 tools/skill_learning.py 冲突）返回 None。
+    """
+    if not user_message or not user_message.strip():
+        return None
+    stripped = user_message.strip()
+    if stripped.startswith("记住这次"):
+        return None
+    # 原有触发词：需分隔符
+    m = _MEMORY_TRIGGER_RE.search(stripped)
+    if m:
+        cmd = m.group(2).strip()
+        if cmd.startswith("这次"):
+            return None
+        return cmd if cmd else None
+    # 新增触发词：不检测分隔符，取其后内容并清理首部空白/标点
+    m2 = _MEMORY_TRIGGER_RE_NO_SEP.search(stripped)
+    if m2:
+        cmd = _strip_leading_punct(m2.group(2))
+        if cmd.startswith("这次"):
+            return None
+        return cmd if cmd else None
+    return None
+
+
+def remember_to_long_term(user_message):
+    """记忆指令落库：命中触发词时同步写入长期记忆（事实文件）。
+
+    返回是否写入成功；非记忆指令返回 False。格式保留原始正文，
+    确保后续 get_relevant_memory 可按语义检索。
+    """
+    cmd = extract_memory_command(user_message)
+    if not cmd:
+        return False
+    append_fact(f"【用户指定】记住：{cmd}")
+    return True
+
+
+# ============ 忘记/清除/更改机制 ============
+# 触发词覆盖常见清除/忘记/更改场景
+_FORGET_TRIGGER_WORDS = ("忘记", "忘掉", "清除", "删除", "移除", "取消", "改掉", "不记得了")
+_UPDATE_TRIGGER_WORDS = ("更改", "修改", "更新", "替换", "变成", "改为", "记错了")
+# 清除指令中可剥离的尾部修饰词
+_FORGET_TAIL_SUFFIXES = ("的记忆", "这条记忆", "这条", "这些", "相关内容", "相关记忆", "这个", "吧", "了")
+# 更改/更正类指令中，旧值与新值之间的分隔符（"不是"为更正语义，前后互换）
+_UPDATE_SEP_RE = re.compile(r"(不是|改成|改为|变成|更新为|替换为|为)")
+
+
+def _forget_keywords(src):
+    """从关键词源生成匹配关键词：整段优先，核心词兜底（仅保留 3 字及以上，防误删）。"""
+    if not src:
+        return []
+    kws = [src]
+    for w in _extract_keywords(src):
+        if len(w) >= 3 and w not in kws:
+            kws.append(w)
+    return kws
+
+
+def _clean_forget_tail(src):
+    """剥离清除指令尾部的修饰词，得到纯关键词源。"""
+    for suffix in _FORGET_TAIL_SUFFIXES:
+        if src.endswith(suffix):
+            src = src[:-len(suffix)]
+            break
+    return _strip_leading_punct(src).strip()
+
+
+def _parse_forget(text, trigger, idx, rest):
+    """解析纯删除类指令，返回 keywords 列表。"""
+    if idx > 0 and "把" in text[:idx]:
+        ba = text.rfind("把", 0, idx)
+        src = text[ba + 1:idx].strip()
+    else:
+        src = rest
+    src = _clean_forget_tail(src)
+    return _forget_keywords(src)
+
+
+def _parse_update(text, trigger, idx, rest):
+    """解析更改/更正类指令，返回 (keywords, new_text)。"""
+    m = _UPDATE_SEP_RE.search(rest)
+    if not m:
+        return _forget_keywords(rest), rest
+    sep = m.group(0)
+    before = _strip_leading_punct(rest[:m.start()].strip())
+    after = rest[m.end():].strip()
+    if sep == "不是":
+        # 更正语义："X 不是 Y" → 删除旧值 Y，写入新值 X
+        old_src, new_text = after, before
+    else:
+        old_src, new_text = before, after
+    if not re.search(r'[\u4e00-\u9fff]', new_text):
+        # 新值无中文（如纯英文/数字名），组合成完整条目避免信息丢失
+        new_text = f"{old_src}{sep}{new_text}"
+    return _forget_keywords(old_src), new_text
+
+
+def parse_forget_command(user_message):
+    """解析忘记/清除/更改记忆指令。
+
+    返回 dict：{trigger, kind, keywords, new_text}
+    - kind="forget"：仅删除匹配条目
+    - kind="update"：删除旧条目并写入 new_text
+    非忘记类指令返回 None。
+    """
+    if not user_message or not user_message.strip():
+        return None
+    stripped = user_message.strip()
+    for word in _FORGET_TRIGGER_WORDS:
+        idx = stripped.find(word)
+        if idx >= 0:
+            return {
+                "trigger": word,
+                "kind": "forget",
+                "keywords": _parse_forget(stripped, word, idx,
+                                          stripped[idx + len(word):].strip()),
+                "new_text": None,
+            }
+    for word in _UPDATE_TRIGGER_WORDS:
+        idx = stripped.find(word)
+        if idx >= 0:
+            keywords, new_text = _parse_update(
+                stripped, word, idx, stripped[idx + len(word):].strip())
+            return {
+                "trigger": word,
+                "kind": "update",
+                "keywords": keywords,
+                "new_text": new_text,
+            }
+    return None
+
+
+def _backup_file(filepath):
+    """删除前备份记忆文件到系统临时目录，失败返回 None。"""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = os.path.join(tempfile.gettempdir(), "smartDesktop_memory_backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_path = os.path.join(
+            backup_dir, f"backup_{os.path.basename(filepath)}_{ts}")
+        shutil.copy2(filepath, backup_path)
+        return backup_path
+    except OSError:
+        return None
+
+
+def remove_memory_lines(filepath, keywords):
+    """从记忆文件删除包含任一关键词的条目行，保留标题/空行结构。
+
+    删除前先备份；返回 (deleted_lines, backup_path)；无匹配或备份失败返回 ([], None)。
+    """
+    if not keywords or not os.path.exists(filepath):
+        return [], None
+    lock = _get_lock(filepath)
+    with lock:
+        with open(filepath, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+    deleted = []
+    kept = []
+    for line in all_lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            kept.append(line)
+            continue
+        if any(kw and kw.lower() in stripped.lower() for kw in keywords):
+            deleted.append(stripped)
+        else:
+            kept.append(line)
+    if not deleted:
+        return [], None
+    backup_path = _backup_file(filepath)
+    if backup_path is None:
+        return [], None  # 备份失败，拒绝删除
+    with lock:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+    _invalidate_cache(filepath)
+    return deleted, backup_path
+
+
+def forget_memory(user_message):
+    """忘记/清除/更改长期记忆（facts/projects/skills/user 四文件）。
+
+    返回 dict：
+    - ok: 是否执行了删除或写入
+    - trigger/kind/keywords: 解析结果
+    - deleted: [{"file": 文件名, "lines": [被删除行...]}, ...]
+    - backups: 备份文件路径列表
+    - written: 更改场景写入的新内容（None 表示未写入）
+    """
+    parsed = parse_forget_command(user_message)
+    if not parsed:
+        return {
+            "ok": False, "trigger": None, "kind": None,
+            "keywords": [], "deleted": [], "backups": [], "written": None,
+        }
+    deleted = []
+    backups = []
+    for fp in (FACTS_MD, PROJECTS_MD, SKILLS_MD, USER_MD):
+        lines, backup = remove_memory_lines(fp, parsed["keywords"])
+        if lines:
+            deleted.append({"file": os.path.basename(fp), "lines": lines})
+        if backup:
+            backups.append(backup)
+    written = None
+    if parsed["kind"] == "update" and parsed["new_text"]:
+        append_fact(parsed["new_text"])
+        written = parsed["new_text"]
+    return {
+        "ok": bool(deleted) or written is not None,
+        "trigger": parsed["trigger"],
+        "kind": parsed["kind"],
+        "keywords": parsed["keywords"],
+        "deleted": deleted,
+        "backups": backups,
+        "written": written,
+    }
+
+
 def read_skills(limit=20):
     """读取技能记录，返回最近 limit 条"""
     lines = _read_lines(SKILLS_MD)
@@ -248,7 +499,11 @@ def list_custom_skill_files():
 
 
 def _extract_keywords(text):
-    """提取关键词：去标点、去停用词、保留2字以上有意义的词"""
+    """提取关键词：去标点、去停用词、保留2字以上有意义的词。
+
+    对连续中文长片段（>4字）额外做 2-4 字滑窗，生成子串候选词，
+    避免"整段当一词"导致短查询词（如"项目代号"）无法命中。
+    """
     clean = re.sub(r'[^\w\u4e00-\u9fff]', ' ', text)
     words = re.findall(r'[\w\u4e00-\u9fff]+', clean)
     stopwords = {
@@ -263,7 +518,26 @@ def _extract_keywords(text):
         "因为", "所以", "但", "是", "不", "如果", "虽然", "然后", "而且",
         "或者", "还是", "但是", "可以", "应该", "需要", "经过", "通过",
     }
-    return [w for w in words if w.lower() not in stopwords and len(w) >= 2]
+    result = []
+    for w in words:
+        w_lower = w.lower()
+        if w_lower in stopwords or len(w) < 2:
+            continue
+        if re.search(r'[\u4e00-\u9fff]', w) and len(w) > 4:
+            # 中文长片段：2-4 字滑窗生成子串候选，扩大召回
+            seen = set()
+            for n in (4, 3, 2):
+                for i in range(len(w) - n + 1):
+                    seg = w[i:i + n]
+                    if seg in stopwords or seg in seen:
+                        continue
+                    seen.add(seg)
+                    result.append(seg)
+        else:
+            result.append(w)
+    # 去重并限制数量（倒排索引关键词上限）
+    dedup = list(dict.fromkeys(result))
+    return dedup[:50]
 
 
 def get_relevant_memory(user_message, max_chars=MAX_RELEVANT_MEMORY_CHARS):
