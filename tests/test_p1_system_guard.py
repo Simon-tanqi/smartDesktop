@@ -60,7 +60,7 @@ def test_net_readonly_query_allowed():
     try:
         assert _classify(_exec("net view")) == "ALLOW"
         assert _classify(_exec("net user")) == "ALLOW"
-        assert _classify(_exec("net user Tankq")) == "ALLOW"
+        assert _classify(_exec("net user username")) == "ALLOW"
         assert _classify(_exec("net accounts")) == "ALLOW"
         assert _classify(_exec("net statistics workstation")) == "ALLOW"
         assert _classify(_exec("net session")) == "ALLOW"
@@ -76,11 +76,11 @@ def test_net_write_operations_challenge():
         assert _classify(_exec("net stop spooler")) == "P1_CHALLENGE"
         assert _classify(_exec("net start WSearch")) == "P1_CHALLENGE"
         assert _classify(_exec("net use Z: \\\\server\\share")) == "P1_CHALLENGE"
-        assert _classify(_exec("net user Tankq P@ss /add")) == "P1_CHALLENGE"
-        assert _classify(_exec("net user Tankq /delete")) == "P1_CHALLENGE"
+        assert _classify(_exec("net user username P@ss /add")) == "P1_CHALLENGE"
+        assert _classify(_exec("net user username /delete")) == "P1_CHALLENGE"
         assert _classify(_exec("net share temp=C:\\tmp")) == "P1_CHALLENGE"
         assert _classify(_exec("net share temp /delete")) == "P1_CHALLENGE"
-        assert _classify(_exec("net localgroup Administrators Tankq /add")) == "P1_CHALLENGE"
+        assert _classify(_exec("net localgroup Administrators username /add")) == "P1_CHALLENGE"
     finally:
         p1.stop(); p2.stop()
 

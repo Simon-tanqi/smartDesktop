@@ -92,7 +92,7 @@ def test_hkcu_low_risk_with_pipe_blocked():
     p1, p2 = _mock_exec()
     try:
         res = _classify(_exec(
-            'reg add "HKCU\\Software\\Test" /v HideFileExt /d 1 /f | Remove-Item -Recurse -Force C:\\Users\\Tankq\\x'))
+            'reg add "HKCU\\Software\\Test" /v HideFileExt /d 1 /f | Remove-Item -Recurse -Force C:\\Users\\username\\x'))
         assert res in ("P1_CHALLENGE", "REJECT")
     finally:
         p1.stop(); p2.stop()
@@ -120,7 +120,7 @@ def test_hkcu_low_risk_non_reg_first_token_blocked():
             'echo reg add "HKCU\\Software\\Test" /v HideDesktopIcons /d 1 /f')) == "ALLOW"
         # echo + 管道夹带删除 → 不放行
         res = _classify(_exec(
-            'echo reg add "HKCU\\Software\\Test" /v HideDesktopIcons /d 1 /f | Remove-Item -Force C:\\Users\\Tankq\\a.txt'))
+            'echo reg add "HKCU\\Software\\Test" /v HideDesktopIcons /d 1 /f | Remove-Item -Force C:\\Users\\username\\a.txt'))
         assert res in ("P1_CHALLENGE", "P2_CONFIRM", "REJECT")
     finally:
         p1.stop(); p2.stop()
@@ -149,7 +149,7 @@ def test_reg_query_still_allowed():
 def test_normal_commands_still_work():
     p1, p2 = _mock_exec()
     try:
-        assert _classify(_exec("dir C:\\Users\\Tankq\\Desktop")) == "ALLOW"
+        assert _classify(_exec("dir C:\\Users\\username\\Desktop")) == "ALLOW"
         assert _classify(_exec("echo hello")) == "ALLOW"
         assert _classify(_exec("systeminfo")) == "ALLOW"
         assert _classify(_exec("net view")) == "ALLOW"

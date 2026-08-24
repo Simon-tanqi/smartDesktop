@@ -106,7 +106,7 @@ def test_sensitive_dir_write_block():
         assert _classify(res) == "BLOCK"
         assert res.get("stop") is True
         assert _classify(_exec(f'Add-Content {USERPROFILE}\\.env "x"')) == "BLOCK"
-        assert _classify(_exec('Out-File -FilePath "C:\\Users\\Tankq\\.git\\config" -InputObject "x"')) == "BLOCK"
+        assert _classify(_exec(f'Out-File -FilePath "{USERPROFILE}\\.git\\config" -InputObject "x"')) == "BLOCK"
     finally:
         p1.stop(); p2.stop()
 
@@ -129,10 +129,10 @@ def test_check_danger_merged_challenge():
     try:
         assert _classify(_exec("Start-Process notepad")) == "P1_CHALLENGE"
         # cmd /c del 用户文件：既有 C 盘删除规则优先（引号路径未识别为当前用户目录）→ REJECT，命令仍被拦截
-        assert _classify(_exec('cmd /c "del C:\\Users\\Tankq\\a.txt"')) == "REJECT"
+        assert _classify(_exec(f'cmd /c "del {USERPROFILE}\\a.txt"')) == "REJECT"
         # readonly 白名单（echo）携带管道组合不得整体放行：删除分类分支先命中 →
         # 单文件当前用户目录删除 P2 确认（命令被拦截需用户确认，不再 ALLOW）
-        assert _classify(_exec("echo hello | Remove-Item C:\\Users\\Tankq\\a.txt")) == "P2_CONFIRM"
+        assert _classify(_exec(f"echo hello | Remove-Item {USERPROFILE}\\a.txt")) == "P2_CONFIRM"
         assert _classify(_exec("echo x; reg add HKLM\\Software\\Foo /v Bar /d 1")) == "REJECT"
     finally:
         p1.stop(); p2.stop()
@@ -146,7 +146,7 @@ def test_normal_commands_allow():
         assert _classify(_exec("dir C:\\")) == "ALLOW"
         assert _classify(_exec("git status")) == "ALLOW"
         assert _classify(_exec("pip install requests")) == "ALLOW"
-        assert _classify(_exec("python C:\\Users\\Tankq\\script.py")) == "ALLOW"
+        assert _classify(_exec(f"python {USERPROFILE}\\script.py")) == "ALLOW"
         # 用户目录内删除仍走既有 P2（不受新增检查影响）
         assert _classify(_exec(f"Remove-Item {USERPROFILE}\\Desktop\\old.txt")) == "P2_CONFIRM"
     finally:
