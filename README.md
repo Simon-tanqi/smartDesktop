@@ -6,12 +6,24 @@
 
 个人 AI Agent 助手，基于 ReAct（Reasoning + Acting）模式的本地智能代理。支持多模型后端、工具动态注册、分层记忆系统与 BM25 上下文路由。
 
+**一句话定位**：在纯本地运行、带四层记忆与断点续传能力的 ReAct 桌面 Agent——让"会思考、有记忆、能执行、可续传"的智能助手直接跑在你自己的电脑上。
+
+**亮点速览**
+
+- 152 项 CI 自动化测试全绿（全仓 351 个测试用例），覆盖 ReAct 循环、记忆压缩、安全预检与工具注册
+- 自研零依赖 BM25 上下文路由，无向量模型、无外部依赖、完全离线
+- 四层记忆体系 + LLM 增量压缩，长对话不失忆
+- 15 个内置工具模块按需注册，安全沙箱 + P0-P3 风险分级确认
+- 任务检查点恢复，意外中断后可精确断点续传
+
+**演示动图**：见下方 [演示](#演示) 区（基础对话 / 工具思考 / 安全拦截 / 记忆召回）。
+
 ## 核心亮点
 
 - **自研零依赖上下文路由**：基于 Okapi BM25 的纯统计任务切换检测（memory/context_router.py），无向量模型、无外部依赖、完全离线，中文 bigram + 单字分词
 - **四层记忆体系**：工作记忆 / 情节缓存 / 历史摘要 / 长期记忆分层组织，LLM 增量压缩控制 Token 预算，长对话不失忆
 - **任务检查点恢复**：SQLite 持久化检查点，任务意外中断后可精确断点续传
-- **动态技能域加载**：12 类内置工具按需注册，加载后下一轮对话即获得该域全部能力
+- **动态技能域加载**：15 个内置工具模块按需注册，加载后下一轮对话即获得该域全部能力
 - **三层递进式熔断**：循环检测 + 同名失败计数 + 全局失败上限，防止工具调用死循环
 - **安全执行沙箱**：safe_exec 命令预检拦截 + 风险分级确认（P0-P3）
 
@@ -212,6 +224,8 @@ MAX_CONTEXT_TOKENS = 28000
 | `skill_learning.py` | 技能学习/经验内化 |
 | `post_action_verify.py` | 操作后状态验证 |
 | `screenshot_tools.py` | 截图工具 |
+| `side_effect_journal.py` | 副作用操作日志 |
+| `skill_fixation.py` | 技能固化（技能学习内化） |
 
 ### 任务检查点与恢复
 
@@ -239,18 +253,27 @@ smartDesktop/
 ├── logger.py                   # 日志系统
 │
 ├── core/                       # 核心引擎
-│   ├── react_engine.py         # ReAct 推理-行动循环引擎（~1700 行）
+│   ├── agent.py                # 核心 Agent 调度
+│   ├── react_engine.py         # ReAct 推理-行动循环引擎（~457 行）
 │   ├── agent_state.py          # 任务状态管理、检查点持久化
 │   ├── streaming.py            # SSE 流式输出格式化
 │   ├── tool_data_provider.py   # 工具数据提供者（schema 管理、域匹配）
+│   ├── intent_router.py        # 意图路由（L1 直连 / L2 LLM 识别）
+│   ├── safety_policy.py        # 安全策略（风险分级 P0-P3）
+│   ├── message_builder.py      # 消息上下文组装
+│   ├── progress_controller.py  # 任务进度控制
+│   ├── confirmation_manager.py # 用户确认流程管理
+│   ├── plan.py                 # 任务计划数据结构
+│   ├── planner.py              # 任务规划器
 │   └── logger.py               # 上下文构建器专用日志
 │
 ├── memory/                     # 记忆系统
-│   ├── session.py              # 会话管理、上下文构建（build_context_messages）(~1175 行)
+│   ├── session.py              # 会话管理、上下文构建（build_context_messages）(~1968 行)
 │   ├── long_term.py            # 长期记忆：Markdown 存储 + 关键词检索
 │   ├── compressor.py           # LLM 压缩：多轮对话 → 自然语言摘要
 │   ├── extractor.py            # 事实提取：自动抽取用户信息、偏好、技能
 │   ├── context_router.py       # BM25 上下文路由：纯统计任务切换检测
+│   ├── episode_store.py        # 情节缓存：会话内结构化交互存储
 │   ├── llm.py                  # 记忆系统 LLM 调用封装
 │   ├── config.py               # 记忆策略配置（路径 / 常量 / YAML 加载）
 │   ├── config/
@@ -273,7 +296,9 @@ smartDesktop/
 │   ├── safe_exec.py            # 安全命令执行沙箱
 │   ├── skill_learning.py       # 技能经验内化
 │   ├── post_action_verify.py   # 操作验证
-│   └── screenshot_tools.py     # 截图
+│   ├── screenshot_tools.py     # 截图
+│   ├── side_effect_journal.py  # 副作用操作日志
+│   └── skill_fixation.py       # 技能固化
 │
 ├── config/                     # 全局配置
 │   ├── settings.py             # 常量定义（超时、模型预设、熔断参数）
@@ -285,6 +310,8 @@ smartDesktop/
 │   ├── chat.py                 # 聊天 API
 │   ├── routing.py              # 路由匹配
 │   ├── upload_api.py           # 文件上传
+│   ├── rate_limiter.py         # 请求限流
+│   ├── services.py             # 业务服务层
 │   └── experience_db.py        # 经验内化数据库
 │
 ├── web/                        # Web 前端
@@ -303,7 +330,6 @@ smartDesktop/
 │   │   ├── architect.md
 │   │   ├── boss.md
 │   │   ├── code_review.md
-│   │   ├── debugger.md
 │   │   ├── growth.md
 │   │   ├── plan.md
 │   │   └── product_manager.md
@@ -313,12 +339,10 @@ smartDesktop/
 │       ├── db_query.md
 │       ├── general_chat.md
 │       ├── office_ppt.md
+│       ├── office_word.md
 │       ├── system_config.md
 │       ├── user_memory.md
 │       └── web_browse.md
-│
-├── agent_skills/               # Agent 技能定义
-│   └── agent_tools.yaml
 │
 ├── ppt_generator/              # HTML→PPTX 渲染引擎
 │   ├── renderer.py             # 核心渲染器
@@ -330,9 +354,11 @@ smartDesktop/
 │   └── error_mapper.py         # 错误映射与翻译
 │
 ├── docs/                       # 项目文档
-│   ├── 经验内化功能完整文档.md
-│   ├── skill_learning_guide.md
-│   └── ...
+│   ├── PRD.md                  # 产品需求文档
+│   ├── TechnicalDesign.md      # 技术设计文档
+│   ├── TEST_SUITE.md           # 测试套件说明
+│   ├── agent_test_suite.md     # Agent 行为测试套件
+│   └── ROADMAP.md              # 开源路线图
 │
 └── scripts/                    # 工具脚本
     └── setup_config.py         # 初始化配置

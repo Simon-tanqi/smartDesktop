@@ -22,7 +22,7 @@ class IntentResult:
     route_level: "L0" / "L1" / "L2" / "L3"
     reply: L0/L1 直接回复文本（L2/L3 为空）
     degraded: L1 命中但工具缺失，需由上层降级到 L2 走 LLM
-    exec_action: L1 工具执行型意图的工具名（当前恒为空：原预设路由工具未实现已移除，见 docs/TODO.md）
+    exec_action: L1 工具执行型意图的工具名（当前恒为空：原预设路由工具未实现已移除，见 docs/ROADMAP.md）
     exec_params: 上述工具的执行参数（dict）
     detail: 命中规则说明（日志/排查用）
     """
@@ -84,7 +84,7 @@ _L1_TASK_SIGNALS = re.compile(
 def _parse_volume_level(text: str):
     """从音量表达中解析目标音量级别，返回 0-100 整数；无法解析返回 None。
 
-    注：原 L1 音量直连路由已移除（set_system_volume 工具未实现，见 docs/TODO.md），
+    注：原 L1 音量直连路由已移除（set_system_volume 工具未实现，见 docs/ROADMAP.md），
     本函数暂无调用方，保留以待工具实现后重挂路由时复用。
     """
     m = re.search(r"百分之\s*(\d{1,3})", text)
@@ -117,7 +117,7 @@ def _try_l1(text: str) -> tuple:
     reply 非空时由上层直接返回（时间/日期/星期，本地生成）；
     reply 为空且 degraded=True 时上层降级到 L2（通用天气类，无工具可用）。
     exec_action 恒为空：原 L1 工具执行型预设路由（昨日天气/音量/桌面图标）依赖的
-    三个工具未实现，对应路由已移除，相关问句安全降级走 LLM 流程（见 docs/TODO.md）。
+    三个工具未实现，对应路由已移除，相关问句安全降级走 LLM 流程（见 docs/ROADMAP.md）。
     """
     now = datetime.datetime.now()
     # 复合任务护栏：命中预设规则但消息里还有任务信号时，回落原流程走 LLM
