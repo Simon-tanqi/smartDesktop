@@ -221,57 +221,7 @@ except Exception as e:
     logger.warning(f"[STARTUP] 列出模型失败: {e}")
 
 
-def _cleanup_pycache(root_dir=None):
-    """启动前清除所有 __pycache__/ 和孤立 .pyc 文件，防止旧字节码遮蔽新源码。
-
-    大厂标准（Google/FB/Meta 等）：
-    1. PYTHONDONTWRITEBYTECODE 环境变量禁止写入新 .pyc
-    2. 启动时一次性清理残留缓存（本次启动不会再产生新 .pyc）
-    """
-    import shutil
-    if root_dir is None:
-        root_dir = os.path.dirname(os.path.abspath(__file__))
-
-    removed_pyc_dirs = 0
-    removed_pyc_files = 0
-    skipped = []
-
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        # 跳过第三方依赖目录（这些目录的 .pyc 更新不影响我们）
-        if any(skip in dirpath for skip in ('site-packages', 'node_modules', '.venv', 'venv', '.git', '.idea', '__pypackages__')):
-            dirnames.clear()  # 不继续深入这些目录
-            continue
-
-        # 删除 __pycache__/ 目录
-        if '__pycache__' in dirnames:
-            dirnames.remove('__pycache__')  # 阻止 os.walk 继续遍历被删的目录
-            pyc_dir = os.path.join(dirpath, '__pycache__')
-            try:
-                shutil.rmtree(pyc_dir, ignore_errors=True)
-                removed_pyc_dirs += 1
-            except Exception:
-                pass
-
-        # 删除孤立 .pyc 文件（不是 __pycache__/ 下的）
-        for f in filenames:
-            if f.endswith('.pyc'):
-                try:
-                    os.remove(os.path.join(dirpath, f))
-                    removed_pyc_files += 1
-                except Exception:
-                    pass
-
-    total = removed_pyc_dirs + removed_pyc_files
-    logger.info(
-        f"[STARTUP] 字节码清理完成: 删 {removed_pyc_dirs} 个 __pycache__/ 目录, "
-        f"{removed_pyc_files} 个孤立 .pyc 文件" +
-        (f", 跳过 {len(skipped)} 个第三方目录" if skipped else "")
-    )
-    return total
-
-
 if __name__ == '__main__':
-    _cleaned = _cleanup_pycache()
     app = create_app()
     logger.info(f"Agent 前端已启动，请访问: http://{Config.HOST}:{Config.PORT}")
     app.run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG, use_reloader=False, threaded=True)
