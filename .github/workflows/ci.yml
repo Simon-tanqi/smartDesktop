@@ -30,6 +30,7 @@ jobs:
         run: python -m compileall -q .
 
       - name: Run tests
-        # 仅运行冒烟测试（test_smoke.py）；test_assertions/test_orchestrator 为
-        # 本地真实 Agent 执行器，依赖 Windows 环境与本地 LLM，不纳入 CI。
-        run: python -m pytest tests/test_smoke.py -x -q
+        # 运行冒烟测试 + 核心模块纯逻辑单测（test_core，跨平台可跑）；
+        # test_assertions/test_orchestrator 为本地真实 Agent 执行器，
+        # 依赖 Windows 环境与本地 LLM，不纳入 CI。
+        run: python -m pytest tests/test_smoke.py tests/test_core -q

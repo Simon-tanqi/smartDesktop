@@ -1,17 +1,15 @@
-# TODO：待实现工具清单
+# Roadmap：规划中的能力
 
-> 本文档记录「L1 直连路由已引用但尚未实现」的工具预期实现方案。
-> 原则：**后续版本再补实现；实现后需重新挂载 intent_router L1 直连**，并同步清理本文件中对应条目。
+> 本文档记录规划中、将在后续版本实现的能力，包含数据源选型、实现要点与安全约束等设计思路。
+> 能力落地后需在 `core/intent_router.py` 注册对应 L1 直连路由，并同步更新本文档。
 
 ## 背景（2026-08-20）
 
-`core/intent_router.py` 的 `_try_l1` 存在三处 L1 工具执行型预设路由，直连引用以下三个**未实现**的工具：
-`query_yesterday_weather`、`set_system_volume`、`set_desktop_icons_visible`。
-全项目 grep 核实：三个工具无任何实现（不在 `tools/system_tools.py`、不在 `prompts/tools.yaml`、不在 TOOL_REGISTRY），
-仅在 `core/intent_router.py` 路由与 `tools/skill_fixation.py` 白名单中被引用。
+以下三个能力此前曾在 `core/intent_router.py` 的 `_try_l1` 中预留路由，当前版本已安全降级为 LLM 通用流程，规划在后续版本实现专属工具：`query_yesterday_weather`（昨日天气查询）、`set_system_volume`（系统音量设置）、`set_desktop_icons_visible`（桌面图标显隐）。
+全项目 grep 核实：三个工具当前无实现（不在 `tools/system_tools.py`、不在 `prompts/tools.yaml`、不在 TOOL_REGISTRY），仅在 `tools/skill_fixation.py` 白名单中被引用。
 
-为保障推送干净，已按方案**移除 L1 直连路由条目**（2026-08-20）：
-- 删除 `_try_l1` 中三处直连 return（exec_action 分支），相关问句安全降级走 LLM 流程，不引入崩溃；
+为保障路由链路干净，已移除 L1 直连路由条目（2026-08-20）：
+- 删除 `_try_l1` 中三处直连 return（exec_action 分支），相关问句走 LLM 流程；
 - 删除专属正则 `_L1_YESTERDAY_WEATHER` / `_L1_VOLUME` / `_L1_DESKTOP_ICONS` / `_L1_DESKTOP_ICONS_SHOW`；
 - 保留 `_parse_volume_level`（注释标注待复用）与 `_L1_WEATHER`（通用天气 degraded 分支仍有效）；
 - `tools/skill_fixation.py` 的 `LOW_RISK_TOOL_WHITELIST` 仍含三个名字（L38-46），实现工具后一并处理或移除。
