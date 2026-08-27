@@ -71,8 +71,10 @@ def _clean_llm_output(raw):
     if not raw:
         return ""
     text = raw.strip()
-    text = re.sub(r'<\|end[_ ]of[_ ]thinking\|>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<\|begin[_ ]of[_ ]thinking\|>', '', text, flags=re.IGNORECASE)
+    # 整体删除 thinking 块（含块内思考文本），避免残留文本阻断后续代码块剥离
+    text = re.sub(r'<\|begin[_ ]of[_ ]thinking\|>.*?<\|end[_ ]of[_ ]thinking\|>', '', text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    # 清理可能残留的单个标记（如只有 begin 或只有 end）
     text = re.sub(r'<\|.*?\|>', '', text)
     text = re.sub(r'^\s*```(?:json)?\s*', '', text)
     text = re.sub(r'\s*```\s*$', '', text)

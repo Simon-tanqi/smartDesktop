@@ -261,11 +261,15 @@ def _path_matches_protected(path: str, protected_patterns: list) -> str | None:
             if '*' not in path and '*' not in protected_pattern:
                 path_lower = path.lower()
                 pattern_lower = protected_pattern.lower()
-                if path_lower == pattern_lower:
+                # 去掉尾部斜杠后再做前缀/相等比较，避免 pattern 以 '\' 结尾时
+                # 拼接出双反斜杠导致子路径永远匹配不上
+                path_norm = path_lower.rstrip('\\/')
+                pattern_norm = pattern_lower.rstrip('\\/')
+                if path_norm == pattern_norm:
                     return desc
-                if path_lower.startswith(pattern_lower + '\\') or path_lower.startswith(pattern_lower + '/'):
+                if path_norm.startswith(pattern_norm + '\\') or path_norm.startswith(pattern_norm + '/'):
                     return desc
-                if pattern_lower.startswith(path_lower + '\\') or pattern_lower.startswith(path_lower + '/'):
+                if pattern_norm.startswith(path_norm + '\\') or pattern_norm.startswith(path_norm + '/'):
                     return desc
         except re.error:
             continue
@@ -450,6 +454,7 @@ def _check_danger(command: str):
         (r'(?<![A-Za-z])del\s+', '删除文件/目录 (del 别名)', 'challenge'),
         (r'(?<![A-Za-z])ri\s+', '删除文件/目录 (ri 别名)', 'challenge'),
         (r'(?<![A-Za-z])rd\s+', '删除目录 (rd 别名)', 'challenge'),
+        (r'\bRemove-Item\b', '删除文件/目录 (Remove-Item)', 'challenge'),
         (r'\b(?:erase|diskpart)\b', '文件系统破坏操作', 'challenge'),
         (r'\bformat\s+[A-Za-z]:', '磁盘格式化', 'challenge'),
         (r'\bFormat-Volume\b', '磁盘格式化', 'challenge'),
