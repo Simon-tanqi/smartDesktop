@@ -288,7 +288,12 @@ class TestReActEngineRunSmoke:
         assert events == ["prepare-event"]
 
     def test_risk_levels_mapping_sane(self):
-        assert ReActEngine.RISK_LEVELS["delete_file"] == "P0"
-        assert ReActEngine.RISK_LEVELS["modify_registry"] == "P0"
+        # P0 永远拒绝（硬 BLOCK，绝不弹确认框）；静态表值仅作动态定级兜底：
+        # - delete_file 实际按目标路径/数量动态定级（C 盘非用户目录→P0、批量→P1、单文件→P2）
+        # - modify_registry 实际按根键动态定级（HKLM 等全局根键→P0、HKCU→P1）
+        assert ReActEngine.RISK_LEVELS["delete_file"] == "P2"
+        assert ReActEngine.RISK_LEVELS["modify_registry"] == "P1"
         assert ReActEngine.RISK_LEVELS["write_file"] == "P2"
         assert "web_search" not in ReActEngine.RISK_LEVELS  # 默认 P3
+        # P0 不再由任何工具静态声明（P0 只能由动态定级命中，且一律直接拒绝）
+        assert all(level != "P0" for level in ReActEngine.RISK_LEVELS.values())

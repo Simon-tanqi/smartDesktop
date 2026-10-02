@@ -32,11 +32,11 @@ safe_exec:
     - pattern: "(?i)[A-Z]:\\\\ProgramData\\\\"
       desc: "ProgramData 目录"
     # 聊天记录数据库
-    - pattern: "(?i)WeChat Files\\\\.+?\\\\Msg[\\\\.]"
+    - pattern: "(?i)WeChat Files\\\\{0,512}?\\\\Msg[\\\\.]"
       desc: "微信聊天记录数据库"
-    - pattern: "(?i)Tencent Files\\\\.+?\\\\Msg[0-9]"
+    - pattern: "(?i)Tencent Files\\\\{0,512}?\\\\Msg[0-9]"
       desc: "QQ 聊天记录数据库"
-    - pattern: "(?i)DingTalk\\\\.+?\\\\db[\\\\.]"
+    - pattern: "(?i)DingTalk\\\\{0,512}?\\\\db[\\\\.]"
       desc: "钉钉聊天记录数据库"
     # 安全凭据
     - pattern: "(?i)\\\\.ssh\\\\"

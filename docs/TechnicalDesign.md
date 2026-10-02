@@ -218,7 +218,7 @@ for step in range(start_step, MAX_TURNS):   # MAX_TURNS = 15
 | gui_tools.py | GUI 自动化 | 截图 / 点击 / 输入 / 按键 / 打开应用 |
 | web_download.py | 文件下载 | 下载 URL 到本地 |
 | db_tools.py | 数据库 | 数据库查询 |
-| safe_exec.py | 安全执行器 | 命令预检拦截 + 风险分级（P0-P3）+ 挑战短语确认 |
+| safe_exec.py | 安全执行器 | 命令预检拦截 + 风险分级（P0-P3，P0 直接拒绝、P1 挑战短语确认、P2 普通确认） |
 | skill_learning.py | 技能学习 | 经验内化 / 技能模板沉淀 |
 | skill_fixation.py | 技能固化 | 工具使用轨迹固化，命中直连执行 |
 | post_action_verify.py | 操作后验证 | 关键操作后状态校验 |
@@ -227,7 +227,7 @@ for step in range(start_step, MAX_TURNS):   # MAX_TURNS = 15
 #### 2.6.3 安全执行沙箱 `tools/safe_exec.py`（约 840 行）
 
 - **命令预检拦截**：危险命令模式匹配，命中即拒绝。
-- **风险分级确认**：P0-P3 四级；P0 强制确认（含挑战短语，防 LLM 注入 `confirmed=True` 绕过）。
+- **风险分级确认**：P0-P3 四级；P0 永远拒绝（硬 BLOCK，直接拒绝、不弹确认框）；P1 挑战短语确认、P2 确认/取消按钮（防 LLM 注入 `confirmed=True` 绕过）。
 - **超时控制**：命令 120s / Python 300s 超时，输出截断 2000 字符。
 - **敏感路径保护**：与 `core/safety_policy.py` 联动（见 2.7）。
 
@@ -239,10 +239,11 @@ for step in range(start_step, MAX_TURNS):   # MAX_TURNS = 15
 - **敏感复制根**：`C:\Windows`、`C:\Program Files`、`C:\Program Files (x86)`、`C:\ProgramData` 四目录全保护（杜绝"复制系统文件到工作区再读取"的绕过路径）。
 - **Zone 划分**：SAFE（工作区）/ USER / APP / SYSTEM / SECRET（凭据隐私）/ NET / UNKNOWN。
 - **隐私目录**：.ssh / .aws / .kube / .gnupg / .config / .cache / Chrome 数据 / keyring / credentials 等 → SECRET。
-- **风险动态定级**（`check_tool_risk_level`）：
-  - 目标在 C 盘且不在 `C:\Users\<当前用户>` 下 → P0 直接拒绝
-  - 其余（用户目录内或非 C 盘）→ P2 简单确认
-- **静态风险映射**（ReActEngine.RISK_LEVELS）：modify_registry / delete_file = P0；move_file / gui_click / gui_type_text / gui_press_keys / gui_mouse_click = P1；write_file / edit_file / replace_in_file / copy_file / scan_directory / web_download / gui_open_application / gui_screenshot / gui_mouse_move = P2；其余默认 P3。
+- **风险动态定级**（`check_tool_risk_level`，按参数动态判定，P0 一律直接拒绝、不进确认分支）：
+  - 单文件编辑：目标在 C 盘且不在 `C:\Users\<当前用户>` 下 → P0 直接拒绝；其余（用户目录内或非 C 盘）→ P2 普通确认
+  - 注册表：全局根键（HKLM / HKEY_LOCAL_MACHINE / HKCR / HKEY_CLASSES_ROOT / HKU / HKEY_USERS / HKCC / HKEY_CURRENT_CONFIG 等非用户级根键）→ P0 直接拒绝；HKCU / HKEY_CURRENT_USER 用户级写 → P1 挑战确认
+  - 删除：目标在 C 盘非当前用户目录 → P0 直接拒绝；Program Files / Program Files (x86)（任意盘符，含 %ProgramFiles% 展开）批量删除 → P0 直接拒绝；批量删除（> 10 个）→ P1 挑战确认；单文件删除 → P2 普通确认（软件卸载走专用前置分支：C 盘内 P1 / 非 C 盘 P2，不受 Program Files 批量删除检查影响）
+- **静态风险映射**（ReActEngine.RISK_LEVELS，仅作动态定级未覆盖时的兜底，不再包含 P0 条目）：modify_registry = P1、delete_file = P2；move_file / gui_click / gui_type_text / gui_press_keys / gui_mouse_click = P1；write_file / edit_file / replace_in_file / copy_file / scan_directory / web_download / gui_open_application / gui_screenshot / gui_mouse_move = P2；其余默认 P3。
 
 ### 2.8 三层递进式熔断
 
@@ -264,7 +265,7 @@ execute_one_step:
   1. 工具查找（tool_data_provider 取 schema）+ 参数校验
   2. 依赖校验（utils/dependency_manager.feature_availability）
   3. 熔断检查（ToolLoopDetector / SearchCircuitBreaker / BreakerState）
-  4. 风险定级（check_tool_risk_level）→ P0/P1 走确认（confirmation_handler）
+  4. 风险定级（check_tool_risk_level）→ P0 直接拒绝（BLOCK，不弹框）；P1/P2 走确认（confirmation_handler）
      - 确认缓存：同一工具 + 同关键参数 120s 内确认过 → 不再弹窗
   5. 执行（_tool_worker 线程 / 进程隔离，超时控制）
   6. 结果处理：截断（MAX_RESULT_CHARS=8000）/ 失败分类（classify_tool_failure）
@@ -457,9 +458,9 @@ sequenceDiagram
 
 ```
 工具调用 → check_tool_risk_level（动态定级）
-  ├─ P0（系统目录写/删/注册表）→ 拒绝 or 强制确认（挑战短语）
-  ├─ P1（移动/GUI 操作）→ 确认框
-  ├─ P2（用户目录写/复制/下载）→ 确认框（120s 同参去重）
+  ├─ P0（格式化 / 系统文件夹写删 / Program Files（任意盘符）批量删除 / 全局注册表 HKLM·HKCR·HKU·HKCC / C 盘非用户目录写删）→ 直接拒绝（BLOCK，不弹确认框）
+  ├─ P1（用户级注册表 HKCU / 批量删除 / 移动 / GUI 操作）→ 挑战短语确认框
+  ├─ P2（用户目录单文件写 / 单文件删除 / 复制 / 下载）→ 确认/取消按钮（120s 同参去重）
   └─ P3（只读/查询）→ 直接执行
 用户确认 → 执行 → post_action_verify 验证 → 结果注入上下文
 ```
@@ -525,7 +526,7 @@ python app.py                      # 默认端口 8765（AGENT_PORT 可覆盖）
 | 单元测试 | 意图路由规则（L0/L1/L3 命中 / 复合任务护栏）、BM25 分词与切换判定、熔断计数、风险定级 |
 | 集成测试 | ReAct 循环端到端（mock LLM）、工具执行管线（校验→熔断→确认→执行→回注） |
 | 场景测试 | tests/test_cases：文件任务 / PPT 生成 / Excel 报表 / 安全拒绝 / 记忆召回 |
-| 安全测试 | 敏感路径绕过（复制系统文件到工作区）、P0 注入 confirmed=True 绕过、死循环熔断 |
+| 安全测试 | 敏感路径绕过（复制系统文件到工作区）、P0 硬 BLOCK 不进入确认流程（无 `confirmed=True` 可注入）、死循环熔断 |
 | 回归测试 | tests/snapshots 快照对比 |
 
 ---

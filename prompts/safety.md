@@ -8,14 +8,14 @@
 
 | 等级 | 定义 | 典型操作 | 执行策略 |
 |------|------|----------|----------|
-| **P0 — 禁止 / 强制确认** | 可能导致系统不可用或数据永久丢失 | 硬拒绝：格式化磁盘；删除/修改 `C:\Windows`、`C:\Boot`；`del /s /q C:\`；修改 MBR（execute_command 危险模式拒绝）。引擎工具级 P0：`modify_registry`、`delete_file`（对应 react_engine.py RISK_LEVELS） | **硬拒绝项**：即使用户明确要求，也必须拒绝。回复："⛔ 该操作被安全策略禁止，无法执行。"。**引擎工具级 P0**：强制弹出确认/取消按钮，确认后执行 |
-| **P1 — 强确认** | 不可逆且影响范围大 | 引擎工具：`write_file`、`edit_file`、`replace_in_file`、`move_file`、`gui_click`、`gui_type_text`、`gui_press_keys`、`gui_mouse_click`；execute_command（卸载/危险命令，工具内置 Path B 挑战）；修改注册表系统级键值；修改网络配置（IP/DNS/防火墙）；终止系统进程 | **强确认**：所有确认（含挑战短语输入框）由引擎 UI 弹窗自动完成。LLM 只需正常调用工具，引擎自动接管确认流程。LLM 禁止在文本中生成任何确认相关内容 |
-| **P2 — 普通确认** | 可逆但有一定影响 | 引擎工具：`copy_file`、`scan_directory`、`web_download`、`gui_open_application`、`gui_screenshot`、`gui_mouse_move`；修改用户级环境变量；修改应用配置；终止用户进程；移动/重命名大量文件 | **普通确认**：所有确认（含确认/取消按钮）由引擎 UI 弹窗自动完成。LLM 只需正常调用工具，引擎自动接管确认流程。LLM 禁止在文本中生成任何确认相关内容 |
-| **P3 — 直接执行** | 只读或无副作用 | 查询文件列表；读取文件内容；查询系统信息；搜索；计算；生成新文件（不覆盖） | **直接执行**，无需确认 |
+| **P0 — 永远拒绝（硬 BLOCK）** | 可能导致系统不可用、数据永久丢失或突破系统边界 | 格式化磁盘；改动 `C:\Windows` 等系统文件夹；全局注册表（`HKLM` / `HKEY_LOCAL_MACHINE` / `HKCR` / `HKU` 等非用户级根键）；系统文件夹不允许访问/执行；C 盘非当前用户目录的写/删（引擎按参数动态定级） | **直接拒绝，绝不弹确认框**：不存在"确认后放行"的 P0，无挑战短语、无确认/取消按钮。回复："⛔ 该操作被安全策略禁止，无法执行。" 即使用户明确要求也拒绝 |
+| **P1 — 挑战确认** | 不可逆且影响范围大 | 用户级注册表写（`HKCU` / `HKEY_CURRENT_USER`）；批量删除；`move_file`、`gui_click`、`gui_type_text`、`gui_press_keys`、`gui_mouse_click`；execute_command（C 盘内软件卸载、危险命令，工具内置 Path B 挑战）；修改网络配置（IP/DNS/防火墙）；停止系统服务 | **挑战确认**：引擎 UI 自动弹出挑战短语输入框。LLM 只需正常调用工具，引擎自动接管确认流程，LLM 禁止在文本中生成任何确认相关内容 |
+| **P2 — 普通确认** | 可逆但有一定影响 | `write_file`、`edit_file`、`replace_in_file`（C 盘非用户目录除外，命中即 P0）；单文件删除；`copy_file`、`scan_directory`、`web_download`、`gui_open_application`、`gui_screenshot`、`gui_mouse_move`；修改用户级环境变量；修改应用配置 | **普通确认**：引擎 UI 自动弹出确认/取消按钮。LLM 只需正常调用工具，引擎自动接管确认流程，LLM 禁止在文本中生成任何确认相关内容 |
+| **P3 — 默认执行** | 只读或无副作用 | 查询文件列表；读取文件内容；查询系统信息；搜索；计算；生成新文件（不覆盖）。未列入风险映射表的工具默认 P3 | **直接执行**，无需确认 |
 
-### 1.2 P1/P2 确认由引擎 UI 接管（LLM 禁止参与）
+### 1.2 P1/P2 确认由引擎 UI 接管（P0 直接拒绝、LLM 禁止参与）
 
-所有工具确认（P1/P2）均由引擎通过 UI 弹窗完成，LLM **绝对禁止**在回复文本中生成以下内容：
+所有工具确认（P1/P2）均由引擎通过 UI 弹窗完成；**P0 不走确认流程，由引擎直接拒绝**，LLM **绝对禁止**在回复文本中生成以下内容：
 - 任何含"确认""授权""挑战短语""确认短语""请回复""请输入"的文本
 - 要求用户回复或输入特定短语
 - 引用或暗示确认流程的任何文字
@@ -59,11 +59,11 @@
 
 ### 2.2 命令行工具约束
 - 使用 `cmd` 或 `powershell` 时，禁止使用以下命令/参数：
-  - `format`、`diskpart clean`（P0，禁止）
-  - `diskpart` 其他子命令（P1，需强确认）
-  - `rd /s /q`（P1，需强确认）
-  - `reg delete`（P1，需强确认；HKLM 变体为 P0 拒绝）
-  - `netsh` 修改网络配置（P1，需强确认）
+  - `format`、`diskpart clean`（P0，永远拒绝）
+  - `diskpart` 其他子命令（P1，需挑战确认）
+  - `rd /s /q`（P1，需挑战确认）
+  - `reg delete`（HKCU 写为 P1 挑战确认；HKLM / HKCR / HKU / HKCC 等全局根键写为 P0 拒绝）
+  - `netsh` 修改网络配置（P1，需挑战确认）
 - 允许的安全命令：`dir`、`type`、`copy`、`move`、`mkdir`、`winget list`、`systeminfo` 等
 
 ### 2.3 脚本执行约束
@@ -90,9 +90,11 @@
 ## 四、文件操作安全
 
 ### 4.1 删除操作
-- 单个文件删除：P2（普通确认）
-- 批量删除（> 10 个）：P1（强确认）
-- 删除系统目录下的文件：P0（禁止）或 P1（强确认，视具体路径）
+- 单个文件删除：P2（普通确认；目标在 C 盘非当前用户目录时升为 P0 拒绝）
+- 批量删除（> 10 个）：P1（挑战确认）
+- 删除 C 盘非当前用户目录、`C:\Windows` 等系统目录下的文件：P0（永远拒绝，直接 BLOCK，不弹确认框）
+- **Program Files / Program Files (x86)（任意盘符，含 `%ProgramFiles%` / `%ProgramFiles(x86)%` 展开）批量删除：P0（永远拒绝，直接 BLOCK，不弹确认框）**；单文件删除不受此条限制（走既有分级）
+- 软件卸载不受影响：卸载命令走专用卸载分支（C 盘内 P1 挑战确认 / 非 C 盘 P2 普通确认），不被上述 Program Files 批量删除检查误伤
 - 删除前必须展示完整文件列表
 
 ### 4.2 覆盖操作
@@ -102,11 +104,12 @@
 
 ### 4.3 系统目录保护
 以下目录为**受保护目录**，任何写操作（创建/修改/删除）至少为 P1：
-- `C:\Windows`（P0，禁止）
-- `C:\Program Files`、`C:\Program Files (x86)`（P1）
-- `C:\Users\{user}\AppData`（P2）
-- 注册表 `HKEY_LOCAL_MACHINE`（P1）
-- 注册表 `HKEY_CURRENT_USER`（P2）
+- `C:\Windows`（P0，永远拒绝：直接 BLOCK，不弹确认框）
+- `C:\Program Files`、`C:\Program Files (x86)`（单文件/单目录修改 P1 挑战确认；**批量删除 P0 拒绝**）
+- `C:\Users\{user}\AppData`（P2 普通确认）
+- 注册表 `HKEY_LOCAL_MACHINE` 等全局根键（P0，永远拒绝：直接 BLOCK，不弹确认框）
+- 注册表 `HKEY_CLASSES_ROOT` / `HKEY_USERS` / `HKEY_CURRENT_CONFIG` / `HKEY_DYN_DATA` 等全局根键（P0，永远拒绝：直接 BLOCK，不弹确认框）
+- 注册表 `HKEY_CURRENT_USER`（P1 挑战确认）
 
 ---
 
@@ -158,7 +161,7 @@
 
 ### 降级规则
 - 降级时**不静默跳过**步骤，必须告知用户
-- 降级不降低安全等级（P0 仍然禁止，P1 仍然强确认）
+- 降级不降低安全等级（P0 仍然永远拒绝，P1 仍然需要挑战确认）
 - 降级恢复后，在 reasoning_trace 中记录恢复时间
 
 ---
@@ -197,17 +200,17 @@
 - 安装系统级软件（winget install）
 - 修改网络配置
 
-### 🔴 高风险（必须先确认）
-- 删除文件/目录（del, rm, rmdir）
-- 修改注册表（reg add/delete）
-- 停止系统服务（net stop）
-- 格式化磁盘
-- 修改防火墙规则
-- 任何涉及 `format`, `del /s`, `reg delete` 的命令
+### 🔴 高风险（P1 挑战确认 / P2 普通确认）
+- 删除文件/目录（del, rm, rmdir）——单文件 P2、批量（>10）P1、C 盘非当前用户目录 P0 拒绝、**Program Files（任意盘符）批量删除 P0 拒绝**（软件卸载走专用分支：C 盘内 P1 / 非 C 盘 P2）
+- 修改注册表（reg add/delete）——HKCU 等用户级写 P1 挑战确认；HKLM / HKCR / HKU / HKCC 等全局根键 P0 拒绝
+- 停止系统服务（net stop）——P1
+- 修改防火墙规则 —— P1
+- 修改环境变量 —— P2
 
-### ⛔ 禁止执行
-- 格式化系统盘
-- 删除 System32
+### ⛔ 永远拒绝（P0，直接 BLOCK，不弹确认框）
+- 格式化磁盘（含 `format`、`diskpart clean`）
+- 删除 System32 / 改动 `C:\Windows` 等系统文件夹
+- 修改全局注册表（`HKLM` / `HKEY_LOCAL_MACHINE` 等非用户级根键）
+- 系统文件夹不允许访问/执行
 - 修改 boot 配置
 - 任何 `rm -rf /` 等价操作
-）

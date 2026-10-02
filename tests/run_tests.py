@@ -18,7 +18,9 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-BASE_DIR = r"D:\PyCharm Project\smartDesktop\tests"
+# P1-2：基于 __file__ 推导项目根，避免残留本机绝对路径（全新 clone 可直接运行）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoint.json")
 RAW_TRAFFIC_LOG = os.path.join(BASE_DIR, "artifacts", "raw_traffic.log")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
@@ -92,25 +94,25 @@ TEST_CASES = {
     "T-41": {"category": "PPT 演示文稿生成", "title": "提取PPT演示文稿基本信息", "input": "查看 intro.pptx 的基本信息，包括幻灯片数量、每页标题", "checkpoints": ["返回幻灯片总数", "返回每张幻灯片标题列表", "返回文件大小信息"], "expected": "success"},
     "T-42": {"category": "PPT 演示文稿生成", "title": "创建Tech Blue主题PPT", "input": "创建一个 PPT tech_presentation.pptx，主题为蓝色科技风格，包含5张幻灯片：封面页\"AI时代\"，目录页，3张内容页（\"AI在各行业的应用\"、\"转型机会\"、\"行动建议\"）", "checkpoints": ["文件成功创建", "共5张幻灯片", "第1张为封面标题AI时代", "第2张为目录页", "第3-5张为内容页标题正确"], "expected": "success"},
 
-    "T-43": {"category": "Excel 数据处理", "title": "读取Excel数据", "input": "读取 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 的内容，显示前10行数据", "checkpoints": ["返回数据包含表头行", "返回行数不超过10行", "返回格式为表格或JSON数组"], "expected": "success"},
-    "T-44": {"category": "Excel 数据处理", "title": "创建Excel透视表", "input": "用 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 创建一个透视表，按\"部门\"分组，统计\"销售额\"的总和，保存到新 sheet 部门汇总", "checkpoints": ["新sheet部门汇总被创建", "透视表包含部门列和汇总后的销售额列", "各部门销售额总和计算正确"], "expected": "success"},
-    "T-45": {"category": "Excel 数据处理", "title": "生成Excel柱状图", "input": "用 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 生成一个柱状图，展示各部门的销售额，保存到桌面 chart.xlsx", "checkpoints": ["图表文件创建成功", "图表类型为柱状图", "图表标题正确显示"], "expected": "success"},
-    "T-46": {"category": "Excel 数据处理", "title": "计算数据列的统计值", "input": "读取 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx，计算\"销售额\"列的平均值、最大值、最小值，并告诉我结果", "checkpoints": ["返回平均值", "返回最大值", "返回最小值", "统计值计算正确"], "expected": "success"},
+    "T-43": {"category": "Excel 数据处理", "title": "读取Excel数据", "input": "读取 {TEST_DATA_DIR}\\sales_data.xlsx 的内容，显示前10行数据", "checkpoints": ["返回数据包含表头行", "返回行数不超过10行", "返回格式为表格或JSON数组"], "expected": "success"},
+    "T-44": {"category": "Excel 数据处理", "title": "创建Excel透视表", "input": "用 {TEST_DATA_DIR}\\sales_data.xlsx 创建一个透视表，按\"部门\"分组，统计\"销售额\"的总和，保存到新 sheet 部门汇总", "checkpoints": ["新sheet部门汇总被创建", "透视表包含部门列和汇总后的销售额列", "各部门销售额总和计算正确"], "expected": "success"},
+    "T-45": {"category": "Excel 数据处理", "title": "生成Excel柱状图", "input": "用 {TEST_DATA_DIR}\\sales_data.xlsx 生成一个柱状图，展示各部门的销售额，保存到桌面 chart.xlsx", "checkpoints": ["图表文件创建成功", "图表类型为柱状图", "图表标题正确显示"], "expected": "success"},
+    "T-46": {"category": "Excel 数据处理", "title": "计算数据列的统计值", "input": "读取 {TEST_DATA_DIR}\\sales_data.xlsx，计算\"销售额\"列的平均值、最大值、最小值，并告诉我结果", "checkpoints": ["返回平均值", "返回最大值", "返回最小值", "统计值计算正确"], "expected": "success"},
     "T-47": {"category": "Excel 数据处理", "title": "将数据写入新Excel文件并格式化", "input": "在桌面创建一个新的 Excel 文件 output.xlsx，包含两个 sheet：\n- Sheet1：3行3列的示例数据（表头：姓名、年龄、城市）\n- Sheet2：将 Sheet1 数据复制一份并设置表头加粗", "checkpoints": ["output.xlsx创建成功", "Sheet1包含3列表头和3行数据", "Sheet2表头加粗格式生效"], "expected": "success"},
-    "T-48": {"category": "Excel 数据处理", "title": "合并多个Excel文件", "input": "将 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\file1.xlsx 和 file2.xlsx 合并为一个文件，保存到桌面 merged.xlsx（按行拼接）", "checkpoints": ["merged.xlsx创建成功", "行数为两个源文件的行数之和", "列结构与源文件一致"], "expected": "success"},
-    "T-49": {"category": "Excel 数据处理", "title": "设置Excel条件格式", "input": "对 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 的\"销售额\"列设置条件格式：数值大于 10000 的单元格标红，小于 5000 的标绿", "checkpoints": ["返回success=true", "用Excel打开文件验证条件格式已应用"], "expected": "success"},
-    "T-50": {"category": "Excel 数据处理", "title": "Excel与CSV格式互转", "input": "将 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 转换为 CSV 文件，保存到桌面 sales_data.csv", "checkpoints": ["CSV文件创建成功", "CSV文件包含与原Excel相同的行数", "CSV文件为标准逗号分隔格式"], "expected": "success"},
+    "T-48": {"category": "Excel 数据处理", "title": "合并多个Excel文件", "input": "将 {TEST_DATA_DIR}\file1.xlsx 和 file2.xlsx 合并为一个文件，保存到桌面 merged.xlsx（按行拼接）", "checkpoints": ["merged.xlsx创建成功", "行数为两个源文件的行数之和", "列结构与源文件一致"], "expected": "success"},
+    "T-49": {"category": "Excel 数据处理", "title": "设置Excel条件格式", "input": "对 {TEST_DATA_DIR}\\sales_data.xlsx 的\"销售额\"列设置条件格式：数值大于 10000 的单元格标红，小于 5000 的标绿", "checkpoints": ["返回success=true", "用Excel打开文件验证条件格式已应用"], "expected": "success"},
+    "T-50": {"category": "Excel 数据处理", "title": "Excel与CSV格式互转", "input": "将 {TEST_DATA_DIR}\\sales_data.xlsx 转换为 CSV 文件，保存到桌面 sales_data.csv", "checkpoints": ["CSV文件创建成功", "CSV文件包含与原Excel相同的行数", "CSV文件为标准逗号分隔格式"], "expected": "success"},
 
     "T-51": {"category": "代码编写", "title": "编写并执行Hello World脚本", "input": "编写一个 Python 脚本，输出 \"Hello, World!\"，执行它并给我看输出", "checkpoints": ["Python执行无报错", "输出结果为Hello, World!"], "expected": "success"},
     "T-52": {"category": "代码编写", "title": "计算1到100的和", "input": "编写一个 Python 脚本，计算 1 到 100 的整数和，输出结果", "checkpoints": ["输出结果为5050", "执行无报错"], "expected": "success"},
-    "T-53": {"category": "代码编写", "title": "读取文本文件并统计单词数", "input": "读取 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sample.txt，统计文件中的单词数并输出", "checkpoints": ["成功读取文件内容", "单词统计结果合理"], "expected": "success"},
-    "T-54": {"category": "代码编写", "title": "列出工作目录下的所有Python文件", "input": "列出 D:\\PyCharm Project\\smartDesktop\\workspace 目录下所有的 .py 文件，并告诉我文件名和大小", "checkpoints": ["返回文件列表", "列表包含文件路径", "可选包含文件大小"], "expected": "success"},
+    "T-53": {"category": "代码编写", "title": "读取文本文件并统计单词数", "input": "读取 {TEST_DATA_DIR}\\sample.txt，统计文件中的单词数并输出", "checkpoints": ["成功读取文件内容", "单词统计结果合理"], "expected": "success"},
+    "T-54": {"category": "代码编写", "title": "列出工作目录下的所有Python文件", "input": "列出 {PROJECT_ROOT}\\workspace 目录下所有的 .py 文件，并告诉我文件名和大小", "checkpoints": ["返回文件列表", "列表包含文件路径", "可选包含文件大小"], "expected": "success"},
     "T-55": {"category": "代码编写", "title": "生成简单的Flask Web服务器代码", "input": "编写一个简单的 Flask Web 服务器代码，监听 5000 端口，访问 / 返回 \"Hello Flask\"，访问 /status 返回 JSON {\"status\": \"ok\"}，保存为 app.py", "checkpoints": ["文件app.py成功创建在workspace", "文件内容包含Flask应用代码", "代码语法正确"], "expected": "success"},
 
     # Extended scenarios T-57~T-70 (excluding manual check T-56, T-62)
     "T-57": {"category": "扩展场景", "title": "网络中断时的优雅降级", "input": "搜索人工智能新闻并保存为桌面Word文档 news_report.docx", "checkpoints": ["Agent不应卡死", "应告知网络状态", "尝试执行创建Word部分"], "expected": "success"},
     "T-58": {"category": "扩展场景", "title": "超大文件处理", "input": "将桌面一个10MB以上的文本文件按行反转顺序", "checkpoints": ["Agent判断文件过大", "执行分块读取或先询问用户"], "expected": "success"},
-    "T-59": {"category": "扩展场景", "title": "Excel数据转Word报告", "input": "读取 D:\\PyCharm Project\\smartDesktop\\tests\\test_data\\sales_data.xlsx 中的销售额总和，在桌面生成一份Word报告 summary.docx，正文写明\"本月总销售额为：XXX元\"", "checkpoints": ["Agent先读Excel数据", "计算总和", "创建Word文档并填入数字"], "expected": "success"},
+    "T-59": {"category": "扩展场景", "title": "Excel数据转Word报告", "input": "读取 {TEST_DATA_DIR}\\sales_data.xlsx 中的销售额总和，在桌面生成一份Word报告 summary.docx，正文写明\"本月总销售额为：XXX元\"", "checkpoints": ["Agent先读Excel数据", "计算总和", "创建Word文档并填入数字"], "expected": "success"},
     "T-60": {"category": "扩展场景", "title": "网页表格抓取并存入Excel", "input": "抓取某个公开网页（如基金净值表）上的表格数据，新建一个Excel文件保存到桌面，并自动调整列宽", "checkpoints": ["识别HTML表格结构", "正确转换为Excel行列", "调用格式化工具有效展示"], "expected": "success"},
     "T-61": {"category": "扩展场景", "title": "依赖前序结果的上下文引用", "input": "帮我新建文件夹ProjectA", "checkpoints": ["Agent能正确理解上下文", "无需用户重复输入绝对路径"], "expected": "success"},
     # T-62 is manual check
@@ -409,13 +411,18 @@ def run_test_case(test_id, session_id):
 
     print(f"\n{'='*60}")
     print(f"[{test_id}] {tc['title']} (类别: {tc['category']})")
-    print(f"输入: {tc['input'][:80]}...")
+    # P1-2：占位符相对化——用例 input 使用 {TEST_DATA_DIR} / {PROJECT_ROOT}，
+    # 运行时替换为基于 __file__ 推导的绝对路径，避免本机绝对路径残留。
+    user_input = (tc.get("input", "")
+                  .replace("{TEST_DATA_DIR}", TEST_DATA_DIR)
+                  .replace("{PROJECT_ROOT}", PROJECT_ROOT))
+    print(f"输入: {user_input[:80]}...")
     print(f"{'='*60}")
 
-    request_body = {"message": tc["input"], "session_id": session_id}
+    request_body = {"message": user_input, "session_id": session_id}
 
     # Send chat message and collect SSE events
-    events = send_chat_message(session_id, tc["input"])
+    events = send_chat_message(session_id, user_input)
 
     # Log raw traffic
     log_raw_traffic(test_id, session_id, request_body, events)

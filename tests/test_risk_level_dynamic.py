@@ -1,24 +1,30 @@
 # -*- coding: utf-8 -*-
-"""单文件内容修改类工具风险动态定级 + 预留接口 单元测试。
+"""风险动态定级 + 预留接口 单元测试（P0–P3 四级语义）。
 
 覆盖：
-- replace_in_file 修改 D:\\ 盘文件 → P2 简单确认（非 P1）
+- replace_in_file 修改 D:\\ 盘文件 → P2 普通确认（非 P1）
 - 修改 C:\\Users\\<当前用户> 下文件 → P2
-- 修改 C:\\Windows / C:\\ 下非用户目录文件 → P0 直接拒绝
-- 批量删除仍 P1（工具层 execute_command 删除分级不受影响）
+- 修改 C:\\Windows / C:\\ 下非用户目录文件 → P0 直接拒绝（不弹确认框）
+- delete_file：单文件删除 → P2；批量删除 → P1 挑战确认；C 盘非用户目录 → P0 直接拒绝
+- modify_registry：HKLM 等全局根键 → P0 直接拒绝；HKCU 用户级写 → P1 挑战确认
+- P0 一律硬 BLOCK，不返回挑战短语（调用方不得弹确认框）
 - 预留接口：confirm_override 默认关闭、apply_workspace_edit 未接入流程
 纯逻辑测试，不依赖 LLM / 网络；路径用 USERPROFILE 动态获取，避免残留个人路径。
 """
 import os
 import pathlib
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 # 先初始化 core 包再导入 tools，规避 tools/__init__ 循环导入（与项目既有入口一致）
 import core.tool_data_provider  # noqa: F401
 from core.tool_data_provider import (
+    _check_delete_p0,
     _check_single_file_edit_p0,
+    _DELETE_TOOLS,
+    _REGISTRY_TOOLS,
     _SINGLE_FILE_EDIT_TOOLS,
     ToolExecutionPipeline,
 )
@@ -27,6 +33,7 @@ from config.config_loader import get_safety_config, SafetyConfig
 from tools.file_tools import apply_workspace_edit
 
 USERPROFILE = os.environ.get("USERPROFILE", r"C:\Users\UnknownUser")
+TEST_DATA_DIR = str(pathlib.Path(__file__).resolve().parent / "test_data")
 
 
 def _pipeline() -> ToolExecutionPipeline:
@@ -43,7 +50,7 @@ def _check(tool: str, args: dict):
 # ── 1. 非 C 盘：单文件修改 → P2 简单确认 ──
 def test_replace_in_file_d_drive_p2():
     msg, challenge, risk = _check("replace_in_file", {
-        "file_path": r"D:\PyCharm Project\smartDesktop\tests\test_data\sample_config.yaml",
+        "file_path": os.path.join(TEST_DATA_DIR, "sample_config.yaml"),
         "old_str": "timeout: 30", "new_str": "timeout: 60"})
     assert risk == "P2", f"期望 P2，实际 {risk}"
     assert challenge is None, "P2 简单确认不应带挑战短语"
@@ -137,12 +144,109 @@ def test_move_file_still_p1():
     assert challenge is not None
 
 
-def test_batch_delete_unchanged_p1():
-    # 批量删除定级在工具层 execute_command（system_tools），引擎层删除相关定级未被改动：
-    # RISK_LEVELS.delete_file 仍为 P0（静态强制确认），execute_command 已移除不走引擎层。
+def test_batch_delete_dynamic_p1():
+    # 批量删除（>1 个目标）→ P1 挑战确认
+    args = {"file_paths": [os.path.join(USERPROFILE, "a.txt"),
+                           os.path.join(USERPROFILE, "b.txt")]}
+    msg, challenge, risk = _check("delete_file", args)
+    assert risk == "P1", f"期望 P1，实际 {risk}"
+    assert challenge is not None, "P1 挑战确认必须带挑战短语"
+
+
+# ── 4. 删除类工具：按目标路径与数量动态定级 ──
+def test_delete_file_single_p2():
+    # 单文件删除（用户目录内）→ P2 普通确认
+    msg, challenge, risk = _check("delete_file",
+                                  {"file_path": os.path.join(USERPROFILE, "Desktop", "tmp.txt")})
+    assert risk == "P2", f"期望 P2，实际 {risk}"
+    assert challenge is None, "P2 普通确认不应带挑战短语"
+    assert "P2" in msg
+
+
+def test_delete_file_non_c_drive_single_p2():
+    _, _, risk = _check("delete_file", {"path": r"D:\tmp\old.log"})
+    assert risk == "P2"
+
+
+def test_delete_file_c_non_user_p0():
+    # C 盘非当前用户目录 → P0 直接拒绝（不弹确认框、不返回挑战短语）
+    msg, challenge, risk = _check("delete_file", {"file_path": r"C:\Windows\System32\a.dll"})
+    assert risk == "P0", f"期望 P0，实际 {risk}"
+    assert challenge is None, "P0 永远拒绝不得返回挑战短语"
+    assert "永远拒绝" in msg
+    assert _check_delete_p0({"file_path": r"C:\Windows\a.dll"}) is not None
+    assert _check_delete_p0({"file_path": os.path.join(USERPROFILE, "a.dll")}) is None
+
+
+def test_delete_tools_membership_and_static_fallback():
+    assert "delete_file" in _DELETE_TOOLS
     engine = ReActEngine(trace_id="t", session_id="s", session_name="n")
-    assert engine.RISK_LEVELS["delete_file"] == "P0"
+    # 静态表值仅为动态定级兜底（单文件删除 P2）；execute_command 不走引擎层
+    assert engine.RISK_LEVELS["delete_file"] == "P2"
     assert "execute_command" not in engine.RISK_LEVELS
+
+
+# ── 4.1 注册表工具：按根键动态定级 ──
+def test_modify_registry_hklm_p0():
+    # 全局根键 → P0 直接拒绝（不弹确认框、不返回挑战短语）
+    args = {"root_key": "HKLM", "key_path": r"SOFTWARE\Test",
+            "value_name": "x", "value": "1"}
+    msg, challenge, risk = _check("modify_registry", args)
+    assert risk == "P0", f"期望 P0，实际 {risk}"
+    assert challenge is None, "P0 永远拒绝不得返回挑战短语"
+    assert "永远拒绝" in msg
+
+
+def test_modify_registry_hklm_full_name_p0():
+    _, _, risk = _check("modify_registry",
+                        {"root_key": "HKEY_LOCAL_MACHINE", "key_path": r"SYSTEM\X"})
+    assert risk == "P0"
+
+
+def test_modify_registry_hkcu_p1():
+    # 用户级根键（HKCU）写 → P1 挑战确认
+    args = {"root_key": "HKCU", "key_path": r"Software\Test",
+            "value_name": "x", "value": "1"}
+    msg, challenge, risk = _check("modify_registry", args)
+    assert risk == "P1", f"期望 P1，实际 {risk}"
+    assert challenge is not None, "P1 挑战确认必须带挑战短语"
+
+
+def test_modify_registry_hkcu_full_name_p1():
+    _, challenge, risk = _check("modify_registry",
+                                {"root_key": "HKEY_CURRENT_USER", "key_path": r"Software\X"})
+    assert risk == "P1"
+    assert challenge is not None
+
+
+def test_modify_registry_hkcu_not_allowlisted_p0():
+    """P0-2：registry_allowed_root_keys 白名单真正生效——白名单为空时 HKCU 写 → P0 拒绝。"""
+    fake_cfg = mock.Mock(registry_allowed_root_keys=set())
+    with mock.patch("core.tool_data_provider.get_safety_config", return_value=fake_cfg):
+        msg, challenge, risk = _check("modify_registry",
+                                      {"root_key": "HKCU", "key_path": r"Software\Test",
+                                       "value_name": "x", "value": "1"})
+    assert risk == "P0", f"白名单为空时 HKCU 应 P0，实际 {risk}"
+    assert challenge is None, "P0 永远拒绝不得返回挑战短语"
+    assert "白名单" in msg
+
+
+def test_modify_registry_hkcu_allowlist_alias_p1():
+    """P0-2：白名单别名映射生效——白名单仅含 HKEY_CURRENT_USER 时，HKCU 写仍 P1。"""
+    fake_cfg = mock.Mock(registry_allowed_root_keys={"HKEY_CURRENT_USER"})
+    with mock.patch("core.tool_data_provider.get_safety_config", return_value=fake_cfg):
+        _, challenge, risk = _check("modify_registry",
+                                    {"root_key": "HKCU", "key_path": r"Software\Test",
+                                     "value_name": "x", "value": "1"})
+    assert risk == "P1", f"别名映射后 HKCU 应 P1，实际 {risk}"
+    assert challenge is not None
+
+
+def test_registry_tools_membership_and_static_fallback():
+    assert "modify_registry" in _REGISTRY_TOOLS
+    engine = ReActEngine(trace_id="t", session_id="s", session_name="n")
+    # 静态表值仅为动态定级兜底（用户级写 P1）
+    assert engine.RISK_LEVELS["modify_registry"] == "P1"
 
 
 # ── 5. 预留接口：只预留不实现 ──

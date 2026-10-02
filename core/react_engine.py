@@ -100,17 +100,33 @@ class ReActEngine:
                    "write_file", "edit_file", "replace_in_file"}
     
     # ── 安全风险分级（P0=最高风险, P3=最低风险） ──
+    # P0：永远拒绝（硬 BLOCK）——直接拒绝，绝不弹确认框，用户无法通过确认放行。
+    #     适用范围仅限：格式化磁盘、改动 C:\Windows 等系统文件夹、全局注册表
+    #     （HKLM 等非用户级根键）、系统文件夹不允许访问/执行；以及由动态定级
+    #     升级为 P0 的条目（C 盘非当前用户目录的写/删、全局注册表根键写）。
+    # P1：挑战确认——弹出挑战短语输入框，短语精确匹配后才执行。
+    # P2：普通确认——弹出确认/取消按钮。
+    # P3：默认执行——只读/查询/无害操作，直接执行，无需确认。
     RISK_LEVELS = {
-        # P0：可导致系统损坏或数据永久丢失，需强制确认
+        # 注册表工具（modify_registry）：动态定级，静态值仅兜底。
+        # 实际由 check_tool_risk_level 动态判定：
+        #   - 全局根键（HKLM / HKEY_LOCAL_MACHINE / HKCR / HKU / HKCC 等非用户级根键）
+        #     → P0 直接拒绝（不弹确认框）
+        #   - 用户级根键（HKEY_CURRENT_USER / HKCU）写 → P1 挑战确认
+        "modify_registry": "P1",
+        # 删除类工具（delete_file）：动态定级，静态值仅兜底。
+        # 实际由 check_tool_risk_level 动态判定：
+        #   - 目标在 C 盘且不在 C:\Users\<当前用户> 目录下 → P0 直接拒绝（不弹确认框）
+        #   - 批量删除（>1 个目标）→ P1 挑战确认
+        #   - 单文件删除 → P2 普通确认
+        "delete_file": "P2",
         # execute_command 已移除 —— 其内置安全检测机制在工具内部通过 Path B 挑战短语确认，
         # 不走 Path A 可避免 LLM 先文本询问（问题一），同时消除 Path A 注入 confirmed=True
         # 绕过工具内部 challenge_phrase 的问题（问题三）。
-        "modify_registry": "P0",
-        "delete_file": "P0",
         # 单文件内容修改类（write_file/edit_file/replace_in_file）：动态定级，静态值仅兜底。
         # 实际由 check_tool_risk_level 动态判定：
         #   - 目标在 C 盘且不在 C:\Users\<当前用户> 目录下 → P0 直接拒绝
-        #   - 其余（C:\Users\<当前用户> 内或非 C 盘）→ P2 简单确认（单文件修改不升 P1）
+        #   - 其余（C:\Users\<当前用户> 内或非 C 盘）→ P2 普通确认（单文件修改不升 P1）
         "write_file": "P2",
         "edit_file": "P2",
         "replace_in_file": "P2",
@@ -119,7 +135,7 @@ class ReActEngine:
         "gui_type_text": "P1",
         "gui_press_keys": "P1",
         "gui_mouse_click": "P1",
-        # P2：可逆操作或影响范围有限，直接执行
+        # P2：可逆操作或影响范围有限，普通确认（确认/取消按钮）
         "copy_file": "P2",
         "scan_directory": "P2",
         "web_download": "P2",

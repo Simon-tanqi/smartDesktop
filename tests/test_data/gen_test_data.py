@@ -1,5 +1,8 @@
 ﻿import openpyxl, csv, os, random
 
+# P1-2：基于 __file__ 推导本目录，避免本机绝对路径残留（全新 clone 可直接生成测试数据）
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Generate sales_data.xlsx
 wb = openpyxl.Workbook()
 ws = wb.active
@@ -18,11 +21,11 @@ data = [
 ]
 for row in data:
     ws.append(row)
-wb.save(r'D:\PyCharm Project\smartDesktop\tests\test_data\sales_data.xlsx')
+wb.save(os.path.join(OUT_DIR, 'sales_data.xlsx'))
 print('sales_data.xlsx created')
 
 # Generate sales_data.csv
-with open(r'D:\PyCharm Project\smartDesktop\tests\test_data\sales_data.csv', 'w', newline='', encoding='utf-8-sig') as f:
+with open(os.path.join(OUT_DIR, 'sales_data.csv'), 'w', newline='', encoding='utf-8-sig') as f:
     writer = csv.writer(f)
     writer.writerow(headers)
     for row in data:
@@ -30,7 +33,7 @@ with open(r'D:\PyCharm Project\smartDesktop\tests\test_data\sales_data.csv', 'w'
 print('sales_data.csv created')
 
 # Generate sample.txt
-with open(r'D:\PyCharm Project\smartDesktop\tests\test_data\sample.txt', 'w', encoding='utf-8') as f:
+with open(os.path.join(OUT_DIR, 'sample.txt'), 'w', encoding='utf-8') as f:
     f.write('The quick brown fox jumps over the lazy dog. ')
     f.write('Artificial intelligence is transforming the world. ')
     f.write('Python is a powerful programming language. ')
@@ -46,7 +49,7 @@ for i, name in enumerate(['file1.xlsx', 'file2.xlsx'], 1):
     ws.append(['姓名', '年龄', '城市'])
     ws.append([f'用户{i}1', 20+i, f'城市{i}1'])
     ws.append([f'用户{i}2', 22+i, f'城市{i}2'])
-    wb.save(rf'D:\PyCharm Project\smartDesktop\tests\test_data\{name}')
+    wb.save(os.path.join(OUT_DIR, name))
     print(f'{name} created')
 
 print('ALL TEST DATA GENERATED')

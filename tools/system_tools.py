@@ -45,7 +45,7 @@ _CMD_PATH_RE = re.compile(
     r""""([A-Za-z]:[\\/][^"]+)"|'([A-Za-z]:[\\/][^']+)'|([A-Za-z]:[\\/][^\s"'`;|&]+)"""
 )
 
-# 注册表写操作（HKCU）正则：命中即 P2 确认（不得直接放行）。
+# 注册表写操作（HKCU）正则：命中即 P1 挑战确认（不得直接放行，无任何放行旁路）。
 # 覆盖 reg add/delete/import 与 Set-ItemProperty/New-ItemProperty/Remove-ItemProperty
 # 的目标为 HKCU/HKEY_CURRENT_USER 的变体；HKLM 变体由 danger_patterns 直接拒绝。
 # 注意：禁止使用 .* 连接远端关键词（超长无匹配输入会二次回溯卡死，实测 120KB 耗时 7s+），
@@ -56,7 +56,8 @@ _REGISTRY_WRITE_HKCU_RE = re.compile(
     re.IGNORECASE,
 )
 
-# P2-9：其他注册表根键（HKCR/HKU/HKCC 等）写 → P2 确认，与 HKCU 同级；HKLM 由 danger_patterns 直接拒绝
+# 全局注册表根键（HKCR/HKU/HKCC 等）写 → P0 直接拒绝（REJECT，不弹确认框）；
+# HKCU → P1 挑战。HKLM 变体由 danger_patterns 直接拒绝。
 _REGISTRY_WRITE_OTHER_RE = re.compile(
     r"\breg\s+(?:add|delete|import)\b(?=[^\r\n]{0,512}\b(?:HKCR|HKU|HKCC|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|HKEY_DYN_DATA)\b)"
     r"|\b(?:Set-ItemProperty|New-ItemProperty|Remove-ItemProperty)\b(?=[^\r\n]{0,512}\b(?:HKCR|HKU|HKCC|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|HKEY_DYN_DATA)\b)",
@@ -72,44 +73,22 @@ _REG_IMPORT_RE = re.compile(r"\breg\s+import\b", re.IGNORECASE)
 # 带组合段的命令必须继续走完整分类流程（danger/delete/safe_exec 规则）。
 _HAS_COMBINED_SEGMENTS_RE = re.compile(r"[|;&]|\b(?:&&|\|\|)\b")
 
-# ── P2-10：low_risk_registry + HKCU 放行收紧 ──
-# 仅放行"纯 HKCU 单条注册表写"：命令必须以 reg/注册表 cmdlet 开头、目标根键仅 HKCU/
-# HKEY_CURRENT_USER、不含其他注册表根键、不含分号/管道/&&/|| 等组合分隔符。
-_OTHER_REGISTRY_ROOTS_RE = re.compile(
-    r"\b(?:HKLM|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG)\b",
-    re.IGNORECASE,
-)
-_REG_CMD_TOKENS = {"reg", "set-itemproperty", "new-itemproperty", "remove-itemproperty", "set-item", "new-item", "remove-item"}
-
-
-def _is_hkcu_only_low_risk_command(command, first_token):
-    """P2-10：判断是否为纯 HKCU 低风险注册表写（夹带其他命令/根键一律不放行）。"""
-    lower = command.lower()
-    if "hkcu" not in lower and "HKEY_CURRENT_USER" not in command:
-        return False
-    if _HAS_COMBINED_SEGMENTS_RE.search(command):
-        return False
-    if _OTHER_REGISTRY_ROOTS_RE.search(command):
-        return False
-    # 目标根键必须明确为 HKCU（拒绝"未指明根键但含关键词"的模糊命令）
-    if not re.search(r"\b(?:HKCU|HKEY_CURRENT_USER)\b", command, re.IGNORECASE):
-        return False
-    # 首 token 必须是注册表操作入口
-    if first_token.lower() not in _REG_CMD_TOKENS:
-        return False
-    return True
+# HKCU 注册表写不再有低风险放行路径：一律落入 P1 挑战确认分支（见 _REGISTRY_WRITE_HKCU_RE 处理）。
+# 原 P2-10 low_risk_registry + HKCU 放行逻辑（_OTHER_REGISTRY_ROOTS_RE / _REG_CMD_TOKENS /
+# _is_hkcu_only_low_risk_command）已移除——值名关键词判断无法覆盖命令注入面，全部 HKCU 写统一 P1。
 
 # ── P1-5：net / wmic 从 readonly 白名单移除后，仅放行明确只读子命令 ──
-# net 只读查询（负面断言排除修改参数：/add /delete /active /expires /passwordchg 等）
+# net 只读查询（负面断言排除修改参数：/add /delete /active /expires /passwordchg 等；
+# 前瞻统一限长 4096，避免超长无匹配输入二次回溯，实测 150KB+ 多段 net 命令 600ms+）
 _NET_READONLY_RE = re.compile(
     r"\bnet\s+(?:view|accounts|statistics|session|config)\b"
-    r"|\bnet\s+user\b(?![^\r\n]*(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))"
-    r"|\bnet\s+share\b(?![^\r\n]*(?:=|/delete|/grant|/remark|/add|/users|/cache))",
+    r"|\bnet\s+user\b(?![^\r\n]{0,1024}(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))"
+    r"|\bnet\s+share\b(?![^\r\n]{0,1024}(?:=|/delete|/grant|/remark|/add|/users|/cache))",
     re.IGNORECASE,
 )
 # wmic 只读查询（list/get 形式，负面断言排除 terminate/call/delete/set/create 修改语义）
 _WMIC_READONLY_RE = re.compile(
-    r"\bwmic\b(?![^\r\n]*\b(?:terminate|call|delete|set|create|stop|start)\b)",
+    r"\bwmic\b(?![^\r\n]{0,1024}\b(?:terminate|call|delete|set|create|stop|start)\b)",
     re.IGNORECASE,
 )
 
@@ -118,15 +97,15 @@ _WMIC_READONLY_RE = re.compile(
 _SYSTEM_LEVEL_P1_PATTERNS = [
     (r"\bsc\s+(?:config|create|delete|stop|start|pause|continue|failure)\b", "服务配置/状态修改 (sc)"),
     (r"\bnet\s+(?:stop|start|pause|continue|use|add|delete|print|localgroup|group|computer|send|time|file|name)\b", "网络/账户/服务操作 (net)"),
-    (r"\bnet\s+user\b(?=[^\r\n]*(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))", "账户修改 (net user)"),
-    (r"\bnet\s+share\b(?=[^\r\n]*(?:=|/delete|/grant|/remark|/add|/users|/cache))", "共享目录修改 (net share)"),
-    (r"\btaskkill\b[^\r\n]*\s/F\b", "强制结束进程 (taskkill /F)"),
+    (r"\bnet\s+user\b(?=[^\r\n]{0,1024}(?:/add|/delete|/active|/expires|/passwordchg|/comment|/domain))", "账户修改 (net user)"),
+    (r"\bnet\s+share\b(?=[^\r\n]{0,1024}(?:=|/delete|/grant|/remark|/add|/users|/cache))", "共享目录修改 (net share)"),
+    (r"\btaskkill\b(?=[^\r\n]{0,512}\s/F\b)", "强制结束进程 (taskkill /F)"),
     (r"\b(?:Set-Service|New-Service|Remove-Service|Restart-Service|Stop-Service|Start-Service|Suspend-Service|Resume-Service)\b", "服务操作 (PowerShell)"),
-    (r"\bbcdedit\b(?![^\r\n]*/enum\b)", "启动配置修改 (bcdedit)"),
-    (r"\bnetsh\b[^\r\n]*\b(?:set|add|delete|reset|exec|commit)\b", "网络配置修改 (netsh)"),
+    (r"\bbcdedit\b(?![^\r\n]{0,1024}/enum\b)", "启动配置修改 (bcdedit)"),
+    (r"\bnetsh\b(?=[^\r\n]{0,512}\b(?:set|add|delete|reset|exec|commit)\b)", "网络配置修改 (netsh)"),
     (r"\bschtasks\s+/(?:create|delete|change|run|end|register)\b", "计划任务操作 (schtasks)"),
     (r"\b(?:icacls|takeown)\b", "ACL 权限修改 (icacls/takeown)"),
-    (r"\bwmic\b[^\r\n]*\b(?:terminate|call|delete|set|create)\b", "WMI 修改操作 (wmic)"),
+    (r"\bwmic\b(?=[^\r\n]{0,256}\b(?:terminate|call|delete|set|create)\b)", "WMI 修改操作 (wmic)"),
     # P2-8：diskpart 整体挑战级（clean 由 always_blocked 先拦 P0/REJECT，其余子命令走 P1）
     (r"\bdiskpart\b", "磁盘分区工具 (diskpart)"),
 ]
@@ -137,9 +116,10 @@ _SYSTEM_LEVEL_P1_RE = re.compile(
 
 # ── P1-7：解释器入口带内联代码载荷（无法静态解析确认无危险）→ P1 挑战确认 ──
 # -c / -e / /c / /k / -Command 为内联代码参数；python -m 属模块运行（pip 等）不拦截。
+# 前瞻限长 512，避免超长无匹配输入对每处解释器入口二次回溯（O(n^2)）。
 _INLINE_INTERPRETER_RE = re.compile(
     r"\b(?:python|python3|pythonw|py|node|nodejs|powershell|pwsh|cmd|bash|sh|zsh|perl|ruby)\b"
-    r"[^\r\n]*\s(?:-c|-e|/c|/k|-Command)\b",
+    r"(?=[^\r\n]{0,512}\s(?:-c|-e|/c|/k|-Command)\b)",
     re.IGNORECASE,
 )
 
@@ -467,6 +447,35 @@ def _is_batch_delete(command: str) -> bool:
     return False
 
 
+_PROGRAM_FILES_DIR_RE = re.compile(
+    r"(?i)(?:[A-Za-z]:[\\/]|%(?:ProgramFiles|ProgramFiles\(x86\))%[\\/]?|\$env:ProgramFiles[\\/]?)"
+    r"Program Files(?: \(x86\))?(?:[\\/]|$)",
+)
+
+
+def _is_program_files_delete(command: str) -> bool:
+    """判断删除命令目标是否命中任意盘符的 Program Files / Program Files (x86)。
+
+    兼容三种写法：字面盘符路径（C:\\Program Files...）、%ProgramFiles% /
+    %ProgramFiles(x86)% 环境变量展开、$env:ProgramFiles 写法。
+    用于删除分流：Program Files 批量删除 → P0 直接拒绝（不弹框）；单文件删除保持既有分级；
+    软件卸载走步骤 4 _is_uninstall_command 专用分支（C 盘内 P1、非 C 盘 P2），不受影响。
+    """
+    candidates = [command]
+    expanded = command
+    for var in ("ProgramFiles(x86)", "ProgramFiles"):
+        expanded = expanded.replace(f"%{var}%", os.environ.get(var, "") or rf"C:\{var}")
+    expanded = re.sub(
+        r"\$env:ProgramFiles\b",
+        lambda m: os.environ.get("ProgramFiles", r"C:\Program Files"),
+        expanded,
+        flags=re.IGNORECASE,
+    )
+    if expanded != command:
+        candidates.append(expanded)
+    return any(_PROGRAM_FILES_DIR_RE.search(c) for c in candidates)
+
+
 def _get_uninstall_exe_path(command: str) -> str:
     """提取卸载命令中的卸载器 exe 路径（用于判断卸载目标是否位于 C 盘）。"""
     try:
@@ -739,7 +748,7 @@ def _run_command_threaded(command: str, working_dir: str = None, timeout: int = 
         try:
             result_container[0] = safe_exec.run_powershell(
                 command, working_dir=working_dir, timeout=timeout,
-                _skip_validation=True, **safe_exec_kwargs
+                validation_skip_reason="upper_layer_verified", **safe_exec_kwargs
             )
         except Exception as e:
             exception_container[0] = e
@@ -777,11 +786,26 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
     """
     # 内部确认标志：由 react_engine Path B 确认通过后带 token 重调注入，
     # 不出现在 LLM 可见的 JSON Schema 中（schema 已过滤这些参数名）。
-    confirmed = bool(kwargs.get("confirmed"))
     challenge_response = kwargs.get("challenge_response")
     challenge_token = kwargs.get("challenge_token")
     confirmation_token = kwargs.get("confirmation_token")
+    # P0-1：confirmed 必须来自真实确认流程——下方 confirmation_manager 的
+    # challenge_token / confirmation_token 校验通过后置 _is_verified。
+    # 禁止调用方手工传入 confirmed=True 绕过分级：此处仅记录声明用于审计，
+    # 不参与放行判断；未持有效确认凭证时按未确认处理，回到正常分级通道。
+    _claimed_confirmed = bool(kwargs.get("confirmed"))
+    if _claimed_confirmed and not (challenge_token or confirmation_token):
+        _log_confirmation(command, "IGNORED_CONFIRMED",
+                          "手工传入 confirmed=True 且无有效确认凭证，已忽略并按未确认处理")
     domain_confirmed = bool(kwargs.get("domain_confirmed"))
+    # P0-1：domain_confirmed 同样属于内部确认标志，必须绑定有效确认凭证才能生效。
+    # 手工传入 domain_confirmed=True 且无 challenge_token/confirmation_token 时，
+    # 视为伪造声明：忽略并回退未确认分级通道（防止裸布尔绕过 P1/P2 分级确认）。
+    _claimed_domain = domain_confirmed
+    if _claimed_domain and not (challenge_token or confirmation_token):
+        _log_confirmation(command, "IGNORED_DOMAIN_CONFIRMED",
+                          "手工传入 domain_confirmed 且无有效确认凭证，已忽略并按未确认处理")
+        domain_confirmed = False
     prevalidated_uninstall_paths = kwargs.get("prevalidated_uninstall_paths")
     stripped = command.lstrip()
     if not stripped:
@@ -858,6 +882,77 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             }
         }, ensure_ascii=False)
 
+    # ── 2.7 无条件硬拦截（任何确认态 / domain_confirmed 均不豁免）──
+    # 危险模式、L0 路径保护（.ssh/.git/微信记录/系统目录）、C 盘删除边界、
+    # Program Files 批量删除、reg import、全局根键写入等 P0/REJECT 一律直接拒绝。
+    # P0-1 修复：原实现这些检查位于下方 `if not _is_verified:` 分级链内，真实确认凭证
+    # （challenge_token/confirmation_token）或手工 domain_confirmed 直通后会被整体跳过，
+    # 导致 HKLM 写入 / .ssh 目录删除 / C 盘非用户目录删除 / Program Files 批量删除等
+    # P0 拦截被绕过。此处前置为无条件层：确认凭证只豁免 P1/P2 分级确认，不豁免 P0。
+    _block_hit_early, _challenge_hit_early = safe_exec._check_protected_paths(command, cwd=working_dir)
+    if _block_hit_early:
+        _log_confirmation(command, "BLOCK", f"路径保护拦截: {_block_hit_early}")
+        return json.dumps({
+            "success": False,
+            "message": f"安全策略：禁止修改 {_block_hit_early}。此路径受硬保护。",
+            "stop": True,
+            "details": {
+                "命令": command[:200],
+                "说明": "目标路径受 protected_path_patterns 硬保护（敏感凭据目录/系统目录），请用户手动完成该操作"
+            }
+        }, ensure_ascii=False)
+    if any(re.search(p[0], command, re.IGNORECASE) for p in _get_cfg().danger_patterns):
+        return json.dumps({
+            "success": False,
+            "message": "操作被拒绝：命令匹配危险模式，需要预先授权"
+        })
+    if _REG_IMPORT_RE.search(command):
+        return json.dumps({
+            "success": False,
+            "message": "操作被拒绝：reg import 导入的注册表文件内容无法静态解析，禁止 Agent 直接执行",
+            "details": {
+                "命令": command[:200],
+                "说明": "请由用户手动运行 reg import，或明确拆分导入键后再授权"
+            }
+        }, ensure_ascii=False)
+    if _REGISTRY_WRITE_OTHER_RE.search(command):
+        # 全局注册表根键（HKCR/HKU/HKCC 等）写 → P0 直接拒绝（REJECT，不弹确认框）；
+        # 与 HKLM 同级均为系统级注册表，禁止 Agent 修改，请用户手动操作。
+        return json.dumps({
+            "success": False,
+            "message": "操作被拒绝：修改全局注册表根键（HKCR/HKU/HKCC 等）属于 P0 风险操作，禁止 Agent 执行",
+            "details": {
+                "命令": command[:200],
+                "风险等级": "P0",
+                "说明": "HKCR/HKU/HKCC 等全局根键影响系统级配置，一律直接拒绝（与 HKLM 同级），请用户手动操作"
+            }
+        }, ensure_ascii=False)
+    if any(re.search(pattern, command, re.IGNORECASE) for pattern in _get_cfg().delete_command_patterns):
+        if _is_program_files_delete(command) and _is_batch_delete(command):
+            # Program Files / Program Files (x86)（任意盘符，含 %ProgramFiles%/%ProgramFiles(x86)%
+            # 环境变量与 $env:ProgramFiles 写法）批量删除 → P0 直接拒绝（不弹确认框）。
+            return json.dumps({
+                "success": False,
+                "message": "操作被拒绝：批量删除 Program Files / Program Files (x86) 程序目录属于 P0 风险操作，禁止 Agent 执行",
+                "details": {
+                    "命令": command[:200],
+                    "风险等级": "P0",
+                    "说明": "批量删除程序目录可能破坏软件安装，一律直接拒绝；卸载请走专用卸载通道（P1 挑战确认），请用户手动操作"
+                }
+            }, ensure_ascii=False)
+        if _is_c_drive_delete(command) and not _is_current_user_dir_delete(command):
+            # C 盘除当前用户目录（C:\Users\<当前用户>，含子目录）外禁止 Agent 删除：
+            # 含 C:\Users 下其他用户目录、C:\Windows、C:\Program Files 等一律拒绝。
+            return json.dumps({
+                "success": False,
+                "message": "操作被拒绝：C 盘除当前用户文件夹外禁止 Agent 删除文件",
+                "details": {
+                    "命令": command[:200],
+                    "说明": "C 盘中仅当前用户文件夹（C:\\Users\\<当前用户>）允许删除，其余位置（含其他用户目录、Windows、Program Files 等）不允许 Agent 执行，请用户手动操作"
+                }
+            }, ensure_ascii=False)
+        # 其余删除（临时目录豁免 / 单文件 P2 / 批量 P1）留在分级链按确认态处理
+
     # ── 3. 音频命令重定向到 system_audio（零风险命令，免确认）──
     audio_result = _try_redirect_audio_command(stripped)
     if audio_result is not None:
@@ -869,7 +964,7 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
         if not path_check["valid"]:
             return json.dumps(path_check, ensure_ascii=False)
 
-        if not _is_verified and not confirmed:
+        if not _is_verified:
             # 卸载软件分级确认：C 盘内 P1（挑战短语），非 C 盘 P2（普通确认）
             uninstall_exe = _get_uninstall_exe_path(command)
             try:
@@ -911,7 +1006,7 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "说明": "此操作将删除软件及其相关文件，不可恢复"
                     }
                 }, ensure_ascii=False)
-        # confirmed 或已验证 → 继续执行
+        # 已验证（真实确认凭证或 domain_confirmed 豁免）→ 继续执行
 
     # ── 4. 原有的命令分类与风险判断（未经验证时执行）──
     try:
@@ -936,11 +1031,6 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             if not _HAS_COMBINED_SEGMENTS_RE.search(command):
                 _is_verified = True
                 _command_is_readonly = True
-        elif (any(kw in command for kw in _get_cfg().low_risk_registry_patterns)
-                and _is_hkcu_only_low_risk_command(command, first_token)):
-            # P2-10：仅放行纯 HKCU 低风险注册表写（无分号/管道/其他根键夹带）
-            _is_verified = True
-            _command_is_readonly = True
         elif _NET_READONLY_RE.search(command) or _WMIC_READONLY_RE.search(command):
             # P1-5：net/wmic 已从 readonly 白名单移除，仅放行明确只读子命令（net view/user
             # 查询、wmic list/get 等）；带修改参数的 net/wmic 由下方 _SYSTEM_LEVEL_P1_RE 拦截。
@@ -948,10 +1038,10 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
             _command_is_readonly = True
 
         if not _is_verified:
-            if confirmed or domain_confirmed:
-                _is_verified = True
-                _confirmed_note = "[已确认]" if confirmed else "[域已确认]"
-            elif _SYSTEM_LEVEL_P1_RE.search(command):
+            # P0-1：confirmed 手工声明不再生效，仅真实 token 校验（_is_verified）置位。
+            # domain_confirmed 仅豁免 P1/P2 分级确认层（见下方置位点）；P0 硬拦截已
+            # 在步骤 2.7 无条件执行，任何确认态都不豁免。
+            if not domain_confirmed and _SYSTEM_LEVEL_P1_RE.search(command):
                 # P1-6：系统级操作（服务/账户/进程/启动配置/网络/计划任务/ACL/WMI 修改）→ P1 挑战确认
                 _p1_desc = _match_p1_desc(command)
                 challenge_phrase = _get_cfg().danger_challenge_phrase
@@ -974,7 +1064,7 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "说明": _p1_desc
                     }
                 }, ensure_ascii=False)
-            elif _INLINE_INTERPRETER_RE.search(command):
+            elif not domain_confirmed and _INLINE_INTERPRETER_RE.search(command):
                 # P1-7：解释器入口带内联代码载荷（python -c / node -e / powershell -Command /
                 # cmd /c / bash -c 等），载荷无法静态解析确认无危险 → P1 挑战确认。
                 # 例外：解释器包装的 C 盘删除不因包装而放宽（保持既有 C 盘删除 REJECT 优先）。
@@ -988,6 +1078,17 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "details": {
                             "命令": command[:200],
                             "说明": "C 盘中仅当前用户文件夹（C:\\Users\\<当前用户>）允许删除，其余位置（含其他用户目录、Windows、Program Files 等）不允许 Agent 执行，请用户手动操作"
+                        }
+                    }, ensure_ascii=False)
+                if _is_program_files_delete(command) and _is_batch_delete(command):
+                    # 解释器包装的 Program Files 批量删除同样 P0 拒绝（不因包装而放宽）
+                    return json.dumps({
+                        "success": False,
+                        "message": "操作被拒绝：批量删除 Program Files / Program Files (x86) 程序目录属于 P0 风险操作，禁止 Agent 执行",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P0",
+                            "说明": "批量删除程序目录可能破坏软件安装，一律直接拒绝；卸载请走专用卸载通道（P1 挑战确认），请用户手动操作"
                         }
                     }, ensure_ascii=False)
                 challenge_phrase = _get_cfg().danger_challenge_phrase
@@ -1010,8 +1111,16 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "说明": "python -c / node -e / powershell -Command / cmd /c / bash -c 等内联载荷无法静态确认无危险"
                     }
                 }, ensure_ascii=False)
+
+            if domain_confirmed:
+                # P0-1：domain_confirmed 仅豁免 P1/P2 分级确认层（系统级操作/解释器内联/
+                # 删除分级/reg import/HKCU/挑战路径/危险操作确认），绝不豁免步骤 2.7 的
+                # 无条件 P0 硬拦截（危险模式、L0 路径保护、C 盘删除边界、Program Files
+                # 批量删除、全局根键写入等）。
+                _is_verified = True
+                _confirmed_note = "[域已确认]"
             elif any(re.search(p[0], command, re.IGNORECASE) for p in _get_cfg().danger_patterns):
-                # 危险模式：无预先授权时直接拒绝，不返回 chat 级确认
+                # 危险模式：已在步骤 2.7 无条件拒绝，此分支仅作兜底（正常不可达）
                 return json.dumps({
                     "success": False,
                     "message": "操作被拒绝：命令匹配危险模式，需要预先授权"
@@ -1022,6 +1131,20 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                     _is_verified = True
                     _confirmed_note = "[临时文件夹豁免]"
                     _log_confirmation(command, "TEMP_EXEMPT", "删除临时文件夹内文件，豁免确认")
+                elif _is_program_files_delete(command) and _is_batch_delete(command):
+                    # Program Files / Program Files (x86)（任意盘符，含 %ProgramFiles%/%ProgramFiles(x86)%
+                    # 环境变量与 $env:ProgramFiles 写法）批量删除 → P0 直接拒绝（不弹确认框）。
+                    # 单文件删除不在此列（走既有分级：C 盘非当前用户目录 REJECT / 其余 P2）；
+                    # 软件卸载由步骤 4 _is_uninstall_command 前置分支处理（C 盘内 P1、非 C 盘 P2），不受影响。
+                    return json.dumps({
+                        "success": False,
+                        "message": "操作被拒绝：批量删除 Program Files / Program Files (x86) 程序目录属于 P0 风险操作，禁止 Agent 执行",
+                        "details": {
+                            "命令": command[:200],
+                            "风险等级": "P0",
+                            "说明": "批量删除程序目录可能破坏软件安装，一律直接拒绝；卸载请走专用卸载通道（P1 挑战确认），请用户手动操作"
+                        }
+                    }, ensure_ascii=False)
                 elif _is_c_drive_delete(command) and not _is_current_user_dir_delete(command):
                     # C 盘除当前用户目录（C:\Users\<当前用户>，含子目录）外禁止 Agent 删除：
                     # 含 C:\Users 下其他用户目录、C:\Windows、C:\Program Files 等一律拒绝。
@@ -1079,32 +1202,39 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                         "说明": "请由用户手动运行 reg import，或明确拆分导入键后再授权"
                     }
                 }, ensure_ascii=False)
-            elif _REGISTRY_WRITE_HKCU_RE.search(command):
-                # HKCU 注册表写操作（非 low_risk 白名单项）：P2 普通确认，不得直接放行
-                token = _get_confirmation_manager().create_confirmation(command=command)
+            elif _REGISTRY_WRITE_OTHER_RE.search(command):
+                # 全局注册表根键（HKCR/HKU/HKCC 等）写 → P0 直接拒绝（REJECT，不弹确认框）；
+                # 与 HKLM 同级均为系统级注册表，禁止 Agent 修改，请用户手动操作。
                 return json.dumps({
                     "success": False,
-                    "confirmation_required": True,
-                    "confirmation_token": token,
-                    "message": "修改 HKCU 注册表属于 P2 风险操作，需要确认",
+                    "message": "操作被拒绝：修改全局注册表根键（HKCR/HKU/HKCC 等）属于 P0 风险操作，禁止 Agent 执行",
                     "details": {
                         "命令": command[:200],
-                        "风险等级": "P2",
-                        "说明": "修改用户级注册表（HKCU），需用户确认后执行"
+                        "风险等级": "P0",
+                        "说明": "HKCR/HKU/HKCC 等全局根键影响系统级配置，一律直接拒绝（与 HKLM 同级），请用户手动操作"
                     }
                 }, ensure_ascii=False)
-            elif _REGISTRY_WRITE_OTHER_RE.search(command):
-                # P2-9：其他注册表根键（HKCR/HKU/HKCC 等）写 → P2 普通确认
-                token = _get_confirmation_manager().create_confirmation(command=command)
+            elif _REGISTRY_WRITE_HKCU_RE.search(command):
+                # HKCU 注册表写操作：P1 挑战短语确认（与批量删除/卸载 C 盘内分支同风格）；
+                # 所有 HKCU 写一律挑战确认，不再有低风险放行路径。
+                challenge_phrase = _get_cfg().danger_challenge_phrase
+                token = _get_confirmation_manager().create_challenge(
+                    command=command,
+                    desc="修改用户级注册表（HKCU）",
+                    source="system_tools",
+                    level="challenge"
+                )
+                _log_confirmation(command, "CHALLENGE", "HKCU 注册表写")
                 return json.dumps({
                     "success": False,
                     "confirmation_required": True,
-                    "confirmation_token": token,
-                    "message": "修改注册表（非 HKCU 根键）属于 P2 风险操作，需要确认",
+                    "challenge_phrase": challenge_phrase,
+                    "challenge_token": token,
+                    "message": f"修改 HKCU 注册表属于 P1 风险操作。请回复以下完整短语以确认执行：\n```\n{challenge_phrase}\n```",
                     "details": {
                         "命令": command[:200],
-                        "风险等级": "P2",
-                        "说明": "修改 HKCR/HKU/HKCC 等注册表根键，需用户确认后执行"
+                        "风险等级": "P1",
+                        "说明": "修改用户级注册表（HKCU），需要挑战短语确认"
                     }
                 }, ensure_ascii=False)
             else:
@@ -1257,10 +1387,10 @@ def execute_command(command: str, working_dir: str = None, **kwargs) -> str:
                 result = {"success": False, "message": f"启动卸载程序失败: {str(e)}", "output": f"启动卸载程序失败: {str(e)}"}
         elif _command_is_readonly and not is_uninstall:
             result = _run_command_threaded(actual_command, working_dir=working_dir, timeout=120,
-                                          domain_confirmed=(confirmed or bool(_confirmed_note)),
+                                          domain_confirmed=bool(_confirmed_note),
                                           **safe_exec_kwargs)
         else:
-            result = safe_exec.run_powershell(actual_command, working_dir=working_dir, timeout=120, domain_confirmed=(confirmed or bool(_confirmed_note)), _skip_validation=True, **safe_exec_kwargs)
+            result = safe_exec.run_powershell(actual_command, working_dir=working_dir, timeout=120, domain_confirmed=bool(_confirmed_note), validation_skip_reason="upper_layer_verified", **safe_exec_kwargs)
 
         if result.get("challenge_required"):
             return json.dumps({

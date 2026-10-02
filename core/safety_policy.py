@@ -39,10 +39,10 @@ def norm_sensitive_path(path: str) -> str:
 
 
 def match_sensitive_read_root(path: str) -> Optional[str]:
-    """路径命中敏感读取根目录（仅 C:\Windows）时返回展示描述，否则 None。
+    """路径命中敏感读取根目录（仅 C:\\Windows）时返回展示描述，否则 None。
 
     兼容大小写、正反斜杠、尾随分隔符等变体；不误伤 C:\\Users 等用户目录。
-    读取语义已放宽：仅 C:\Windows 受保护，Program Files / ProgramData 允许读取。
+    读取语义已放宽：仅 C:\\Windows 受保护，Program Files / ProgramData 允许读取。
     """
     np = norm_sensitive_path(path)
     if not np:
@@ -56,8 +56,8 @@ def match_sensitive_read_root(path: str) -> Optional[str]:
 def match_sensitive_copy_root(path: str) -> Optional[str]:
     """路径命中复制保护根目录（四目录）时返回展示描述，否则 None。
 
-    复制/修改/删除语义仍限制 C:\Windows、C:\Program Files、
-    C:\Program Files (x86)、C:\ProgramData 四目录，
+    复制/修改/删除语义仍限制 C:\\Windows、C:\\Program Files、
+    C:\\Program Files (x86)、C:\\ProgramData 四目录，
     防止"复制系统文件到工作区再读取"的绕过路径。
     逻辑与 match_sensitive_read_root 相同，仅保护集合不同。
     """

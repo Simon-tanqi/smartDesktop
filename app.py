@@ -110,7 +110,7 @@ def _validate_model_configs():
 
 
 def _init_app(app, config):
-    """应用初始化逻辑 - 生产环境部署时也会执行"""
+    """应用初始化逻辑"""
     logger.info("="*60)
     logger.info("Agent 服务启动中...")
     logger.info(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

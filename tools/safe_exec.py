@@ -512,7 +512,15 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
     challenge_response = kwargs.get("challenge_response")
     challenge_token = kwargs.get("challenge_token")
     domain_confirmed = bool(kwargs.get("domain_confirmed"))
-    _skip_validation = bool(kwargs.get("_skip_validation"))
+    # P1-1：显式跳过原因（来源枚举）替代裸布尔 _skip_validation。
+    # 仅白名单场景允许跳过 L0/L2：upper_layer_verified（上层 execute_command 已完成
+    # 同命令权限验证并携带有效确认凭证/豁免标记）。未知原因一律视为不跳过，
+    # 避免上层透传任意标志瓦解路径/危险模式防护。
+    _ALLOWED_VALIDATION_SKIP_REASONS = ("upper_layer_verified",)
+    validation_skip_reason = kwargs.get("validation_skip_reason")
+    if validation_skip_reason is not None and validation_skip_reason not in _ALLOWED_VALIDATION_SKIP_REASONS:
+        _log("WARN", f"忽略未知 validation_skip_reason: {validation_skip_reason}")
+    _skip_validation = validation_skip_reason in _ALLOWED_VALIDATION_SKIP_REASONS
     _evict_stale_challenges()
 
     script = _normalize_command(script)
@@ -618,7 +626,10 @@ def run_powershell(script, working_dir=None, timeout=COMMAND_TIMEOUT, encoding="
 
     if first_prog in cmd_exclusive_programs:
         # 对 cmd /c 分支额外检测拼接（防止绕过）
-        if not challenge_verified:
+        # P0-1 修复：_skip_validation（upper_layer_verified）表示 execute_command 已按
+        # 无条件硬拦截 + 确认凭证完成校验，此处不应再二次发起挑战——否则已确认的
+        # cmd /c 命令会在此被误拦截（返回 challenge_required 被上层转为拒绝）。
+        if not challenge_verified and not _skip_validation:
             # 再次检测拼接符号（已增强）
             danger, _, _ = _check_danger(script)
             if danger:

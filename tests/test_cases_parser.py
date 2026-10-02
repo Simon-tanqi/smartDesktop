@@ -11,6 +11,7 @@ from typing import List, Optional
 @dataclass
 class TestCase:
     """测试用例数据模型"""
+    __test__ = False  # 非测试类：避免 pytest 因类名 Test 开头 + dataclass 生成 __init__ 尝试收集（PytestCollectionWarning）
     id: str                  # T-01 ~ T-55
     category: str            # 类别名称
     title: str               # 测试标题

@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""P2 批针对性验证：diskpart 整体 P1、low_risk_registry+HKCU 收紧、声明对齐冒烟。"""
+"""P2 批针对性验证：diskpart 整体 P1、HKCU 写一律 P1 挑战（P2-10 低风险放行已移除）、全局根键 P0 拒绝、声明对齐冒烟。"""
 import json
+import os
 import sys
 from unittest import mock
 
 import pytest
 
-sys.path.insert(0, r"D:\PyCharm Project\smartDesktop")
+# P1-2：基于 __file__ 推导项目根，避免本机绝对路径残留
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
 
 import core.tool_data_provider  # noqa
 from tools import system_tools  # noqa
@@ -60,16 +63,17 @@ def test_diskpart_other_commands_challenge():
         p1.stop(); p2.stop()
 
 
-# ── P2-10：low_risk_registry + HKCU 放行收紧 ──
-def test_hkcu_low_risk_plain_allowed():
+# ── P2-10：HKCU 低风险放行已移除，一律 P1 挑战 ──
+def test_hkcu_low_risk_plain_challenge():
     p1, p2 = _mock_exec()
     try:
+        # 低风险关键词（HideFileExt 等）不再直接放行：所有 HKCU 写一律 P1 挑战确认
         assert _classify(_exec(
             'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
-            '/v HideFileExt /t REG_DWORD /d 1 /f')) == "ALLOW"
+            '/v HideFileExt /t REG_DWORD /d 1 /f')) == "P1_CHALLENGE"
         assert _classify(_exec(
             'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
-            '-Name HideFileExt -Value 1')) == "ALLOW"
+            '-Name HideFileExt -Value 1')) == "P1_CHALLENGE"
     finally:
         p1.stop(); p2.stop()
 
@@ -80,10 +84,10 @@ def test_hkcu_low_risk_with_semicolon_blocked():
         # 分号夹带 HKLM 写 → 不放行（danger_patterns 命中 → REJECT）
         assert _classify(_exec(
             'reg add "HKCU\\Software\\Test" /v HideFileExt /d 1 /f ; reg add "HKLM\\Software\\Test" /v x /d 1 /f')) == "REJECT"
-        # 分号夹带其他命令 → 不放行（解释器/组合段规则生效）
+        # 分号夹带其他命令 → 不放行（HKCU 写分支 P1 挑战确认）
         res = _classify(_exec(
             'reg add "HKCU\\Software\\Test" /v HideFileExt /d 1 /f ; whoami'))
-        assert res in ("P1_CHALLENGE", "P2_CONFIRM", "REJECT")
+        assert res == "P1_CHALLENGE"
     finally:
         p1.stop(); p2.stop()
 
@@ -104,10 +108,10 @@ def test_hkcu_low_risk_with_other_root_blocked():
         # 夹带 HKLM 根键 → 不放行（danger_patterns 命中）
         assert _classify(_exec(
             'reg add "HKLM\\Software\\Test" /v HideDesktopIcons /d 1 /f')) == "REJECT"
-        # 夹带 HKCR 根键 → 不放行（其他根键 → HKCU P2 或拒绝）
+        # 夹带 HKCR 根键 → 不放行（全局根键 → P0 拒绝）
         res = _classify(_exec(
             'reg add "HKCR\\Test" /v HideDesktopIcons /d 1 /f'))
-        assert res in ("P2_CONFIRM", "REJECT")
+        assert res == "REJECT"
     finally:
         p1.stop(); p2.stop()
 
@@ -126,12 +130,12 @@ def test_hkcu_low_risk_non_reg_first_token_blocked():
         p1.stop(); p2.stop()
 
 
-def test_hkcu_write_non_lowrisk_still_p2():
+def test_hkcu_write_non_lowrisk_still_p1():
     p1, p2 = _mock_exec()
     try:
-        # 非 low_risk 关键词的 HKCU 写 → P2 确认（既有机制不回退）
+        # 非 low_risk 关键词的 HKCU 写 → P1 挑战确认（全部 HKCU 写统一 P1，无放行旁路）
         assert _classify(_exec(
-            'reg add "HKCU\\Software\\Test" /v CustomValue /d 1 /f')) == "P2_CONFIRM"
+            'reg add "HKCU\\Software\\Test" /v CustomValue /d 1 /f')) == "P1_CHALLENGE"
     finally:
         p1.stop(); p2.stop()
 

@@ -21,6 +21,7 @@ from memory import append_session_message
 from config.settings import PROGRESS_EVALUATOR_ENABLED
 from core.progress_controller import Verdict
 from concurrent.futures import ThreadPoolExecutor
+from config.config_loader import get_safety_config
 
 
 class ToolDataProvider:
@@ -716,51 +717,132 @@ class ToolExecutionPipeline:
                 f"建议：更换思路/参数，或拆分为更小步骤后重试。")
 
     def check_tool_risk_level(self, tool_name: str, arguments: dict) -> tuple:
-        """工具执行前安全分级检查。
+        """工具执行前安全分级检查（P0–P3 四级语义）。
 
-        根据 risk_levels 映射表检查工具的风险等级：
-        - P0/P1：返回 (确认消息, 挑战短语, 风险等级) — 调用方应弹出确认窗口
-        - P2/P3：返回 (None, None, None) — 直接执行
+        风险等级语义（用户口径，最高优先级）：
+        - P0：永远拒绝（硬 BLOCK）——调用方必须直接拒绝，**绝不弹确认框**；
+              适用范围仅限：格式化磁盘、改动 C:\\Windows 等系统文件夹、全局注册表
+              （HKLM 等非用户级根键）、系统文件夹不允许访问/执行。
+        - P1：挑战确认——返回挑战短语，调用方弹出挑战短语输入框，短语精确匹配后才执行。
+        - P2：普通确认——调用方弹出确认/取消按钮。
+        - P3：直接执行——只读/查询/无害操作，无需确认。
 
-        单文件内容修改类工具（_SINGLE_FILE_EDIT_TOOLS：replace_in_file /
-        replace_in_text / edit_file / write_file）走动态定级，不读静态表：
-        - 目标在 C 盘非当前用户目录 → 返回 P0 直接拒绝（调用方不弹确认框，
-          直接返回拒绝结果，任务继续）
-        - 其余（C:\\Users\\<当前用户> 内或非 C 盘）→ 返回 P2 简单确认
-          （按钮确认，无挑战短语，单文件修改不升 P1）
+        动态定级（覆盖静态映射表，按根键 / 目标路径与数量判定）：
+        1) 单文件内容修改类（_SINGLE_FILE_EDIT_TOOLS：replace_in_file /
+           replace_in_text / edit_file / write_file）：
+           - 目标在 C 盘非当前用户目录 → P0 直接拒绝（调用方不弹确认框）
+           - 其余（C:\\Users\\<当前用户> 内或非 C 盘）→ P2 普通确认（单文件修改不升 P1）
+        2) 注册表写类（_REGISTRY_TOOLS：modify_registry）：
+           - 全局根键（HKLM / HKEY_LOCAL_MACHINE / HKCR / HKU / HKCC 等）→ P0 直接拒绝
+           - 用户级根键（HKEY_CURRENT_USER / HKCU）写 → 白名单
+             （registry_allowed_root_keys）内 P1 挑战确认；白名单外 → P0 直接拒绝
+           - 无法识别根键 → 保守按 P1 挑战确认
+        3) 删除类（_DELETE_TOOLS：delete_file）：
+           - 目标在 C 盘非当前用户目录 → P0 直接拒绝
+           - 批量删除（>1 个目标）→ P1 挑战确认
+           - 单文件删除 → P2 普通确认
 
         Returns:
             (msg, challenge_phrase, risk_level):
-            - msg: 描述性确认消息
-            - challenge_phrase: 挑战短语（P1 带固定短语供前端渲染输入框；P0/P2 为 None 渲染按钮）
-            - risk_level: "P0" / "P1" / "P2" / None
+            - msg: 描述性消息；P0 时为拒绝原因，调用方**不得**据此弹确认框
+            - challenge_phrase: 挑战短语（P1 带固定短语供前端渲染输入框；P0/P2 为 None）
+            - risk_level: "P0" / "P1" / "P2"，或 None（P3 / 无需确认）
         """
-        # ── 单文件内容修改类工具：动态定级（覆盖静态表） ──
+        args_preview = json.dumps(arguments, ensure_ascii=False)[:300]
+
+        # ── 1) 单文件内容修改类工具：动态定级（覆盖静态表） ──
         if tool_name in _SINGLE_FILE_EDIT_TOOLS:
-            args_preview = json.dumps(arguments, ensure_ascii=False)[:300]
             _c_path = _check_single_file_edit_p0(tool_name, arguments)
             if _c_path:
                 msg = (
                     f"[安全拦截] 工具 '{tool_name}' 目标文件位于 C 盘非用户数据目录"
-                    f"（{_c_path}），风险等级 P0（最高风险）："
+                    f"（{_c_path}），风险等级 P0（永远拒绝）："
                     f"C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止操作。"
                 )
                 return msg, None, "P0"
             msg = (
-                f"[安全确认] 工具 '{tool_name}' 将修改文件，风险等级 P2（中风险，简单确认），"
+                f"[安全确认] 工具 '{tool_name}' 将修改文件，风险等级 P2（普通确认），"
                 f"参数：{args_preview}。"
             )
             return msg, None, "P2"
 
+        # ── 2) 注册表写类工具：按根键动态定级 ──
+        if tool_name in _REGISTRY_TOOLS:
+            _global_root = _registry_global_root_hit(arguments)
+            if _global_root:
+                msg = (
+                    f"[安全拦截] 工具 '{tool_name}' 目标为全局注册表根键（{_global_root}），"
+                    f"风险等级 P0（永远拒绝）：全局注册表（HKLM 等非用户级根键）禁止修改，"
+                    f"参数：{args_preview}。"
+                )
+                return msg, None, "P0"
+            _user_root = _registry_user_root_hit(arguments)
+            if _user_root:
+                # P0-2：接入 registry_allowed_root_keys 白名单（config 声明生效）。
+                # 白名单内用户级根键（如 HKCU / HKEY_CURRENT_USER）→ P1 挑战确认；
+                # 白名单外（含未声明根键）→ P0 拒绝，与 execute_command 通道语义一致
+                # （execute_command：HKCU 写 → P1 挑战、全局根键 → P0 拒绝）。
+                try:
+                    _allowed = get_safety_config().registry_allowed_root_keys or set()
+                except Exception:
+                    _allowed = set()
+                _allowed_roots: Set[str] = set()
+                for _r in _allowed:
+                    _rk = str(_r).strip().upper()
+                    _allowed_roots.add(_rk)
+                    _allowed_roots.update(_REGISTRY_ROOT_ALIASES.get(_rk, set()))
+                if _user_root in _allowed_roots:
+                    msg = (
+                        f"[安全确认] 工具 '{tool_name}' 将修改注册表（用户级根键 {_user_root}，"
+                        f"位于 registry_allowed_root_keys 白名单内），风险等级 P1（挑战确认），"
+                        f"参数：{args_preview}。"
+                    )
+                    return msg, CHALLENGE_PHRASE_DEFAULT, "P1"
+                msg = (
+                    f"[安全拦截] 工具 '{tool_name}' 目标为用户级根键（{_user_root}），但不在"
+                    f" registry_allowed_root_keys 白名单"
+                    f"（{sorted(str(_r).strip().upper() for _r in _allowed)}）内，"
+                    f"风险等级 P0（永远拒绝）：仅白名单内用户级根键允许 P1 挑战确认，"
+                    f"参数：{args_preview}。"
+                )
+                return msg, None, "P0"
+            msg = (
+                f"[安全确认] 工具 '{tool_name}' 将修改注册表（未识别到根键，按高风险处理），"
+                f"风险等级 P1（挑战确认），参数：{args_preview}。"
+            )
+            return msg, CHALLENGE_PHRASE_DEFAULT, "P1"
+
+        # ── 3) 删除类工具：按目标路径与数量动态定级 ──
+        if tool_name in _DELETE_TOOLS:
+            _c_path = _check_delete_p0(arguments)
+            if _c_path:
+                msg = (
+                    f"[安全拦截] 工具 '{tool_name}' 目标位于 C 盘非用户数据目录"
+                    f"（{_c_path}），风险等级 P0（永远拒绝）："
+                    f"C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止删除。"
+                )
+                return msg, None, "P0"
+            if _delete_is_batch(arguments):
+                msg = (
+                    f"[安全确认] 工具 '{tool_name}' 将批量删除多个目标，风险等级 P1（挑战确认），"
+                    f"参数：{args_preview}。"
+                )
+                return msg, CHALLENGE_PHRASE_DEFAULT, "P1"
+            msg = (
+                f"[安全确认] 工具 '{tool_name}' 将删除单个文件，风险等级 P2（普通确认），"
+                f"参数：{args_preview}。"
+            )
+            return msg, None, "P2"
+
+        # ── 4) 其余工具读静态映射表（未登记工具默认 P3，直接执行） ──
         risk = self._risk_levels.get(tool_name, "P3")
         if risk in ("P0", "P1"):
-            args_preview = json.dumps(arguments, ensure_ascii=False)[:300]
-            level_label = "P0（最高风险）" if risk == "P0" else "P1（高风险）"
+            level_label = "P0（永远拒绝）" if risk == "P0" else "P1（挑战确认）"
             msg = (
                 f"[安全拦截] 工具 '{tool_name}' 风险等级 {level_label}，"
                 f"参数：{args_preview}。"
             )
-            challenge = "我知晓此操作为危险操作，确认执行。" if risk == "P1" else None
+            challenge = CHALLENGE_PHRASE_DEFAULT if risk == "P1" else None
             return msg, challenge, risk
         return None, None, None
 
@@ -1122,11 +1204,51 @@ _SINGLE_FILE_EDIT_TOOLS = {
     "replace_in_file", "replace_in_text", "edit_file", "write_file",
 }
 
+# 删除类工具集合：风险等级动态化（不读静态表）。
+# - 目标在 C 盘且不在 C:\Users\<当前用户> 目录下 → P0 直接拒绝（不弹确认框）
+# - 批量删除（>1 个目标）→ P1 挑战确认
+# - 单文件删除 → P2 普通确认
+_DELETE_TOOLS = {
+    "delete_file",
+}
+
+# 注册表写类工具集合：风险等级动态化（不读静态表）。
+# - 全局根键（HKLM / HKEY_LOCAL_MACHINE / HKCR / HKU / HKCC 等非用户级根键）
+#   → P0 直接拒绝（不弹确认框）
+# - 用户级根键（HKEY_CURRENT_USER / HKCU）写 → P1 挑战确认
+_REGISTRY_TOOLS = {
+    "modify_registry",
+}
+
+# 批量删除阈值：目标数量 > 该值视为批量删除（P1 挑战确认），否则单文件删除（P2 普通确认）。
+BATCH_DELETE_THRESHOLD = 1
+
 # 系统级拒绝固定文案：命中敏感系统路径后直接作为最终回复输出，不允许换工具重试。
 SENSITIVE_BLOCK_FINAL_REPLY = "内容不允许操作，如需操作请用户自行手动操作"
 
+# 挑战短语固定文案（P1 使用；P0 为硬拒绝，不提供挑战短语）。
+CHALLENGE_PHRASE_DEFAULT = "我知晓此操作为危险操作，确认执行。"
+
 # Windows 绝对路径识别（C:\... / C:/...）
 _ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+# ── 注册表根键识别（动态定级用） ──
+# 全局/非用户级根键：HKLM 等 → P0 直接拒绝
+_GLOBAL_REGISTRY_ROOT_RE = re.compile(
+    r"(?<![A-Za-z_])(HKLM|HKEY_LOCAL_MACHINE|HKCR|HKEY_CLASSES_ROOT|HKU|HKEY_USERS|"
+    r"HKCC|HKEY_CURRENT_CONFIG|HKEY_PERFORMANCE_DATA|HKEY_DYN_DATA)(?![A-Za-z_])",
+    re.IGNORECASE,
+)
+# 用户级根键：HKCU → 白名单内 P1 挑战确认，白名单外 P0 拒绝（见 check_tool_risk_level）
+_USER_REGISTRY_ROOT_RE = re.compile(
+    r"(?<![A-Za-z_])(HKCU|HKEY_CURRENT_USER)(?![A-Za-z_])",
+    re.IGNORECASE,
+)
+# 根键等价别名（缩写 ↔ 全名），用于 registry_allowed_root_keys 白名单匹配
+_REGISTRY_ROOT_ALIASES = {
+    "HKCU": {"HKCU", "HKEY_CURRENT_USER"},
+    "HKEY_CURRENT_USER": {"HKCU", "HKEY_CURRENT_USER"},
+}
 
 
 def _extract_abs_paths(arguments: dict) -> List[str]:
@@ -1151,10 +1273,10 @@ def _extract_abs_paths(arguments: dict) -> List[str]:
 
 
 def _check_sensitive_path_read(tool_name: str, arguments: dict) -> Optional[str]:
-    """读取类工具命中敏感读取根目录（仅 C:\Windows）时返回展示描述，否则 None。
+    """读取类工具命中敏感读取根目录（仅 C:\\Windows）时返回展示描述，否则 None。
 
     兼容大小写、正反斜杠、尾随分隔符等变体；不误伤 C:\\Users 等用户目录。
-    读取语义已放宽：仅 C:\Windows 受保护，Program Files / ProgramData 允许读取。
+    读取语义已放宽：仅 C:\\Windows 受保护，Program Files / ProgramData 允许读取。
     """
     if tool_name not in _READ_TOOLS:
         return None
@@ -1171,8 +1293,8 @@ def _check_sensitive_path_copy(tool_name: str, arguments: dict) -> Optional[str]
 
     仅检查源路径参数（source_path / source / path / file_path / src 等），
     命中即系统级拒绝，杜绝"复制系统文件到工作区再读取"的绕过路径。
-    复制/修改/删除语义仍限制 C:\Windows、C:\Program Files、
-    C:\Program Files (x86)、C:\ProgramData 四目录。
+    复制/修改/删除语义仍限制 C:\\Windows、C:\\Program Files、
+    C:\\Program Files (x86)、C:\\ProgramData 四目录。
     """
     if tool_name not in _COPY_TOOLS:
         return None
@@ -1241,6 +1363,129 @@ def _check_single_file_edit_p0(tool_name: str, arguments: dict) -> Optional[str]
         if hit:
             return hit
     return None
+
+
+def _iter_string_values(arguments: dict):
+    """递归产出参数中的全部字符串值（含列表/字典嵌套）。"""
+    def _scan(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for _v in v.values():
+                yield from _scan(_v)
+        elif isinstance(v, (list, tuple)):
+            for _v in v:
+                yield from _scan(_v)
+
+    for _v in (arguments or {}).values():
+        yield from _scan(_v)
+
+
+def _registry_global_root_hit(arguments: dict) -> Optional[str]:
+    """注册表工具命中全局/非用户级根键（HKLM 等）时返回规范化根键名，否则 None。
+
+    动态定级规则（注册表写类工具）：
+    - 全局根键（HKLM / HKEY_LOCAL_MACHINE / HKCR / HKU / HKCC 等）→ P0 直接拒绝；
+    - 仅命中用户级根键（HKEY_CURRENT_USER / HKCU）→ 返回 None（走 P1 挑战确认）。
+    """
+    for s in _iter_string_values(arguments):
+        m = _GLOBAL_REGISTRY_ROOT_RE.search(s or "")
+        if m:
+            return m.group(1).upper()
+    return None
+
+
+def _registry_user_root_hit(arguments: dict) -> Optional[str]:
+    """注册表工具命中用户级根键（HKCU / HKEY_CURRENT_USER）时返回根键名，否则 None。"""
+    for s in _iter_string_values(arguments):
+        m = _USER_REGISTRY_ROOT_RE.search(s or "")
+        if m:
+            return m.group(1).upper()
+    return None
+
+
+def _collect_delete_targets(arguments: dict) -> List[str]:
+    """提取删除类工具的候选目标（支持单值 / 列表 / 别名键 / 嵌套结构）。"""
+    targets: List[str] = []
+    _target_keys = {
+        "file_path", "filepath", "path", "paths", "file_paths",
+        "target", "targets", "target_path", "src", "source", "source_path",
+        "dir", "dirs", "directory", "directories",
+    }
+
+    def _scan(v):
+        if isinstance(v, str):
+            s = v.strip().strip("\"'`")
+            if s:
+                targets.append(s)
+        elif isinstance(v, dict):
+            for _v in v.values():
+                _scan(_v)
+        elif isinstance(v, (list, tuple)):
+            for _v in v:
+                _scan(_v)
+
+    for k, v in (arguments or {}).items():
+        if str(k).lower() in _target_keys:
+            _scan(v)
+    # 兜底：未命中已知键时，扫描列表中出现的批量目标
+    if not targets:
+        for v in (arguments or {}).values():
+            if isinstance(v, (list, tuple)):
+                _scan(v)
+    return targets
+
+
+def _check_delete_p0(arguments: dict) -> Optional[str]:
+    """删除类工具命中 C 盘非当前用户目录时返回该绝对路径，否则 None。
+
+    动态定级规则：
+    - 目标在 C 盘且不在 C:\\Users\\<当前用户> 目录下 → P0 直接拒绝（不弹确认框）；
+    - 其余（用户目录内或非 C 盘）→ 按数量分级：批量 P1 挑战确认、单文件 P2 普通确认。
+    """
+    for t in _collect_delete_targets(arguments):
+        hit = _c_drive_non_user_abs_path(t)
+        if hit:
+            return hit
+    return None
+
+
+def _delete_is_batch(arguments: dict) -> bool:
+    """删除类工具目标数量超过阈值（>1）时视为批量删除（P1 挑战确认）。"""
+    return len(_collect_delete_targets(arguments)) > BATCH_DELETE_THRESHOLD
+
+
+def _describe_p0_hit(tool_name: str, arguments: dict) -> tuple:
+    """构造 P0 硬拒绝明细：返回 (目标, 操作, 说明)。
+
+    仅用于 P0（永远拒绝）分支，供拒绝结果 details 使用；非 P0 工具返回通用兜底文案。
+    """
+    if tool_name in _REGISTRY_TOOLS:
+        root = _registry_global_root_hit(arguments) or "HKLM 等全局根键"
+        return (
+            root,
+            "修改全局注册表",
+            "全局注册表（HKLM 等非用户级根键）永远拒绝修改；用户级注册表（HKCU）属 P1 挑战确认。",
+        )
+    if tool_name in _DELETE_TOOLS:
+        path = _check_delete_p0(arguments) or ""
+        return (
+            path,
+            "删除",
+            "C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止删除文件。",
+        )
+    if tool_name in _SINGLE_FILE_EDIT_TOOLS:
+        path = _check_single_file_edit_p0(tool_name, arguments) or ""
+        return (
+            path,
+            "修改",
+            "C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止修改文件。",
+        )
+    return (
+        "",
+        "执行",
+        "该操作命中 P0 风险（永远拒绝）规则，不允许执行。",
+    )
 
 
 def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
@@ -1434,23 +1679,28 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                 final_reply_saved = True
                 return "return"
 
-            # ── 安全分级检查（P0/P1 需确认） ──
+            # ── 安全分级检查（P0 直接拒绝 / P1 挑战确认 / P2 普通确认） ──
             risk_msg, challenge_phrase, risk_level = engine.tool_pipeline.check_tool_risk_level(tool_name, arguments)
             _confirm_approved = False
             if risk_msg:
-                # ── 单文件修改命中 C 盘非用户目录：P0 直接拒绝（不弹确认框，任务继续） ──
-                # 与敏感系统路径 BLOCK（中止任务）区分：此处仅拒绝本次单文件修改调用，
+                # ── P0（永远拒绝）：硬 BLOCK，绝不弹确认框 ──
+                # 适用范围：格式化磁盘、改动 C:\Windows 等系统文件夹、全局注册表
+                # （HKLM 等非用户级根键）、系统文件夹不允许访问/执行；以及由
+                # check_tool_risk_level 动态升级为 P0 的条目（C 盘非当前用户目录的
+                # 写/删、注册表全局根键写）。
+                # 与敏感系统路径 BLOCK（中止任务）区分：此处仅拒绝本次工具调用，
                 # 返回拒绝结果供 Agent 调整思路，不中止整个任务。
-                if risk_level == "P0" and tool_name in _SINGLE_FILE_EDIT_TOOLS:
+                if risk_level == "P0":
+                    _p0_target, _p0_op, _p0_note = _describe_p0_hit(tool_name, arguments)
                     yield engine.streamer.emit_step(
                         f"安全策略：{risk_msg}", "warning")
                     _block_result = {
                         "success": False,
-                        "message": "内容不允许操作，如需操作请用户自行手动操作",
+                        "message": SENSITIVE_BLOCK_FINAL_REPLY,
                         "details": {
-                            "路径": _check_single_file_edit_p0(tool_name, arguments),
-                            "操作": "修改",
-                            "说明": "C 盘除用户数据文件夹（C:\\Users\\<当前用户>）外禁止修改文件",
+                            "路径": _p0_target,
+                            "操作": _p0_op,
+                            "说明": _p0_note,
                             "风险等级": "P0",
                         },
                     }
@@ -1459,10 +1709,10 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                         args_preview += "..."
                     _tool_call_history.append({
                         "name": tool_name, "args": args_preview,
-                        "status": "blocked", "result": "C 盘非用户目录文件修改被拒绝（P0）"
+                        "status": "blocked", "result": f"P0 风险直接拒绝（{_p0_op}{_p0_target}）"
                     })
                     step_msg = engine.tool_pipeline.build_step_summary(tool_name, arguments, "", "failed",
-                        "C 盘非用户目录文件修改被拒绝（P0）", step)
+                        f"P0 风险直接拒绝（{_p0_op}{_p0_target}）", step)
                     _persist_tool_pair(engine, full_content, tool_call_id, tc, full_reasoning,
                                        json.dumps(_block_result, ensure_ascii=False))
                     conversation_messages.append({
@@ -1554,12 +1804,13 @@ def execute_one_step(engine, rs: RunState, state, tc: dict, step: int,
                     # ✅ 确认通过：写入确认缓存（同工具+同关键参数 120s 内不再重复确认）
                     engine._confirmed_cache[cache_key] = time.time()
                 else:
-                    # ── P0-3 fail-closed：无确认处理器时拒绝执行高风险工具，绝不默认放行 ──
+                    # ── P0-3 fail-closed：无确认处理器时拒绝执行 P1/P2 需确认工具，绝不默认放行 ──
+                    # （P0 永远拒绝，已在上面硬 BLOCK，不会走到本分支；此处仅兜底 P1/P2）
                     get_logger().warning(
-                        f"安全确认处理器缺失（confirmation_handler=None），已拒绝执行高风险工具 {tool_name}（{risk_level}）",
+                        f"安全确认处理器缺失（confirmation_handler=None），已拒绝执行需确认工具 {tool_name}（{risk_level}）",
                         trace_id=engine.trace_id, session_id=engine.session_id)
                     yield engine.streamer.emit_step(
-                        f"安全确认处理器缺失，已拒绝执行高风险工具 '{tool_name}'（{risk_level}）。"
+                        f"安全确认处理器缺失，已拒绝执行需确认工具 '{tool_name}'（{risk_level}）。"
                         f"请在具备确认能力的会话中重试。", "warning")
                     args_preview = json.dumps(arguments, ensure_ascii=False)[:500]
                     if len(json.dumps(arguments, ensure_ascii=False)) > 500:

@@ -278,10 +278,10 @@ tools:
     domains: [code_dev, excel_analyze]
 
   execute_command:
-    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg。注：音量/音频命令自动路由到 system_audio 执行。通用兜底工具：同一目标存在专用工具（如 extract_word_text/create_word_document/excel_analyze 域工具等）时，必须先尝试专用工具，仅当专用工具无法满足需求时才使用本工具，且须在 reasoning_trace 说明专用工具无法满足的原因
+    desc: 执行 PowerShell（文件/进程/注册表查询/网络/安装）。免确认：dir/copy/python/reg query 等只读操作。注：音量/音频命令自动路由到 system_audio 执行。通用兜底工具：同一目标存在专用工具（如 extract_word_text/create_word_document/excel_analyze 域工具等）时，必须先尝试专用工具，仅当专用工具无法满足需求时才使用本工具，且须在 reasoning_trace 说明专用工具无法满足的原因
     params:
       command: {type: str, desc: 要执行的PowerShell命令字符串}
-    note: 禁止 rm -rf/format/shutdown；C 盘文件删除操作一律拒绝。删除分级：临时文件夹免确认、非 C 盘单文件删除 P2 普通确认、非 C 盘批量删除 P1 挑战确认。卸载分级：C 盘内软件 P1 挑战确认、非 C 盘软件 P2 普通确认。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
+    note: 禁止 rm -rf/format/shutdown；C 盘文件删除操作一律拒绝。删除分级：临时文件夹免确认、非 C 盘单文件删除 P2 普通确认、非 C 盘批量删除 P1 挑战确认、Program Files / Program Files (x86)（任意盘符，含 %ProgramFiles% 展开）批量删除 P0 拒绝。卸载分级：C 盘内软件 P1 挑战确认、非 C 盘软件 P2 普通确认（卸载不受 Program Files 批量删除检查影响）。注册表写分级：HKCU 用户级写 P1 挑战确认、HKLM/HKCR/HKU/HKCC 等全局根键写 P0 拒绝。音量/静音/麦克风类命令自动重定向到 system_audio 免确认执行。超时30s
     tier: 2
     tags: [shell, system, general]
     domains: [system_high_risk]
