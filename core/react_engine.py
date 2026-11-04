@@ -10,8 +10,6 @@ import datetime
 import re
 import os
 import threading
-import multiprocessing
-from multiprocessing import Manager
 from typing import Dict, Any, List, Optional, Callable, Generator
 from dataclasses import dataclass, field
 from utils.dependency_manager import feature_availability
@@ -157,7 +155,6 @@ class ReActEngine:
         self.context_detector = ContextSwitchDetector(window_size=5, strict_threshold=0.25,
                                                       session_id=session_id)
         self._turn_state: Optional[AgentTurnState] = None  # 当前轮次状态引用，供 _on_final 回调使用
-        self._manager = Manager()
         self._search_breaker = SearchCircuitBreaker(failure_threshold=3, cooldown_seconds=60)
         self.tool_pipeline = ToolExecutionPipeline(
             search_breaker=self._search_breaker,

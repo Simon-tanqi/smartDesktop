@@ -29,14 +29,14 @@
 | 测试ID | 风险等级 | 测试场景 | 确认方式 | 超时处理 |
 |--------|----------|----------|----------|----------|
 | SC-001 | P0 (最高风险) | 格式化磁盘、改动 C:\Windows 等系统文件夹、修改全局注册表（HKLM / HKCR / HKU / HKCC 等非用户级根键）、Program Files（任意盘符）批量删除、C 盘非当前用户目录写/删 | **直接拒绝（BLOCK）**，绝不弹确认框 | 不适用（无确认等待，直接拒绝） |
-| SC-002 | P1 (高风险) | 卸载软件、批量删除（>10 个）、修改用户级注册表（HKCU）、move_file / GUI 点击输入 | 挑战短语 + 精确匹配 | 300s 后自动拒绝 |
+| SC-002 | P1 (高风险) | 卸载软件、批量删除（>1 个目标）、修改用户级注册表（HKCU）、move_file / GUI 点击输入 | 挑战短语（逐字一致）+ 一次性令牌 | 300s 后自动拒绝 |
 | SC-003 | P2 (普通确认) | 单文件写入/删除、执行命令、复制/下载 | 弹窗确认/取消按钮 | 300s 后自动拒绝 |
 | SC-004 | P3 (低风险) | 读取文件、查询信息 | 直接执行，无需确认 | N/A |
 
 **挑战短语验证逻辑**:
 ```python
-# 必须完全匹配配置的挑战短语
-if challenge_response == expected_phrase:
+# 必须与配置短语逐字一致（仅忽略首尾空白与大小写；"ok"/"确认"等泛化词一律拒绝）
+if challenge_response.strip().lower() == expected_phrase.strip().lower():
     _is_verified = True
 else:
     return {"success": False, "message": "挑战短语不匹配"}
@@ -146,27 +146,27 @@ else:
 
 ## 六、测试执行方法
 
-### 6.1 单元测试
+### 6.1 单元测试 / 冒烟测试
 
-```bash
-# 运行工具函数测试
-python -m pytest tests/test_system_tools.py -v
+```powershell
+# CI 执行范围：冒烟 + 核心纯逻辑单测 + 确认令牌回归（跨平台，不依赖 LLM 与 Windows 专属包）
+python -m pytest tests/test_smoke.py tests/test_core tests/test_confirmation_manager.py -q
 
-# 运行确认管理器测试
-python -m pytest tests/test_confirmation_manager.py -v
-
-# 运行 ReAct 引擎测试
-python -m pytest tests/test_react_engine.py -v
+# 安全回归：P0-P3 分级、命令护栏、注册表/磁盘防护、确认令牌
+python -m pytest tests/test_p0_command_guard.py tests/test_p1_system_guard.py tests/test_p1_validation_skip_reason.py tests/test_p2_registry_diskpart_guard.py tests/test_risk_level_dynamic.py tests/test_safety_policy.py tests/test_security_block.py -q
 ```
 
-### 6.2 集成测试
+> `tests/test_assertions.py`、`tests/test_orchestrator.py` 是真实 Agent 执行器，
+> 依赖 Windows 环境与本地可用的模型配置，不纳入 CI。
+
+### 6.2 端到端测试
 
 ```bash
-# 启动测试服务器
-python -m backend.chat --test-mode
+# 1) 启动 Agent 服务（默认 http://127.0.0.1:8765）
+python app.py
 
-# 运行 API 测试
-python -m pytest tests/integration/ -v --tb=short
+# 2) 另开终端执行 70 条真实任务用例（需先配置 %APPDATA%\smartDesktop\models.json）
+python tests/run_tests.py
 ```
 
 ### 6.3 手动测试清单

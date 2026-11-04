@@ -60,12 +60,6 @@ class ConfirmationManager:
     _instance: Optional["ConfirmationManager"] = None
     _instance_lock = threading.Lock()
 
-    # Bug 4: Flexible approval keywords for user-friendly response parsing
-    APPROVE_KEYWORDS = (
-        "yes", "y", "approve", "confirm", "ok",
-        "\u662f", "\u786e\u8ba4", "\u540c\u610f", "\u5141\u8bb8", "approved"
-    )
-
     def __init__(self, on_timeout_callback: Optional[Callable] = None):
         """Bug 10: Accept optional timeout callback for external notification."""
         self._pending: dict = {}
@@ -173,14 +167,15 @@ class ConfirmationManager:
         return token
 
     def verify_challenge(self, token: str, response: str, expected_phrase: str) -> Optional[dict]:
-        """Verify challenge response. Bug 4: flexible substring matching."""
+        """校验挑战短语：用户输入必须与配置短语逐字一致（仅忽略首尾空白与大小写）。
+
+        安全约束：不接受 "ok" / "确认" / "同意" 等泛化词，否则一句话即可放行高危操作，
+        P1 挑战确认形同虚设。令牌一次性使用：pop 后无论校验成败均已失效。
+        """
         entry = self.pop(token)
         if not entry or entry.get("type") != "challenge":
             return None
-        resp_lower = response.lower()
-        if resp_lower != expected_phrase.lower() and not any(
-            kw in resp_lower for kw in self.APPROVE_KEYWORDS
-        ):
+        if (response or "").strip().lower() != (expected_phrase or "").strip().lower():
             return None
         return entry
 
