@@ -18,6 +18,17 @@ TOOLS_CONFIG_PATH = PROMPTS_DIR / "tools.yaml"
 AGENT_SKILLS_DIR = Path(__file__).parent.parent / "agent_skills"
 AGENT_TOOLS_YAML = AGENT_SKILLS_DIR / "agent_tools.yaml"
 
+# 域 → 技能提示词文件名映射。
+# tools.yaml 中的域名与 prompts/skills/ 下的文件名历史上不完全一致
+# （如 code_dev 对应 code_generate.md），此处显式声明，避免技能提示词静默丢失。
+# 未收录的域按同名文件查找。
+DOMAIN_SKILL_MAP = {
+    "code_dev": "code_generate",
+    "excel_analyze": "data_excel",
+    "system_basic": "system_config",
+    "system_high_risk": "system_config",
+}
+
 
 def path_params(*params):
     """标记函数参数为路径参数（供工具注册中心识别路径类参数）"""
@@ -254,9 +265,11 @@ def match_persona(user_input: str) -> str | None:
 
 def get_skill_prompt(domain: str) -> str:
     """读取技能域提示词文本，带 mtime 缓存"""
-    path = PROMPTS_DIR / f"skills/{domain}.md"
+    # 域名与文件名不一致时走显式映射，否则按同名查找
+    skill_name = DOMAIN_SKILL_MAP.get(domain, domain)
+    path = PROMPTS_DIR / f"skills/{skill_name}.md"
     if not path.exists():
-        path = AGENT_SKILLS_DIR / f"skills/{domain}.md"
+        path = AGENT_SKILLS_DIR / f"skills/{skill_name}.md"
     
     if not path.exists():
         return ""

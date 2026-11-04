@@ -299,11 +299,13 @@ class ToolDataProvider:
             return self._merged_tools.copy()
     
     def get_domain_tools(self, domain: str) -> List[str]:
-        """获取指定域的工具列表"""
+        """获取指定域的工具列表（仅返回真实注册过的工具）"""
         self._sync_all()
+        with self._runtime_lock:
+            registered = set(self._runtime_tools)
         with self._merged_lock:
             domain_info = self._merged_domains.get(domain, {})
-            return domain_info.get("tools", [])
+            return [name for name in domain_info.get("tools", []) if name in registered]
     
     def get_domain_keywords(self, domain: str) -> List[str]:
         """获取指定域的关键词"""
@@ -355,6 +357,8 @@ class ToolDataProvider:
         均通过此方法获得统一视图，杜绝"提示词有但执行器无"的不一致。
         """
         self._sync_all()
+        with self._runtime_lock:
+            registered = set(self._runtime_tools)
         with self._merged_lock:
             active = set(self._merged_always_inject)
             if domains:
@@ -364,6 +368,9 @@ class ToolDataProvider:
             # inject: false 的工具明确不注入（历史兼容工具保留定义但不暴露给 LLM）
             active = {name for name in active
                       if self._merged_tools.get(name, {}).get("inject") is not False}
+            # 只注入真实注册过的工具：tools.yaml 中"声明了但没实现"的工具不得暴露给 LLM，
+            # 否则模型会调用不存在的工具并反复失败（幻影工具）。
+            active = {name for name in active if name in registered}
             return active
 
     @staticmethod
@@ -1325,7 +1332,8 @@ def _c_drive_non_user_abs_path(path: str) -> Optional[str]:
     """
     if not path or not isinstance(path, str):
         return None
-    s = path.strip().strip("\"'`")
+    from .safety_policy import canonicalize_win_path
+    s = canonicalize_win_path(path)
     if not _ABS_PATH_RE.match(s):
         return None
     try:

@@ -28,6 +28,15 @@ from core.react_engine import ReActEngine
 
 chat_bp = Blueprint('chat', __name__)
 
+# 会话 ID 会参与落盘目录拼接（memory 的 per-session 目录），必须限制字符集，
+# 防止 "../" 之类的构造把数据写出数据目录。
+_SESSION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _is_valid_session_id(session_id) -> bool:
+    """校验会话 ID：仅允许字母/数字/下划线/短横线，长度 1-64。"""
+    return bool(session_id) and bool(_SESSION_ID_RE.fullmatch(str(session_id)))
+
 # ── 全局会话状态管理 ──
 _active_sessions = {}  # {session_id: {"started_at": timestamp, "thread_id": thread_id, "cancel_event": Event, "engine": ReActEngine}}
 _active_sessions_lock = threading.Lock()
@@ -317,6 +326,10 @@ def api_chat():
         get_logger().info(f"[/chat] API start: session_id={session_id}, trace_id={trace_id}", trace_id=trace_id)
         if not session_id:
             return jsonify({"success": False, "message": "缺少 session_id"}), 400
+        if not _is_valid_session_id(session_id):
+            return jsonify({"success": False, "message": "非法的 session_id"}), 400
+        if not user_input:
+            return jsonify({"success": False, "message": "消息内容不能为空"}), 400
 
         cleaned_msg, attachments = _extract_attachments(user_input)
         user_input = _inject_attachment_context(cleaned_msg, attachments)
@@ -890,6 +903,11 @@ def save_session():
     try:
         data = request.json
         session_id = data.get("id")
+        if not session_id:
+            return jsonify({"success": False, "message": "缺少会话 id"}), 400
+        if not _is_valid_session_id(session_id):
+            return jsonify({"success": False, "message": "非法的会话 id"}), 400
+        saved_count, total = 0, 0
         if session_id:
             from memory import set_active_session
             set_active_session(session_id)
@@ -902,7 +920,6 @@ def save_session():
                 }
                 save_sessions_db(db)
             messages = data.get("messages", [])
-            saved_count = 0
             total = len(messages) if messages else 0
             if messages:
                 existing = sql_get_messages(session_id)

@@ -5,6 +5,7 @@ v4: APP_DIR / DATA_DIR 分离，支持 PyInstaller 打包；
     YAML 策略配置；长期 / 短期记忆子目录隔离。
 """
 import os
+import re
 import sys
 import uuid
 import yaml
@@ -199,9 +200,18 @@ _ensure_dir(SHORT_TERM_DIR)
 EXPERIENCE_DB = os.path.join(DATA_DIR, 'memory', 'experience.db')
 _ensure_dir(os.path.dirname(EXPERIENCE_DB))
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 def get_session_dir(session_id):
-    """获取会话专属目录，不存在则创建。"""
-    d = os.path.join(SHORT_TERM_DIR, session_id)
+    """获取会话专属目录，不存在则创建。
+
+    session_id 会直接参与目录拼接，此处做字符集校验，防止 "../" 之类的路径穿越。
+    """
+    sid = str(session_id or "")
+    if not _SESSION_ID_RE.fullmatch(sid):
+        raise ValueError(f"非法 session_id: {session_id!r}")
+    d = os.path.join(SHORT_TERM_DIR, sid)
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -31,10 +31,41 @@ SENSITIVE_COPY_ROOTS = (
 )
 
 
+_DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\")
+
+
+def canonicalize_win_path(path: str) -> str:
+    """把路径规范化为安全检查可用的形式。
+
+    处理三类 Windows 等价写法，避免绕过前缀匹配：
+    1. 设备前缀 ``\\\\?\\`` / ``\\\\.\\``（含 ``\\\\?\\UNC\\`` → ``\\\\server\\share``）；
+    2. 分隔符统一为反斜杠；
+    3. 各路径组件的尾随点/空格（Win32 解析时会被忽略，如 ``C:\\Windows.\\x``）。
+    仅用于判定，不改变实际传给文件 API 的原始路径。
+    """
+    p = str(path or "").strip().strip("\"'`")
+    if not p:
+        return ""
+    p = p.replace("/", "\\")
+    for prefix in _DEVICE_PREFIXES:
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            if p[:4].upper() == "UNC\\":
+                p = "\\\\" + p[4:]
+            break
+    parts = p.split("\\")
+    cleaned = []
+    for seg in parts:
+        if seg in ("", ".", ".."):
+            cleaned.append(seg)
+        else:
+            cleaned.append(seg.rstrip(" ."))
+    return "\\".join(cleaned)
+
+
 def norm_sensitive_path(path: str) -> str:
     """归一化路径用于敏感前缀匹配：统一小写、正反斜杠、去引号与尾随分隔符。"""
-    p = str(path or "").strip().strip("\"'`")
-    p = p.replace("/", "\\").lower()
+    p = canonicalize_win_path(path).lower()
     return p.rstrip("\\")
 
 

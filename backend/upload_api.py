@@ -9,6 +9,7 @@ POST /api/upload
 文件命名: {uuid}_{原始文件名} → 防重名, 保留扩展名以供工具识别。
 """
 import os
+import re
 import uuid
 from flask import Blueprint, request, jsonify
 
@@ -31,6 +32,16 @@ ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".xlsx", ".pptx", ".csv",
                       ".py", ".js", ".ts", ".html", ".css", ".c", ".cpp", ".h", ".java", ".go", ".rs",
                       ".exe", ".msi", ".apk", ".dmg", ".deb", ".rpm"}
 
+# session_id 参与目录拼接，必须限制字符集防路径穿越
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _safe_filename(name: str) -> str:
+    """净化上传文件名：保留中文等 Unicode 字符，去掉路径分隔符、控制符与 Windows 非法字符。"""
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    base = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", base).strip(" .")
+    return base or "upload"
+
 
 @upload_bp.route("/api/upload", methods=["POST"])
 def upload_file():
@@ -45,9 +56,12 @@ def upload_file():
     session_id = request.form.get("session_id", "").strip()
     if not session_id:
         return jsonify({"success": False, "message": "缺少 session_id"}), 400
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        return jsonify({"success": False, "message": "非法的 session_id"}), 400
 
-    # 扩展名白名单
-    ext = os.path.splitext(file.filename)[1].lower()
+    # 扩展名白名单（基于净化后的文件名判定）
+    safe_name = _safe_filename(file.filename)
+    ext = os.path.splitext(safe_name)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify({"success": False, "message": f"不支持的文件类型: {ext}"}), 400
 
@@ -56,8 +70,12 @@ def upload_file():
     os.makedirs(session_dir, exist_ok=True)
 
     # UUID 防重名, 保留扩展名
-    unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+    unique_name = f"{uuid.uuid4().hex}_{safe_name}"
     save_path = os.path.join(session_dir, unique_name)
+    # 兜底：最终路径必须仍位于上传根目录内
+    root_real = os.path.realpath(UPLOAD_ROOT)
+    if not os.path.realpath(save_path).startswith(root_real + os.sep):
+        return jsonify({"success": False, "message": "非法的保存路径"}), 400
 
     # 写入 + 大小限制
     file.seek(0, os.SEEK_END)
@@ -71,7 +89,7 @@ def upload_file():
     return jsonify({
         "success": True,
         "file_path": os.path.abspath(save_path),
-        "file_name": file.filename,
+        "file_name": safe_name,
         "size": size,
     })
 
