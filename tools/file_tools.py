@@ -1,30 +1,189 @@
 """文件操作工具：扫描、移动、复制、解析文件夹"""
 import os
+import re
 import json
 import shutil
+import uuid
 import datetime
 
 from . import register_tool, path_params
 
+# 前导零数字串 / 超长数字串视为 ID（如手机号、订单号），不做数值化
+_ID_LIKE_RE = re.compile(r"^0\d+$")
+_LONG_DIGIT_RE = re.compile(r"^\d{12,}$")
+
+
+def _read_csv_with_fallback(path: str, **kwargs):
+    """按常见中文办公编码依次尝试读取 CSV（UTF-8 BOM → GB18030 → GBK → Latin-1）。"""
+    import pandas as pd
+
+    last_err = None
+    for enc in ("utf-8-sig", "gb18030", "gbk", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, **kwargs)
+        except (UnicodeDecodeError, UnicodeError) as e:
+            last_err = e
+            continue
+    raise last_err if last_err else UnicodeError("无法识别 CSV 编码")
+
+
+def _coerce_object_column(series):
+    """把文本型数字（千分位/货币符号）转成数值；保留前导零、超长数字等 ID 列。"""
+    import pandas as pd
+
+    # pandas 3.x 的字符串列 dtype 为 str，不再是 object，两者都要处理
+    if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+        return series
+    raw = series.dropna()
+    if raw.empty:
+        return series
+    text = raw.astype(str).str.strip()
+    # ID 类列（00123 / 13800000000 这类）保持文本，避免丢前导零或精度
+    if text.map(lambda v: bool(_ID_LIKE_RE.match(v) or _LONG_DIGIT_RE.match(v))).any():
+        return series
+    cleaned = (text.str.replace(",", "", regex=False)
+                   .str.replace("，", "", regex=False)
+                   .str.replace("¥", "", regex=False)
+                   .str.replace("￥", "", regex=False)
+                   .str.replace("$", "", regex=False)
+                   .str.replace(" ", "", regex=False))
+    nums = pd.to_numeric(cleaned, errors="coerce")
+    if nums.notna().mean() < 0.9:
+        return series
+    out = series.astype(object).copy()
+    out.loc[nums.index] = nums
+    return out
+
+
+def _looks_numeric(value) -> bool:
+    """判断单元格值是否像数值（兼容千分位与货币符号），用于表头行打分。"""
+    import pandas as pd
+
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    s = str(value).strip().replace(",", "").replace("¥", "").replace("￥", "").replace("$", "").replace(" ", "")
+    if not s:
+        return False
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_header_row(file_path: str, sheet_name=None, max_scan: int = 10) -> int:
+    """自动探测表头所在行（0 基）。
+
+    真实报表常见结构：第 1 行合并标题、第 2 行制表说明、第 3 行才是表头。
+    打分依据：该行非空单元格比例、列名唯一性、字符串占比，以及下一行的数值占比。
+    只有当某行明显优于首行时才覆盖，避免把普通表误判。
+    """
+    import pandas as pd
+
+    is_csv = str(file_path).lower().endswith(".csv")
+    try:
+        if is_csv:
+            raw = _read_csv_with_fallback(file_path, header=None, nrows=max_scan,
+                                          dtype=str, keep_default_na=False)
+        else:
+            # sheet_name=None 会让 pandas 返回 dict（全部 sheet），这里只探测第一张表
+            raw = pd.read_excel(file_path, sheet_name=0 if sheet_name is None else sheet_name,
+                                header=None, nrows=max_scan)
+    except Exception:
+        return 0
+    if raw.empty or raw.shape[0] < 2:
+        return 0
+
+    ncols = raw.shape[1]
+    scores = []
+    for i in range(min(len(raw) - 1, max_scan)):
+        vals = [v for v in raw.iloc[i].tolist() if pd.notna(v) and str(v).strip() != ""]
+        if not vals:
+            scores.append(-1.0)
+            continue
+        uniq = len({str(v) for v in vals})
+        str_ratio = sum(isinstance(v, str) for v in vals) / len(vals)
+        nxt = [v for v in raw.iloc[i + 1].tolist() if pd.notna(v) and str(v).strip() != ""]
+        num_ratio = sum(_looks_numeric(v) for v in nxt) / len(nxt) if nxt else 0.0
+        score = (len(vals) / max(ncols, 1)) * 2 + (uniq / len(vals)) + str_ratio + num_ratio
+        scores.append(score)
+
+    best_i = max(range(len(scores)), key=lambda k: scores[k])
+    if best_i != 0 and scores[best_i] - scores[0] >= 0.8 and scores[best_i] >= 3.2:
+        return best_i
+    return 0
+
+
+def _read_table(file_path: str, sheet_name=None, header_row=None, nrows=None):
+    """统一读取表格：CSV 编码回退 + 表头定位 + 文本数字规范化。
+
+    header_row 为 None 时自动探测表头行，适配“标题行 + 表头行”的真实报表。
+    """
+    import pandas as pd
+
+    if header_row is None:
+        header_row = _detect_header_row(file_path, sheet_name)
+
+    is_csv = str(file_path).lower().endswith(".csv")
+    if is_csv:
+        df = _read_csv_with_fallback(file_path, header=header_row, nrows=nrows,
+                                     dtype=str, keep_default_na=False)
+        df = df.replace({"": None})
+    else:
+        df = pd.read_excel(file_path, sheet_name=0 if sheet_name is None else sheet_name,
+                           header=header_row, nrows=nrows)
+
+    if isinstance(df, dict):  # 多 sheet
+        df = df[list(df.keys())[0]]
+
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    for col in df.columns:
+        df[col] = _coerce_object_column(df[col])
+    return df
+
+
+def _count_total_rows(file_path: str, sheet_name=None):
+    """统计文件真实总行数（含表头）；失败返回 None。"""
+    try:
+        if str(file_path).lower().endswith(".csv"):
+            with open(file_path, "rb") as f:
+                return sum(1 for _ in f)
+        import openpyxl
+        wb = openpyxl.load_workbook(file_path, read_only=True)
+        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+        total = ws.max_row
+        wb.close()
+        return total
+    except Exception:
+        return None
+
 
 def _create_excel_copy(source_path: str) -> str:
     """复制Excel源文件到副本，返回副本文件路径。
-    
-    副本命名规则: {原文件名}_copy_{时间戳}.xlsx
-    副本与源文件在同一目录下。
-    如果源文件不存在，返回None。
+
+    副本命名规则: {原文件名}_copy_{年月日_时分秒_微秒}_{4位随机}.xlsx
+    使用微秒 + 随机后缀，避免同一秒内多次操作命中同一副本路径导致结果互相覆盖。
+    副本与源文件在同一目录下。如果源文件不存在，返回 None。
     """
     if not os.path.exists(source_path):
         return None
-    
+
     dir_name = os.path.dirname(source_path)
     base_name = os.path.basename(source_path)
     name_without_ext, ext = os.path.splitext(base_name)
-    
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    copy_name = f"{name_without_ext}_copy_{timestamp}{ext}"
-    copy_path = os.path.join(dir_name, copy_name)
-    
+
+    for _ in range(10):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        copy_path = os.path.join(dir_name, f"{name_without_ext}_copy_{timestamp}_{uuid.uuid4().hex[:4]}{ext}")
+        if not os.path.exists(copy_path):
+            shutil.copy2(source_path, copy_path)
+            return copy_path
+    # 极端情况下回退到 UUID 全名
+    copy_path = os.path.join(dir_name, f"{name_without_ext}_copy_{uuid.uuid4().hex}{ext}")
     shutil.copy2(source_path, copy_path)
     return copy_path
 
@@ -190,10 +349,25 @@ def excel_pivot(file_path: str, index_cols: list, value_cols: list, agg_func: st
         if not copy_path:
             return json.dumps({"success": False, "message": f"源文件不存在: {file_path}"}, ensure_ascii=False)
         
-        df = pd.read_excel(copy_path)
-        print(f"数据形状: {df.shape}")
-        print(f"列名: {list(df.columns)}")
-        
+        df = _read_table(copy_path)
+        missing = [c for c in list(index_cols) + list(value_cols) if c not in df.columns]
+        if missing:
+            return json.dumps({
+                "success": False,
+                "message": f"列不存在: {missing}；实际列: {[str(c) for c in df.columns][:20]}"
+            }, ensure_ascii=False)
+
+        for col in value_cols:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False).str.replace("¥", "", regex=False),
+                errors="coerce"
+            )
+        if df[value_cols].isna().all().all():
+            return json.dumps({
+                "success": False,
+                "message": f"数值列 {value_cols} 全为空或非数值，无法聚合（请检查是否为文本型数字或公式列）"
+            }, ensure_ascii=False)
+
         pivot_table = pd.pivot_table(
             df,
             index=index_cols,
@@ -482,8 +656,9 @@ def excel_batch_process(directory: str, operations: list = None):
 # ==================== Excel 基础操作工具 ====================
 
 @register_tool(timeout=60)
-def excel_read(file_path: str, sheet_name: str = None, max_rows: int = 100, start_row: int = 0):
-    """读取Excel数据，返回JSON格式。file_path: Excel文件路径, sheet_name: 工作表名(默认第一个), max_rows: 最大读取行数, start_row: 起始行"""
+def excel_read(file_path: str, sheet_name: str = None, max_rows: int = 100,
+               start_row: int = 0, header_row: int = None):
+    """读取Excel/CSV数据，返回JSON。file_path: 文件路径, sheet_name: 工作表名(默认第一个), max_rows: 最大读取行数, start_row: 兼容旧参数(等价于 header_row), header_row: 表头所在行(0基；省略时自动探测标题行)"""
     # 敏感系统路径读取拦截（P0/BLOCK，纵深防御）
     from core.safety_policy import match_sensitive_read_root
     _sensitive_hit = match_sensitive_read_root(str(file_path))
@@ -496,26 +671,57 @@ def excel_read(file_path: str, sheet_name: str = None, max_rows: int = 100, star
     import pandas as pd
 
     try:
-        # pandas read_excel 不支持 .csv，需按扩展名分派 read_csv
-        if str(file_path).lower().endswith(".csv"):
-            df = pd.read_csv(file_path, skiprows=start_row, nrows=max_rows)
+        if not os.path.exists(file_path):
+            return json.dumps({"success": False, "message": f"文件不存在: {file_path}"}, ensure_ascii=False)
+
+        warnings = []
+        # 表头定位：显式 header_row > 旧参数 start_row > 自动探测
+        auto_detected = False
+        if header_row is not None:
+            hr = max(int(header_row), 0)
+        elif start_row:
+            hr = max(int(start_row), 0)
         else:
-            df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=start_row, nrows=max_rows)
-        
-        if isinstance(df, dict):
-            first_sheet = list(df.keys())[0]
-            df = df[first_sheet]
-        
+            hr = _detect_header_row(file_path, sheet_name)
+            auto_detected = hr != 0
+            if auto_detected:
+                warnings.append(
+                    f"检测到表头在第 {hr + 1} 行（前 {hr} 行为标题/说明），已按该行解析；可用 header_row 显式覆盖"
+                )
+
+        df = _read_table(file_path, sheet_name=sheet_name, header_row=hr, nrows=max_rows)
+
+        # 全空列告警：公式列未在 Excel 中重算保存时会是空值
+        empty_cols = [str(c) for c in df.columns if df[c].isna().all()]
+        if empty_cols:
+            warnings.append(f"列 {empty_cols} 全为空：若源文件为公式列且未重算保存，读取结果会是空值")
+
+        total = _count_total_rows(file_path, sheet_name)
+        data_df = df.head(min(max_rows, 50))
+        records = []
+        for row in data_df.to_dict(orient="records"):
+            records.append({k: (None if pd.isna(v) else v) for k, v in row.items()})
+        data_rows = max((total or 0) - (hr + 1), 0) if total else len(df)
+        if len(records) < data_rows:
+            warnings.append(
+                f"仅返回前 {len(records)} 行（共 {data_rows} 行数据，单次上限 50 行）；可用 start_row 分页或先做聚合"
+            )
+
         result = {
             "success": True,
-            "message": f"读取成功",
+            "message": "读取成功",
             "shape": {"rows": len(df), "columns": len(df.columns)},
-            "columns": list(df.columns),
-            "data": df.head(min(max_rows, 50)).to_dict(orient='records'),
-            "total_rows": len(df)
+            "columns": [str(c) for c in df.columns],
+            "header_row": hr,
+            "header_auto_detected": auto_detected,
+            "data": records,
+            "total_rows": total if total is not None else len(df),
+            "rows_returned": len(records),
+            "data_truncated": len(records) < data_rows,
+            "warnings": warnings,
         }
         return json.dumps(result, ensure_ascii=False, default=str)
-        
+
     except Exception as e:
         return json.dumps({"success": False, "message": f"读取错误: {str(e)}"}, ensure_ascii=False)
 
@@ -558,7 +764,7 @@ def excel_merge(file_paths: list, output_path: str, strategy: str = "concat", jo
         if strategy == "concat":
             dfs = []
             for fp in file_paths:
-                df = pd.read_excel(fp)
+                df = _read_table(fp)
                 df['source_file'] = os.path.basename(fp)
                 dfs.append(df)
             merged_df = pd.concat(dfs, ignore_index=True)
@@ -567,9 +773,9 @@ def excel_merge(file_paths: list, output_path: str, strategy: str = "concat", jo
             if not join_key:
                 return json.dumps({"success": False, "message": "merge策略需要指定join_key"}, ensure_ascii=False)
             
-            merged_df = pd.read_excel(file_paths[0])
+            merged_df = _read_table(file_paths[0])
             for fp in file_paths[1:]:
-                df = pd.read_excel(fp)
+                df = _read_table(fp)
                 merged_df = pd.merge(merged_df, df, on=join_key, how='outer')
         
         merged_df.to_excel(output_path, index=False)
@@ -598,19 +804,24 @@ def excel_convert(input_path: str, output_format: str = "csv"):
         file_ext = os.path.splitext(input_path)[1].lower()
         
         if file_ext in ['.xlsx', '.xls']:
-            df = pd.read_excel(input_path)
+            df = _read_table(input_path)
             if output_format == "csv":
                 output_path = os.path.splitext(input_path)[0] + ".csv"
                 df.to_csv(output_path, index=False, encoding='utf-8-sig')
             else:
                 output_path = input_path
         elif file_ext == '.csv':
-            df = pd.read_csv(input_path)
+            df = _read_table(input_path)
             if output_format == "excel":
                 output_path = os.path.splitext(input_path)[0] + ".xlsx"
                 df.to_excel(output_path, index=False)
             else:
                 output_path = input_path
+        else:
+            return json.dumps({
+                "success": False,
+                "message": f"不支持的输入格式: {file_ext}（仅支持 .xlsx/.xls/.csv）"
+            }, ensure_ascii=False)
         
         result = {
             "success": True,
