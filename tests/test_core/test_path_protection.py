@@ -4,8 +4,11 @@ r"""路径保护回归测试：设备前缀 / 组件尾点不得绕过敏感路�
 背景：`\\?\C:\Windows\...`、`C:\Windows.\...` 这类 Windows 等价写法
 曾使前缀匹配失效，导致 P0 写入/删除拒绝与读取保护被绕过。
 """
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -65,6 +68,7 @@ class TestReadProtection:
         assert match_sensitive_copy_root(r"\\?\C:\Program Files\app\a.txt") == r"C:\Program Files"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="写入/删除的 P0 判定依赖 Windows 盘符语义")
 class TestWriteDeleteProtection:
     def test_long_path_prefix_blocks_write(self):
         for p in WRITE_TARGETS:
@@ -75,6 +79,5 @@ class TestWriteDeleteProtection:
             assert _check_delete_p0({"file_path": p}), f"未拦截: {p}"
 
     def test_user_dir_still_allowed(self):
-        import os
         profile = os.environ.get("USERPROFILE", r"C:\Users\UnknownUser")
         assert _check_single_file_edit_p0("write_file", {"file_path": profile + r"\a.txt"}) is None

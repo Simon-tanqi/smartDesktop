@@ -15,7 +15,10 @@ from logger import get_logger, get_llm_request_logger
 logger = get_logger()
 _llm_req_log = get_llm_request_logger()
 
-import keyring
+try:
+    import keyring
+except ImportError:  # CI / 最小安装环境没有 keyring 时降级为环境变量 + models.json
+    keyring = None
 
 from core.streaming import parse_reasoning_trace, _build_context_memory_summary, strip_code_blocks, inline_compress, strip_temp_system_messages
 from utils.error_mapper import translate_error
@@ -91,6 +94,9 @@ def _brief_result(result) -> str:
 def _is_keyring_available():
     """探测系统 keyring 是否可用，结果缓存在全局变量中。"""
     global _KEYRING_AVAILABLE
+    if keyring is None:
+        _KEYRING_AVAILABLE = False
+        return False
     if _KEYRING_AVAILABLE is None:
         try:
             keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
